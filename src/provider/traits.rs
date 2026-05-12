@@ -350,3 +350,73 @@ macro_rules! impl_traits {
     }
   };
 }
+
+/// Extension trait for groups that participate in an asymmetric pairing.
+///
+/// Conventions:
+/// - `Self` is the first source group `G1` (already a `DlogGroup`).
+/// - `G2` is the second source group; only the minimum surface needed to
+///   sample and scalar-multiply a single G2 base is exposed (KZH's `V`).
+/// - `MillerLoopOutput` is the pre–final-exponentiation value, kept as its
+///   own type so callers can batch many pairings into one final exponentiation.
+pub trait PairingGroup: DlogGroup {
+  /// Projective point in the second source group G2.
+  type G2: Copy
+    + Clone
+    + Debug
+    + Eq
+    + Send
+    + Sync
+    + Serialize
+    + for<'de> Deserialize<'de>
+    + Add<Output = Self::G2>
+    + Sub<Output = Self::G2>
+    + Mul<<Self as Group>::Scalar, Output = Self::G2>;
+
+  /// Affine point in the second source group G2.
+  type G2Affine: Copy
+    + Clone
+    + Debug
+    + Eq
+    + Send
+    + Sync
+    + Serialize
+    + for<'de> Deserialize<'de>
+    + TranscriptReprTrait<Self>;
+
+  /// Target group Gt (codomain of the pairing).
+  type Gt: Copy + Clone + Debug + Eq + Send + Sync;
+
+  /// Output of a (multi-)Miller loop, before final exponentiation.
+  type MillerLoopOutput: Copy + Clone + Debug + Send + Sync;
+
+  /// Generator of G2. KZH uses this as the single base for its G2 SRS.
+  fn g2_generator() -> Self::G2;
+
+  /// Project a G2 element to affine form.
+  fn g2_to_affine(p: &Self::G2) -> Self::G2Affine;
+
+  /// Batch project a slice of G2 points to affine using Montgomery's trick.
+  fn batch_g2_to_affine(points: &[Self::G2]) -> Vec<Self::G2Affine>;
+
+  /// Lift an affine G2 element to projective.
+  fn g2_from_affine(p: &Self::G2Affine) -> Self::G2;
+
+  /// Batched Miller loop on (G1Affine, G2Affine) pairs.
+  fn multi_miller_loop(
+    pairs: &[(&Self::AffineGroupElement, &Self::G2Affine)],
+  ) -> Self::MillerLoopOutput;
+
+  /// Final exponentiation: map a Miller-loop output into Gt.
+  fn final_exponentiation(m: &Self::MillerLoopOutput) -> Self::Gt;
+
+  /// One-shot pairing.
+  fn pairing(p: &Self::AffineGroupElement, q: &Self::G2Affine) -> Self::Gt {
+    Self::final_exponentiation(&Self::multi_miller_loop(&[(p, q)]))
+  }
+
+  /// One-shot multi-pairing: ∏ e(A_i, B_i). One Miller loop, one final exponentiation.
+  fn multi_pairing(pairs: &[(&Self::AffineGroupElement, &Self::G2Affine)]) -> Self::Gt {
+    Self::final_exponentiation(&Self::multi_miller_loop(pairs))
+  }
+}
