@@ -1,10 +1,13 @@
 //! This module implements the KZH-2 polynomial commitment scheme
 use crate::{
-  errors::SpartanError, math::Math, provider::traits::{DlogGroup, DlogGroupExt, PairingGroup}, traits::{
+  errors::SpartanError,
+  math::Math,
+  provider::traits::{DlogGroup, DlogGroupExt, PairingGroup},
+  traits::{
     Engine, PrimeFieldExt,
     pcs::{CommitmentTrait, PCSEngineTrait},
     transcript::TranscriptReprTrait,
-  }
+  },
 };
 use core::marker::PhantomData;
 use digest::{ExtendableOutput, Update};
@@ -14,11 +17,10 @@ use serde::{Deserialize, Serialize};
 use sha3::Shake256;
 use std::io::Read;
 
-
 /// Provides a commitment engine
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KZHPCS<E:Engine> {
-    _p: PhantomData<E>
+pub struct KZHPCS<E: Engine> {
+  _p: PhantomData<E>,
 }
 
 fn sample_scalars<E: Engine>(
@@ -34,7 +36,7 @@ fn sample_scalars<E: Engine>(
     .map(|_| {
       let mut bytes = [0u8; 64];
       reader.read_exact(&mut bytes).unwrap();
-      E::Scalar::from_uniform(&bytes)  // PrimeFieldExt method
+      E::Scalar::from_uniform(&bytes) // PrimeFieldExt method
     })
     .collect()
 }
@@ -42,51 +44,51 @@ fn sample_scalars<E: Engine>(
 /// A type that holds commitment generators for KZH commitments
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct KZHCommitmentKey<E:Engine>
-where 
+pub struct KZHCommitmentKey<E: Engine>
+where
   E::GE: DlogGroupExt + PairingGroup,
 {
-  log_num_rows: usize,                                // log2(num_rows)
-  log_num_cols: usize,                                // log2(num_cols)
+  log_num_rows: usize,                                     // log2(num_rows)
+  log_num_cols: usize,                                     // log2(num_cols)
   h_matrix: Vec<<E::GE as DlogGroup>::AffineGroupElement>, // H^(i,j) = τ_i · G^(j), flat row-major, length 2^(ν+μ)
-  h_col:    Vec<<E::GE as DlogGroup>::AffineGroupElement>, // H^(j)   = α   · G^(j), length 2^μ
+  h_col: Vec<<E::GE as DlogGroup>::AffineGroupElement>,    // H^(j)   = α   · G^(j), length 2^μ
 }
 
 /// A type that holds the verifier key for KZH commitments
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct KZHVerifierKey<E:Engine>
+pub struct KZHVerifierKey<E: Engine>
 where
   E::GE: DlogGroupExt + PairingGroup,
 {
   log_num_rows: usize,
   log_num_cols: usize,
-  h_col:   Vec<<E::GE as DlogGroup>::AffineGroupElement>,  // duplicated from CK — verifier needs this for check 2
-  v_row:   Vec<<E::GE as PairingGroup>::G2Affine>, // V^(i) = τ_i · V, length 2^ν
-  v_prime: <E::GE as PairingGroup>::G2Affine,      // V'    = α   · V
+  h_col: Vec<<E::GE as DlogGroup>::AffineGroupElement>, // duplicated from CK — verifier needs this for check 2
+  v_row: Vec<<E::GE as PairingGroup>::G2Affine>,        // V^(i) = τ_i · V, length 2^ν
+  v_prime: <E::GE as PairingGroup>::G2Affine,           // V'    = α   · V
 }
 
 /// Structure that holds commitments
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct KZHCommitment<E:Engine> {
-  comm:   E::GE,        // the actual commitment, single G1
-  aux: Vec<E::GE>,   // {D^(x)} cache, length 2^ν
+pub struct KZHCommitment<E: Engine> {
+  comm: E::GE,     // the actual commitment, single G1
+  aux: Vec<E::GE>, // {D^(x)} cache, length 2^ν
 }
 
-type KZHBlind = ();          // non-hiding for this slice
+type KZHBlind = (); // non-hiding for this slice
 
 /// Provides an implementation of a polynomial evaluation argument
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct KZHEvaluationArgument<E:Engine>
+pub struct KZHEvaluationArgument<E: Engine>
 where
   E::GE: DlogGroupExt + PairingGroup,
-{  
-  _p:PhantomData<E> // placeholder; populated in next slice
-}  
+{
+  _p: PhantomData<E>, // placeholder; populated in next slice
+}
 
-impl<E: Engine> PCSEngineTrait<E> for KZHPCS<E> 
+impl<E: Engine> PCSEngineTrait<E> for KZHPCS<E>
 where
   E::GE: DlogGroupExt + PairingGroup,
 {
@@ -104,8 +106,14 @@ where
   ) -> (Self::CommitmentKey, Self::VerifierKey) {
     //validate: n, width are powers of 2; 1 <= width <= n
     assert!(_n.is_power_of_two(), "n must be a power of 2, got {_n}");
-    assert!(width.is_power_of_two(), "width must be a power of 2, got {width}");
-    assert!(1 <= width && width <= _n, "width must be in [1, {_n}], got {width}");
+    assert!(
+      width.is_power_of_two(),
+      "width must be a power of 2, got {width}"
+    );
+    assert!(
+      1 <= width && width <= _n,
+      "width must be in [1, {_n}], got {width}"
+    );
 
     let num_cols = width;
     let num_rows = _n / num_cols;
@@ -113,14 +121,12 @@ where
     let log_num_cols = num_cols.log_2();
 
     // Base generators (transparent, hash-to-curve)
-    let gens  = E::GE::from_label(label, num_cols);                 // {G^(j)}_j∈B_m, length m
-    let V    = <E::GE as PairingGroup>::g2_generator();
-
+    let gens = E::GE::from_label(label, num_cols); // {G^(j)}_j∈B_m, length m
+    let V = <E::GE as PairingGroup>::g2_generator();
 
     // Toxic-waste trapdoors, derived from label via Shake256 → uniform_bytes → Scalar::from_uniform
-    let tau   = sample_scalars::<E>(label, b"kzh-tau",   num_rows);  // {τ_i}_i∈B_n
-    let alpha    = sample_scalars::<E>(label, b"kzh-alpha", 1)[0];
-
+    let tau = sample_scalars::<E>(label, b"kzh-tau", num_rows); // {τ_i}_i∈B_n
+    let alpha = sample_scalars::<E>(label, b"kzh-alpha", 1)[0];
 
     // Derive structured SRS
 
@@ -128,24 +134,26 @@ where
     let h_matrix_proj: Vec<E::GE> = (0..num_rows)
       .into_par_iter()
       .flat_map(|i| {
-      let tau_i = tau[i];
-      gens.par_iter().map(move |g_j| E::GE::group(g_j) * tau_i).collect::<Vec<_>>()
-    }).collect();
+        let tau_i = tau[i];
+        gens
+          .par_iter()
+          .map(move |g_j| E::GE::group(g_j) * tau_i)
+          .collect::<Vec<_>>()
+      })
+      .collect();
 
-    //H_col[j] = alpha * G^(j)    for j in [num_cols]   
+    //H_col[j] = alpha * G^(j)    for j in [num_cols]
     let h_col_proj: Vec<E::GE> = gens
       .par_iter()
       .map(|g_j| E::GE::group(g_j) * alpha)
       .collect();
 
-    //V_row[i]  = tau_i * V        for i in [num_rows]             
-    let v_row_proj: Vec<<E::GE as PairingGroup>::G2> = (0..num_rows)
-      .into_par_iter()
-      .map(|i| V * tau[i])
-      .collect();
+    //V_row[i]  = tau_i * V        for i in [num_rows]
+    let v_row_proj: Vec<<E::GE as PairingGroup>::G2> =
+      (0..num_rows).into_par_iter().map(|i| V * tau[i]).collect();
 
     // V_prime = alpha * V
-    let v_prime_proj = V*alpha;
+    let v_prime_proj = V * alpha;
 
     //batch-normalize all to affine
     let h_matrix = E::GE::batch_affine(&h_matrix_proj);
@@ -153,13 +161,23 @@ where
     let v_row = <E::GE as PairingGroup>::batch_g2_to_affine(&v_row_proj);
     let v_prime = <E::GE as PairingGroup>::g2_to_affine(&v_prime_proj);
 
-    let ck = KZHCommitmentKey { log_num_rows, log_num_cols, h_matrix, h_col };
-    let vk = KZHVerifierKey { log_num_rows, log_num_cols, h_col: ck.h_col.clone(), v_row, v_prime };
-    return (ck, vk)
+    let ck = KZHCommitmentKey {
+      log_num_rows,
+      log_num_cols,
+      h_matrix,
+      h_col,
+    };
+    let vk = KZHVerifierKey {
+      log_num_rows,
+      log_num_cols,
+      h_col: ck.h_col.clone(),
+      v_row,
+      v_prime,
+    };
+    (ck, vk)
   }
 
-  fn blind(_ck: &Self::CommitmentKey, _n: usize) -> Self::Blind { () }
-
+  fn blind(_ck: &Self::CommitmentKey, _n: usize) -> Self::Blind {}
 
   fn commit(
     ck: &Self::CommitmentKey,
@@ -172,137 +190,143 @@ where
     let expected_len = num_rows * num_cols;
 
     if v.len() != expected_len {
-        return Err(SpartanError::InvalidInputLength {
+      return Err(SpartanError::InvalidInputLength {
         reason: format!(
-            "expected v.len() = {expected_len} (2^{} rows * 2^{} cols), got {}",
-            ck.log_num_rows,
-            ck.log_num_cols,
-            v.len()
+          "expected v.len() = {expected_len} (2^{} rows * 2^{} cols), got {}",
+          ck.log_num_rows,
+          ck.log_num_cols,
+          v.len()
         ),
-        });
+      });
     }
 
     // For each row i in B_n in parallel, compute:
     //   C^(i) = MSM(v[row_i], h_matrix[row_i])  — contribution to the overall commitment
     //   D^(i) = MSM(v[row_i], h_col)            — cache entry needed by prove/verify
     let row_results: Result<Vec<(E::GE, E::GE)>, SpartanError> = (0..num_rows)
-        .into_par_iter()
-        .map(|i| {
+      .into_par_iter()
+      .map(|i| {
         let lower = i * num_cols;
         let upper = lower + num_cols;
         let row_scalars = &v[lower..upper];
         let h_matrix_row = &ck.h_matrix[lower..upper];
 
         let (c_i, d_i) = if is_small {
-            // Caller hints all row scalars fit in u64; take the fast MSM path.
-            // Convert once and reuse across both MSMs for this row.
-            let small: Vec<u64> = row_scalars
+          // Caller hints all row scalars fit in u64; take the fast MSM path.
+          // Convert once and reuse across both MSMs for this row.
+          let small: Vec<u64> = row_scalars
             .iter()
             .map(|s| {
-                let bytes = s.to_repr();
-                //low 8 bytes -> [u8; 8] -> u64
-                u64::from_le_bytes(bytes.as_ref()[..8].try_into().unwrap())
+              let bytes = s.to_repr();
+              //low 8 bytes -> [u8; 8] -> u64
+              u64::from_le_bytes(bytes.as_ref()[..8].try_into().unwrap())
             })
             .collect();
-            let c_i = E::GE::vartime_multiscalar_mul_small(&small, h_matrix_row, false)?;
-            let d_i = E::GE::vartime_multiscalar_mul_small(&small, &ck.h_col, false)?;
-            (c_i, d_i)
+          let c_i = E::GE::vartime_multiscalar_mul_small(&small, h_matrix_row, false)?;
+          let d_i = E::GE::vartime_multiscalar_mul_small(&small, &ck.h_col, false)?;
+          (c_i, d_i)
         } else {
-            let c_i = E::GE::vartime_multiscalar_mul(row_scalars, h_matrix_row, false)?;
-            let d_i = E::GE::vartime_multiscalar_mul(row_scalars, &ck.h_col, false)?;
-            (c_i, d_i)
+          let c_i = E::GE::vartime_multiscalar_mul(row_scalars, h_matrix_row, false)?;
+          let d_i = E::GE::vartime_multiscalar_mul(row_scalars, &ck.h_col, false)?;
+          (c_i, d_i)
         };
         Ok((c_i, d_i))
-        })
-        .collect();
+      })
+      .collect();
     let row_results = row_results?;
 
     // C = Σ_i C^(i);  aux = [D^(0), …, D^(num_rows - 1)]
     let mut comm = E::GE::zero();
     let mut aux = Vec::with_capacity(num_rows);
     for (c_i, d_i) in row_results {
-        comm = comm + c_i;
-        aux.push(d_i);
+      comm += c_i;
+      aux.push(d_i);
     }
 
     Ok(KZHCommitment { comm, aux })
-}
-
+  }
 
   fn commit_zeros(
-      _ck: &Self::CommitmentKey,
-      _n: usize,
-      _r: &Self::Blind,
-    ) -> Result<Self::Commitment, SpartanError>
-  {
-    Err(SpartanError::InternalError { reason: "not yet implemented".to_string() })
+    _ck: &Self::CommitmentKey,
+    _n: usize,
+    _r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "not yet implemented".to_string(),
+    })
   }
 
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError> {
     if width == 0 || n % width != 0 {
-        return Err(SpartanError::InvalidCommitmentLength {
+      return Err(SpartanError::InvalidCommitmentLength {
         reason: format!("KZH commitment shape: width {width} must divide n {n}"),
-        });
+      });
     }
     let expected_num_rows = n / width;
     if comm.aux.len() != expected_num_rows {
-        return Err(SpartanError::InvalidCommitmentLength {
+      return Err(SpartanError::InvalidCommitmentLength {
         reason: format!(
-            "KZH commitment aux length: actual {}, expected {} (n = {n}, width = {width})",
-            comm.aux.len(),
-            expected_num_rows,
+          "KZH commitment aux length: actual {}, expected {} (n = {n}, width = {width})",
+          comm.aux.len(),
+          expected_num_rows,
         ),
-        });
+      });
     }
     Ok(())
   }
 
   fn rerandomize_commitment(
-      _ck: &Self::CommitmentKey,
-      _comm: &Self::Commitment,
-      _r_old: &Self::Blind,
-      _r_new: &Self::Blind,
-    ) -> Result<Self::Commitment, SpartanError>
-  {
-    Err(SpartanError::InternalError { reason: "not yet implemented".to_string() })
+    _ck: &Self::CommitmentKey,
+    _comm: &Self::Commitment,
+    _r_old: &Self::Blind,
+    _r_new: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "not yet implemented".to_string(),
+    })
   }
 
   fn combine_commitments(_comms: &[Self::Commitment]) -> Result<Self::Commitment, SpartanError> {
-    Err(SpartanError::InternalError { reason: "not yet implemented".to_string() })
+    Err(SpartanError::InternalError {
+      reason: "not yet implemented".to_string(),
+    })
   }
 
   fn combine_blinds(_blinds: &[Self::Blind]) -> Result<Self::Blind, SpartanError> {
-    Err(SpartanError::InternalError { reason: "not yet implemented".to_string() })
+    Err(SpartanError::InternalError {
+      reason: "not yet implemented".to_string(),
+    })
   }
 
   fn prove(
-      _ck: &Self::CommitmentKey,
-      _ck_eval: &Self::CommitmentKey,
-      _transcript: &mut <E as Engine>::TE,
-      _comm: &Self::Commitment,
-      _poly: &[<E as Engine>::Scalar],
-      _blind: &Self::Blind,
-      _point: &[<E as Engine>::Scalar],
-      _comm_eval: &Self::Commitment,
-      _blind_eval: &Self::Blind,
-    ) -> Result<Self::EvaluationArgument, SpartanError>
-  {
-    Err(SpartanError::InternalError { reason: "not yet implemented".to_string() })
+    _ck: &Self::CommitmentKey,
+    _ck_eval: &Self::CommitmentKey,
+    _transcript: &mut <E as Engine>::TE,
+    _comm: &Self::Commitment,
+    _poly: &[<E as Engine>::Scalar],
+    _blind: &Self::Blind,
+    _point: &[<E as Engine>::Scalar],
+    _comm_eval: &Self::Commitment,
+    _blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "not yet implemented".to_string(),
+    })
   }
 
   fn verify(
-      _vk: &Self::VerifierKey,
-      _ck_eval: &Self::CommitmentKey,
-      _transcript: &mut <E as Engine>::TE,
-      _comm: &Self::Commitment,
-      _point: &[<E as Engine>::Scalar],
-      _comm_eval: &Self::Commitment,
-      _arg: &Self::EvaluationArgument,
-    ) -> Result<(), SpartanError>
-  {
-    Err(SpartanError::InternalError { reason: "not yet implemented".to_string() })
+    _vk: &Self::VerifierKey,
+    _ck_eval: &Self::CommitmentKey,
+    _transcript: &mut <E as Engine>::TE,
+    _comm: &Self::Commitment,
+    _point: &[<E as Engine>::Scalar],
+    _comm_eval: &Self::Commitment,
+    _arg: &Self::EvaluationArgument,
+  ) -> Result<(), SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "not yet implemented".to_string(),
+    })
   }
-
 }
 
 impl<E: Engine> TranscriptReprTrait<E::GE> for KZHCommitment<E>
@@ -315,7 +339,6 @@ where
 }
 
 impl<E: Engine> CommitmentTrait<E> for KZHCommitment<E> where E::GE: DlogGroupExt {}
-
 
 #[cfg(test)]
 mod tests {
@@ -361,7 +384,11 @@ mod tests {
     // Aux must have one entry per row (num_rows = 64 / 8 = 8).
     assert_eq!(comm.aux.len(), 8);
     // C should not be the identity for a random polynomial.
-    assert_ne!(comm.comm, GE::zero(), "C is identity for a random polynomial");
+    assert_ne!(
+      comm.comm,
+      GE::zero(),
+      "C is identity for a random polynomial"
+    );
 
     // is_small path agreement: build a polynomial whose scalars are genuinely
     // small (fit in u64), commit both ways, results must be identical.
