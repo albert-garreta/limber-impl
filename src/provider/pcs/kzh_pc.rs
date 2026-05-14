@@ -50,9 +50,9 @@ where
 {
   log_num_rows: usize,
   log_num_cols: usize,
-  a_vec: Vec<<E::GE as DlogGroup>::AffineGroupElement>,   // duplicated from ck — verifier needs this for check 2
-  v_tau_vec: Vec<<E::GE as PairingGroup>::G2Affine>,      // V^(i) = τ_i · V, length 2^ν
-  v_alpha: <E::GE as PairingGroup>::G2Affine,             // V'    = α   · V
+  a_vec: Vec<<E::GE as DlogGroup>::AffineGroupElement>, // duplicated from ck — verifier needs this for check 2
+  v_tau_vec: Vec<<E::GE as PairingGroup>::G2Affine>,    // V^(i) = τ_i · V, length 2^ν
+  v_alpha: <E::GE as PairingGroup>::G2Affine,           // V'    = α   · V
 }
 
 /// Structure that holds commitments
@@ -78,7 +78,6 @@ where
   y: E::Scalar,
   _p: PhantomData<E>, //placeholder to tie this struct to the Engine type parameter E, needed for the trait impl but not used in the struct fields
 }
-
 
 // helper method for setup to sample the toxic wastes: tau vector and alpha
 fn sample_scalars<E: Engine>(
@@ -117,8 +116,14 @@ where
   ) -> (Self::CommitmentKey, Self::VerifierKey) {
     //validate: n, width are powers of 2; 1 <= width <= n
     assert!(_n.is_power_of_two(), "n must be a power of 2, got {_n}");
-    assert!(width.is_power_of_two(), "width must be a power of 2, got {width}");
-    assert!(1 <= width && width <= _n, "width must be in [1, {_n}], got {width}");
+    assert!(
+      width.is_power_of_two(),
+      "width must be a power of 2, got {width}"
+    );
+    assert!(
+      1 <= width && width <= _n,
+      "width must be in [1, {_n}], got {width}"
+    );
 
     let num_cols = width;
     let num_rows = _n / num_cols;
@@ -152,8 +157,8 @@ where
       .collect();
 
     // v_tau_vec[i] = tau_i * v        for i in [num_rows]
-    let v_tau_vec_proj: Vec<<E::GE as PairingGroup>::G2> = (0..num_rows)
-      .into_par_iter().map(|i| v * tau[i]).collect();
+    let v_tau_vec_proj: Vec<<E::GE as PairingGroup>::G2> =
+      (0..num_rows).into_par_iter().map(|i| v * tau[i]).collect();
 
     // v_alpha = alpha * v
     let v_alpha_proj = v * alpha;
@@ -260,7 +265,7 @@ where
   }
 
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError> {
-    if width == 0 || n%width!=0 {
+    if width == 0 || n % width != 0 {
       return Err(SpartanError::InvalidCommitmentLength {
         reason: format!("KZH commitment shape: width {width} must divide n {n}"),
       });
@@ -289,16 +294,31 @@ where
     })
   }
 
-  fn combine_commitments(_comms: &[Self::Commitment]) -> Result<Self::Commitment, SpartanError> {
-    Err(SpartanError::InternalError {
-      reason: "not yet implemented".to_string(),
+  fn combine_commitments(comms: &[Self::Commitment]) -> Result<Self::Commitment, SpartanError> {
+    if comms.is_empty() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "KZH combine_commitments: no commitments provided".to_string(),
+      });
+    }
+    // Concatenate the per-row aux caches and sum the comm fields. For length-1
+    // input this is the identity. For multi-partial inputs this is correct when
+    // the partials are slices of a single witness committed under a compatible
+    // shared SRS (zero-padded outside each partial's row range); independently
+    // sampled SRSes would not produce a meaningful sum on the comm field.
+    let combined_comm: E::GE = comms
+      .iter()
+      .map(|c| c.comm)
+      .fold(E::GE::zero(), |acc, c| acc + c);
+    let combined_aux: Vec<E::GE> = comms.iter().flat_map(|c| c.aux.iter().cloned()).collect();
+    Ok(KZHCommitment {
+      comm: combined_comm,
+      aux: combined_aux,
     })
   }
 
   fn combine_blinds(_blinds: &[Self::Blind]) -> Result<Self::Blind, SpartanError> {
-    Err(SpartanError::InternalError {
-      reason: "not yet implemented".to_string(),
-    })
+    // Non-hiding: Blind is ().
+    Ok(())
   }
 
   fn prove(

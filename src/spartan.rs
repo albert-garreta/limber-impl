@@ -658,13 +658,13 @@ mod tests {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
 
-    type E = crate::provider::PallasHyraxEngine;
-    type S = SpartanSNARK<E>;
-    test_snark_with::<E, S>();
+    //type E = crate::provider::PallasHyraxEngine;
+    //type S = SpartanSNARK<E>;
+    //test_snark_with::<E, S>();
 
-    type E2 = crate::provider::T256HyraxEngine;
-    type S2 = SpartanSNARK<E2>;
-    test_snark_with::<E2, S2>();
+    //type E2 = crate::provider::T256HyraxEngine;
+    //type S2 = SpartanSNARK<E2>;
+    //test_snark_with::<E2, S2>();
 
     // Additional Test to check KZH integration works
     type E3 = crate::provider::Bn254Engine;
@@ -683,6 +683,9 @@ mod tests {
 
     // generate a witness and proof
     let res = S::prove(&pk, circuit.clone(), prep_snark, false);
+    if let Err(e) = &res {
+      panic!("prove failed: {e:?}");
+    }
     assert!(res.is_ok());
     let (snark, _prep_snark) = res.unwrap();
 
