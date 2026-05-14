@@ -265,7 +265,7 @@ where
   }
 
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError> {
-    if width == 0 || n % width != 0 {
+    if width == 0 || !n.is_multiple_of(width) {
       return Err(SpartanError::InvalidCommitmentLength {
         reason: format!("KZH commitment shape: width {width} must divide n {n}"),
       });
@@ -305,6 +305,7 @@ where
     // the partials are slices of a single witness committed under a compatible
     // shared SRS (zero-padded outside each partial's row range); independently
     // sampled SRSes would not produce a meaningful sum on the comm field.
+
     let combined_comm: E::GE = comms
       .iter()
       .map(|c| c.comm)
