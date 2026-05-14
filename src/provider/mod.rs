@@ -21,7 +21,7 @@ use crate::{
     bn254::types as bn254_types,
     keccak::Keccak256Transcript,
     pasta::{pallas, vesta},
-    pcs::hyrax_pc::HyraxPCS,
+    pcs::{hyrax_pc::HyraxPCS, kzh_pc::KZHPCS},
     pt256::{p256, t256},
   },
   traits::Engine,
@@ -86,5 +86,6 @@ impl Engine for Bn254Engine {
   type Scalar = bn254_types::Scalar;
   type GE = bn254_types::Point;
   type TE = Keccak256Transcript<Self>;
-  type PCS = HyraxPCS<Self>;
+  //type PCS = HyraxPCS<Self>;
+  type PCS = KZHPCS<Self>;
 }

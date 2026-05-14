@@ -35,7 +35,7 @@ use crate::provider::msm::{AffineGroupElement, FixedBaseMul, vartime_scalar_mul}
 /// Avoids per-product REDC, reducing multiply cost by ~50%.
 /// The accumulator array (r_len * 72B) must fit in L2 cache.
 #[inline(never)]
-fn bind_with_delayed<F: PrimeField + MontgomeryLimbs + Copy>(
+pub(crate) fn bind_with_delayed<F: PrimeField + MontgomeryLimbs + Copy>(
   poly: &[F],
   l: &[F],
   r_len: usize,
