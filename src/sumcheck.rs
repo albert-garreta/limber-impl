@@ -576,6 +576,7 @@ impl<E: Engine> SumcheckProof<E> {
   ///
   /// Round polynomial is degree 3 (same as the 3-input cubic SC).
   /// Returns `(proof, r, [v_a, v_b, v_c, v_m, v_q])`.
+  #[allow(dead_code)] // wired up by imod_spartan in a follow-up commit
   pub fn prove_cubic_with_five_inputs(
     claim: &E::Scalar,
     taus: Vec<E::Scalar>,
@@ -1244,6 +1245,7 @@ pub(crate) mod eq_sumcheck {
     /// Evaluate eq(tau,X) * (A*B - C - M*Q) for the Integer Mod-R1CS outer sumcheck.
     /// Same BDDT structure as the 3-input variant but with an extra `-M*Q` quadratic
     /// term in the inner polynomial. Leading coefficient picks up `-(m_1-m_0)(q_1-q_0)`.
+    #[allow(dead_code)] // wired up by imod_spartan in a follow-up commit
     #[inline]
     pub fn evaluation_points_cubic_with_five_inputs(
       &self,
@@ -1339,6 +1341,7 @@ pub(crate) mod eq_sumcheck {
 
     /// Fallback for the 5-input cubic SC when `derive_from_claim` cannot invert
     /// (i.e. tau_i = 0): compute t(-1) directly.
+    #[allow(dead_code)] // wired up by imod_spartan in a follow-up commit
     fn fallback_five_inputs(
       &self,
       t_0: E::Scalar,
@@ -1909,7 +1912,10 @@ mod five_input_tests {
     let (v_a, v_b, v_c, v_m, v_q) = (evals[0], evals[1], evals[2], evals[3], evals[4]);
     let eq_tau_r = EqPolynomial::new(tau).evaluate(&r);
     let expected = eq_tau_r * (v_a * v_b - v_c - v_m * v_q);
-    assert_eq!(final_claim, expected, "integrand at r doesn't match final claim");
+    assert_eq!(
+      final_claim, expected,
+      "integrand at r doesn't match final claim"
+    );
   }
 
   /// Zero-check correctness: choose A, B, C, M, Q so that AB - C - MQ = 0 on
@@ -1953,8 +1959,9 @@ mod five_input_tests {
     .expect("prover");
 
     let mut v_t = E::TE::new(b"zero_check");
-    let (final_claim, _r_v) =
-      proof.verify(E::Scalar::ZERO, num_vars, 3, &mut v_t).expect("verifier");
+    let (final_claim, _r_v) = proof
+      .verify(E::Scalar::ZERO, num_vars, 3, &mut v_t)
+      .expect("verifier");
 
     let (v_a, v_b, v_c, v_m, v_q) = (evals[0], evals[1], evals[2], evals[3], evals[4]);
     let eq_tau_r = EqPolynomial::new(tau).evaluate(&r);
@@ -2005,14 +2012,7 @@ mod five_input_tests {
     let mut p5q = MultilinearPolynomial::new(zero);
     let mut t5 = E::TE::new(b"compare");
     let (proof5, r5, evals5) = SumcheckProof::<E>::prove_cubic_with_five_inputs(
-      &claim,
-      tau,
-      &mut p5a,
-      &mut p5b,
-      &mut p5c,
-      &mut p5m,
-      &mut p5q,
-      &mut t5,
+      &claim, tau, &mut p5a, &mut p5b, &mut p5c, &mut p5m, &mut p5q, &mut t5,
     )
     .expect("5-input prover");
 
@@ -2025,7 +2025,10 @@ mod five_input_tests {
 
     let bytes3 = bincode::serialize(&proof3).unwrap();
     let bytes5 = bincode::serialize(&proof5).unwrap();
-    assert_eq!(bytes3, bytes5, "5-input proof should match 3-input when M=Q=0");
+    assert_eq!(
+      bytes3, bytes5,
+      "5-input proof should match 3-input when M=Q=0"
+    );
   }
 
   /// Verifier must reject a tampered proof. Flip a coefficient in one of the
@@ -2068,13 +2071,16 @@ mod five_input_tests {
     let mut short: SumcheckProof<E> = bincode::deserialize(&bytes).unwrap();
     short.compressed_polys.pop();
     let mut v_t = E::TE::new(b"tamper");
-    assert!(short.verify(E::Scalar::ZERO, num_vars, 3, &mut v_t).is_err());
+    assert!(
+      short
+        .verify(E::Scalar::ZERO, num_vars, 3, &mut v_t)
+        .is_err()
+    );
 
     // (b) Replace round 0 with a degree-2 polynomial.
     let mut wrong_degree: SumcheckProof<E> = bincode::deserialize(&bytes).unwrap();
     let low_degree =
-      UniPoly::from_evals(&vec![E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO])
-        .unwrap();
+      UniPoly::from_evals(&[E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO]).unwrap();
     wrong_degree.compressed_polys[0] = low_degree.compress();
     let mut v_t = E::TE::new(b"tamper");
     assert!(
