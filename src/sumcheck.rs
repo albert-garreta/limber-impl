@@ -570,6 +570,92 @@ impl<E: Engine> SumcheckProof<E> {
     ))
   }
 
+  /// Outer sumcheck for Integer Mod-R1CS.
+  ///
+  /// Proves that `sum_i eq(i, tau) * (poly_A(i)*poly_B(i) - poly_C(i) - poly_M(i)*poly_Q(i))` equals `claim`,
+  ///
+  /// Round polynomial is degree 3 (same as the 3-input cubic SC).
+  /// Returns `(proof, r, [v_a, v_b, v_c, v_m, v_q])`.
+  pub fn prove_cubic_with_five_inputs(
+    claim: &E::Scalar,
+    taus: Vec<E::Scalar>,
+    poly_A: &mut MultilinearPolynomial<E::Scalar>,
+    poly_B: &mut MultilinearPolynomial<E::Scalar>,
+    poly_C: &mut MultilinearPolynomial<E::Scalar>,
+    poly_M: &mut MultilinearPolynomial<E::Scalar>,
+    poly_Q: &mut MultilinearPolynomial<E::Scalar>,
+    transcript: &mut E::TE,
+  ) -> Result<(Self, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError> {
+    let mut r: Vec<E::Scalar> = Vec::new();
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
+    let mut claim_per_round = *claim;
+
+    let num_rounds = taus.len();
+    let mut eq_instance = eq_sumcheck::EqSumCheckInstance::<E>::new(taus);
+
+    for round in 0..num_rounds {
+      let (_round_span, round_t) = start_span!("sumcheck_round_imod", round = round);
+
+      let poly = {
+        let (eval_point_0, eval_point_2, eval_point_3) = eq_instance
+          .evaluation_points_cubic_with_five_inputs(
+            poly_A,
+            poly_B,
+            poly_C,
+            poly_M,
+            poly_Q,
+            claim_per_round,
+          );
+
+        let evals = vec![
+          eval_point_0,
+          claim_per_round - eval_point_0,
+          eval_point_2,
+          eval_point_3,
+        ];
+        UniPoly::from_evals(&evals)?
+      };
+
+      transcript.absorb(b"p", &poly);
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+
+      claim_per_round = poly.evaluate(&r_i);
+
+      // Bind all five polynomials plus the eq instance.
+      rayon::join(
+        || {
+          rayon::join(
+            || poly_A.bind_poly_var_top(&r_i),
+            || poly_B.bind_poly_var_top(&r_i),
+          )
+        },
+        || {
+          rayon::join(
+            || poly_C.bind_poly_var_top(&r_i),
+            || {
+              rayon::join(
+                || poly_M.bind_poly_var_top(&r_i),
+                || poly_Q.bind_poly_var_top(&r_i),
+              )
+            },
+          )
+        },
+      );
+      eq_instance.bound(&r_i);
+      info!(elapsed_ms = %round_t.elapsed().as_millis(), round = round, "sumcheck_round_imod");
+    }
+
+    Ok((
+      SumcheckProof {
+        compressed_polys: polys,
+      },
+      r,
+      vec![poly_A[0], poly_B[0], poly_C[0], poly_M[0], poly_Q[0]],
+    ))
+  }
+
   /// Executes the **outer** cubic-with-additive-term sum-check in
   /// Zero-knowledge outer sum-check for the cubic-with-additive-term case.
   pub fn prove_cubic_with_additive_term_zk(
@@ -1155,6 +1241,180 @@ pub(crate) mod eq_sumcheck {
       }
     }
 
+    /// Evaluate eq(tau,X) * (A*B - C - M*Q) for the Integer Mod-R1CS outer sumcheck.
+    /// Same BDDT structure as the 3-input variant but with an extra `-M*Q` quadratic
+    /// term in the inner polynomial. Leading coefficient picks up `-(m_1-m_0)(q_1-q_0)`.
+    #[inline]
+    pub fn evaluation_points_cubic_with_five_inputs(
+      &self,
+      poly_A: &MultilinearPolynomial<E::Scalar>,
+      poly_B: &MultilinearPolynomial<E::Scalar>,
+      poly_C: &MultilinearPolynomial<E::Scalar>,
+      poly_M: &MultilinearPolynomial<E::Scalar>,
+      poly_Q: &MultilinearPolynomial<E::Scalar>,
+      claim: E::Scalar,
+    ) -> (E::Scalar, E::Scalar, E::Scalar) {
+      debug_assert_eq!(poly_A.Z.len() % 2, 0);
+
+      let in_first_half = self.round < self.first_half;
+      let half_p = poly_A.Z.len() / 2;
+
+      // t(0)   = sum_x eq~(x) * (A_0 B_0 - C_0 - M_0 Q_0)
+      // t(inf) = sum_x eq~(x) * ((A_1-A_0)(B_1-B_0) - (M_1-M_0)(Q_1-Q_0))
+      //
+      // Note: we do not use the wide-accumulator delayed-reduction path here
+      // because the integrand mixes two quadratic terms with opposite signs;
+      // the existing accumulator API only accumulates products. A normal
+      // field-multiply path is plenty for phase 1; revisit if this is hot.
+      let (t_0, t_inf) = if in_first_half {
+        let (poly_eq_left, poly_eq_right, second_half) = self.poly_eqs_first_half();
+        let eq_out_len = poly_eq_left.len();
+
+        (0..eq_out_len)
+          .into_par_iter()
+          .map(|x_out| {
+            let e_out = poly_eq_left[x_out];
+            let (inner_0, inner_inf): (E::Scalar, E::Scalar) = poly_eq_right
+              .iter()
+              .enumerate()
+              .map(|(x_in, e_in)| {
+                let id = (x_out << second_half) | x_in;
+
+                let a0 = poly_A.Z[id];
+                let a1 = poly_A.Z[id + half_p];
+                let b0 = poly_B.Z[id];
+                let b1 = poly_B.Z[id + half_p];
+                let c0 = poly_C.Z[id];
+                let m0 = poly_M.Z[id];
+                let m1 = poly_M.Z[id + half_p];
+                let q0 = poly_Q.Z[id];
+                let q1 = poly_Q.Z[id + half_p];
+
+                let t0_elem = a0 * b0 - c0 - m0 * q0;
+                let tinf_elem = (a1 - a0) * (b1 - b0) - (m1 - m0) * (q1 - q0);
+                (*e_in * t0_elem, *e_in * tinf_elem)
+              })
+              .fold((E::Scalar::ZERO, E::Scalar::ZERO), |acc, x| {
+                (acc.0 + x.0, acc.1 + x.1)
+              });
+            (e_out * inner_0, e_out * inner_inf)
+          })
+          .reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1),
+          )
+      } else {
+        let poly_eq_right = self.poly_eq_right_last_half();
+
+        (0..half_p)
+          .into_par_iter()
+          .map(|id| {
+            let e = poly_eq_right[id];
+            let a0 = poly_A.Z[id];
+            let a1 = poly_A.Z[id + half_p];
+            let b0 = poly_B.Z[id];
+            let b1 = poly_B.Z[id + half_p];
+            let c0 = poly_C.Z[id];
+            let m0 = poly_M.Z[id];
+            let m1 = poly_M.Z[id + half_p];
+            let q0 = poly_Q.Z[id];
+            let q1 = poly_Q.Z[id + half_p];
+
+            let t0_elem = a0 * b0 - c0 - m0 * q0;
+            let tinf_elem = (a1 - a0) * (b1 - b0) - (m1 - m0) * (q1 - q0);
+            (e * t0_elem, e * tinf_elem)
+          })
+          .reduce(
+            || (E::Scalar::ZERO, E::Scalar::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1),
+          )
+      };
+
+      if let Some(result) = self.derive_from_claim(t_0, t_inf, claim) {
+        result
+      } else {
+        self.fallback_five_inputs(t_0, t_inf, claim, poly_A, poly_B, poly_C, poly_M, poly_Q)
+      }
+    }
+
+    /// Fallback for the 5-input cubic SC when `derive_from_claim` cannot invert
+    /// (i.e. tau_i = 0): compute t(-1) directly.
+    fn fallback_five_inputs(
+      &self,
+      t_0: E::Scalar,
+      t_inf: E::Scalar,
+      claim: E::Scalar,
+      poly_A: &MultilinearPolynomial<E::Scalar>,
+      poly_B: &MultilinearPolynomial<E::Scalar>,
+      poly_C: &MultilinearPolynomial<E::Scalar>,
+      poly_M: &MultilinearPolynomial<E::Scalar>,
+      poly_Q: &MultilinearPolynomial<E::Scalar>,
+    ) -> (E::Scalar, E::Scalar, E::Scalar) {
+      let p = self.eval_eq_left;
+      let (eq_0, eq_slope, eq_m1) = self.eq_tau_0_slope_m1[self.round - 1];
+      let half_p = poly_A.Z.len() / 2;
+
+      // t(-1) = sum eq~(x) * ((2A_0-A_1)(2B_0-B_1) - (2C_0-C_1) - (2M_0-M_1)(2Q_0-Q_1))
+      let t_m1: E::Scalar = if self.round < self.first_half {
+        let (poly_eq_left, poly_eq_right, second_half) = self.poly_eqs_first_half();
+        let eq_out_len = poly_eq_left.len();
+        (0..eq_out_len)
+          .into_par_iter()
+          .map(|x_out| {
+            let e_out = poly_eq_left[x_out];
+            let inner: E::Scalar = poly_eq_right
+              .iter()
+              .enumerate()
+              .map(|(x_in, e_in)| {
+                let id = (x_out << second_half) | x_in;
+                let m1_a = poly_A.Z[id].double() - poly_A.Z[id + half_p];
+                let m1_b = poly_B.Z[id].double() - poly_B.Z[id + half_p];
+                let m1_c = poly_C.Z[id].double() - poly_C.Z[id + half_p];
+                let m1_m = poly_M.Z[id].double() - poly_M.Z[id + half_p];
+                let m1_q = poly_Q.Z[id].double() - poly_Q.Z[id + half_p];
+                *e_in * (m1_a * m1_b - m1_c - m1_m * m1_q)
+              })
+              .sum();
+            e_out * inner
+          })
+          .sum()
+      } else {
+        let poly_eq_right = self.poly_eq_right_last_half();
+        (0..half_p)
+          .into_par_iter()
+          .map(|id| {
+            let e = poly_eq_right[id];
+            let m1_a = poly_A.Z[id].double() - poly_A.Z[id + half_p];
+            let m1_b = poly_B.Z[id].double() - poly_B.Z[id + half_p];
+            let m1_c = poly_C.Z[id].double() - poly_C.Z[id + half_p];
+            let m1_m = poly_M.Z[id].double() - poly_M.Z[id + half_p];
+            let m1_q = poly_Q.Z[id].double() - poly_Q.Z[id + half_p];
+            e * (m1_a * m1_b - m1_c - m1_m * m1_q)
+          })
+          .sum()
+      };
+
+      let s_0 = eq_0 * p * t_0;
+      let s_leading = eq_slope * p * t_inf;
+      let s_m1 = eq_m1 * p * t_m1;
+
+      let e0 = s_0;
+      let e1: E::Scalar = claim - s_0;
+      let half: E::Scalar = E::Scalar::TWO_INV;
+      let c1: E::Scalar = (e1 - s_m1) * half - s_leading;
+      let c2: E::Scalar = (e1 + s_m1) * half - e0;
+
+      let inner_2: E::Scalar = c2 + s_leading.double();
+      let eval_2: E::Scalar = e0 + (c1 + inner_2.double()).double();
+
+      let c3_3: E::Scalar = s_leading.double() + s_leading;
+      let inner_3: E::Scalar = c2 + c3_3;
+      let mid_3: E::Scalar = c1 + inner_3.double() + inner_3;
+      let eval_3: E::Scalar = e0 + mid_3.double() + mid_3;
+
+      (e0, eval_2, eval_3)
+    }
+
     /// Zero-check round 0 optimization: at the first round of a zero-check (claim=0),
     /// all evaluation points are on the binary hypercube where Az*Bz = Cz (R1CS satisfied),
     /// so t(0) = 0. Only t(inf) (leading coefficient, no Cz) needs to be computed.
@@ -1569,5 +1829,294 @@ mod perf_tests {
       test_inner_sumcheck_with::<PallasHyraxEngine>();
       test_inner_sumcheck_with::<T256HyraxEngine>();
     }
+  }
+}
+
+#[cfg(test)]
+mod five_input_tests {
+  //! Correctness tests for the 5-input cubic SC added for IntMod-R1CS.
+  //!
+  //! The existing perf_tests pass `claim = 0` regardless of the inputs, which
+  //! makes them smoke tests rather than correctness tests (the SC verifier
+  //! only checks intra-round consistency, not that the initial claim matches
+  //! the actual sum). These tests use the true sum over the hypercube as the
+  //! claim, then additionally verify that the SC's final claim equals the
+  //! integrand evaluated at the verifier's challenge `r`.
+  use super::*;
+  use crate::polys::eq::EqPolynomial;
+  use crate::traits::Engine;
+  use ff::Field;
+  use rand::{SeedableRng, rngs::StdRng};
+
+  /// Compute `sum_i eq(i, tau) * (A_i B_i - C_i - M_i Q_i)` over the hypercube.
+  fn hypercube_sum<E: Engine>(
+    a: &[E::Scalar],
+    b: &[E::Scalar],
+    c: &[E::Scalar],
+    m: &[E::Scalar],
+    q: &[E::Scalar],
+    tau: &[E::Scalar],
+  ) -> E::Scalar {
+    let eq = EqPolynomial::evals_from_points(tau);
+    (0..a.len())
+      .map(|i| eq[i] * (a[i] * b[i] - c[i] - m[i] * q[i]))
+      .fold(E::Scalar::ZERO, |acc, x| acc + x)
+  }
+
+  /// End-to-end correctness on random inputs: compute the true sum, prove
+  /// with that sum as the claim, verify, and check that the final-round
+  /// claim returned by the verifier equals `eq(r,τ) · (v_a v_b - v_c - v_m v_q)`.
+  fn random_correctness_with<E: Engine>() {
+    const SEED: u64 = 0xCAFEBABE;
+    let num_vars = 5usize;
+    let n = 1usize << num_vars;
+    let mut rng = StdRng::seed_from_u64(SEED);
+
+    let a: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let b: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let c: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let m: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let q: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let tau: Vec<_> = (0..num_vars).map(|_| E::Scalar::random(&mut rng)).collect();
+
+    let claim = hypercube_sum::<E>(&a, &b, &c, &m, &q, &tau);
+
+    let mut poly_a = MultilinearPolynomial::new(a);
+    let mut poly_b = MultilinearPolynomial::new(b);
+    let mut poly_c = MultilinearPolynomial::new(c);
+    let mut poly_m = MultilinearPolynomial::new(m);
+    let mut poly_q = MultilinearPolynomial::new(q);
+
+    let mut p_t = E::TE::new(b"five_input_test");
+    let (proof, r, evals) = SumcheckProof::<E>::prove_cubic_with_five_inputs(
+      &claim,
+      tau.clone(),
+      &mut poly_a,
+      &mut poly_b,
+      &mut poly_c,
+      &mut poly_m,
+      &mut poly_q,
+      &mut p_t,
+    )
+    .expect("prover");
+
+    let mut v_t = E::TE::new(b"five_input_test");
+    let (final_claim, r_v) = proof
+      .verify(claim, num_vars, 3, &mut v_t)
+      .expect("verifier");
+
+    assert_eq!(r, r_v);
+    let (v_a, v_b, v_c, v_m, v_q) = (evals[0], evals[1], evals[2], evals[3], evals[4]);
+    let eq_tau_r = EqPolynomial::new(tau).evaluate(&r);
+    let expected = eq_tau_r * (v_a * v_b - v_c - v_m * v_q);
+    assert_eq!(final_claim, expected, "integrand at r doesn't match final claim");
+  }
+
+  /// Zero-check correctness: choose A, B, C, M, Q so that AB - C - MQ = 0 on
+  /// the hypercube (set C := AB - MQ pointwise). Sum is 0, the SC should
+  /// succeed with `claim = 0`, and the final-claim consistency check holds.
+  fn zero_check_correctness_with<E: Engine>() {
+    const SEED: u64 = 0xC0FFEE;
+    let num_vars = 5usize;
+    let n = 1usize << num_vars;
+    let mut rng = StdRng::seed_from_u64(SEED);
+
+    let a: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let b: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let m: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let q: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let c: Vec<_> = (0..n).map(|i| a[i] * b[i] - m[i] * q[i]).collect();
+    let tau: Vec<_> = (0..num_vars).map(|_| E::Scalar::random(&mut rng)).collect();
+
+    assert_eq!(
+      hypercube_sum::<E>(&a, &b, &c, &m, &q, &tau),
+      E::Scalar::ZERO
+    );
+
+    let mut poly_a = MultilinearPolynomial::new(a);
+    let mut poly_b = MultilinearPolynomial::new(b);
+    let mut poly_c = MultilinearPolynomial::new(c);
+    let mut poly_m = MultilinearPolynomial::new(m);
+    let mut poly_q = MultilinearPolynomial::new(q);
+
+    let mut p_t = E::TE::new(b"zero_check");
+    let (proof, r, evals) = SumcheckProof::<E>::prove_cubic_with_five_inputs(
+      &E::Scalar::ZERO,
+      tau.clone(),
+      &mut poly_a,
+      &mut poly_b,
+      &mut poly_c,
+      &mut poly_m,
+      &mut poly_q,
+      &mut p_t,
+    )
+    .expect("prover");
+
+    let mut v_t = E::TE::new(b"zero_check");
+    let (final_claim, _r_v) =
+      proof.verify(E::Scalar::ZERO, num_vars, 3, &mut v_t).expect("verifier");
+
+    let (v_a, v_b, v_c, v_m, v_q) = (evals[0], evals[1], evals[2], evals[3], evals[4]);
+    let eq_tau_r = EqPolynomial::new(tau).evaluate(&r);
+    let expected = eq_tau_r * (v_a * v_b - v_c - v_m * v_q);
+    assert_eq!(final_claim, expected);
+  }
+
+  /// When `M = Q = 0` everywhere, the 5-input cubic reduces to the 3-input
+  /// cubic (the `−M·Q` term contributes nothing to either `t_0` or `t_inf`).
+  /// We expect byte-identical proofs.
+  fn matches_three_input_when_mq_zero_with<E: Engine>() {
+    const SEED: u64 = 0xDEADBEEF;
+    let num_vars = 4usize;
+    let n = 1usize << num_vars;
+    let mut rng = StdRng::seed_from_u64(SEED);
+
+    let a: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let b: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let c: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let tau: Vec<_> = (0..num_vars).map(|_| E::Scalar::random(&mut rng)).collect();
+    let zero: Vec<_> = vec![E::Scalar::ZERO; n];
+
+    // Use the true sum so the proofs are correct on both sides; otherwise the
+    // 3-input variant produces internally consistent but semantically wrong
+    // round polynomials, and we'd be comparing apples to a different apple.
+    let claim = hypercube_sum::<E>(&a, &b, &c, &zero, &zero, &tau);
+
+    // 3-input run
+    let mut p3a = MultilinearPolynomial::new(a.clone());
+    let mut p3b = MultilinearPolynomial::new(b.clone());
+    let mut p3c = MultilinearPolynomial::new(c.clone());
+    let mut t3 = E::TE::new(b"compare");
+    let (proof3, r3, evals3) = SumcheckProof::<E>::prove_cubic_with_three_inputs(
+      &claim,
+      tau.clone(),
+      &mut p3a,
+      &mut p3b,
+      &mut p3c,
+      &mut t3,
+    )
+    .expect("3-input prover");
+
+    // 5-input run with M = Q = 0
+    let mut p5a = MultilinearPolynomial::new(a);
+    let mut p5b = MultilinearPolynomial::new(b);
+    let mut p5c = MultilinearPolynomial::new(c);
+    let mut p5m = MultilinearPolynomial::new(zero.clone());
+    let mut p5q = MultilinearPolynomial::new(zero);
+    let mut t5 = E::TE::new(b"compare");
+    let (proof5, r5, evals5) = SumcheckProof::<E>::prove_cubic_with_five_inputs(
+      &claim,
+      tau,
+      &mut p5a,
+      &mut p5b,
+      &mut p5c,
+      &mut p5m,
+      &mut p5q,
+      &mut t5,
+    )
+    .expect("5-input prover");
+
+    assert_eq!(r3, r5, "challenge vectors differ");
+    assert_eq!(evals3[0], evals5[0]);
+    assert_eq!(evals3[1], evals5[1]);
+    assert_eq!(evals3[2], evals5[2]);
+    assert_eq!(evals5[3], E::Scalar::ZERO);
+    assert_eq!(evals5[4], E::Scalar::ZERO);
+
+    let bytes3 = bincode::serialize(&proof3).unwrap();
+    let bytes5 = bincode::serialize(&proof5).unwrap();
+    assert_eq!(bytes3, bytes5, "5-input proof should match 3-input when M=Q=0");
+  }
+
+  /// Verifier must reject a tampered proof. Flip a coefficient in one of the
+  /// compressed round polynomials.
+  fn verifier_rejects_tamper_with<E: Engine>() {
+    const SEED: u64 = 0x1234_5678;
+    let num_vars = 4usize;
+    let n = 1usize << num_vars;
+    let mut rng = StdRng::seed_from_u64(SEED);
+
+    let a: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let b: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let m: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let q: Vec<_> = (0..n).map(|_| E::Scalar::random(&mut rng)).collect();
+    let c: Vec<_> = (0..n).map(|i| a[i] * b[i] - m[i] * q[i]).collect();
+    let tau: Vec<_> = (0..num_vars).map(|_| E::Scalar::random(&mut rng)).collect();
+
+    let mut p_t = E::TE::new(b"tamper");
+    let (proof, _r, _evals) = SumcheckProof::<E>::prove_cubic_with_five_inputs(
+      &E::Scalar::ZERO,
+      tau,
+      &mut MultilinearPolynomial::new(a),
+      &mut MultilinearPolynomial::new(b),
+      &mut MultilinearPolynomial::new(c),
+      &mut MultilinearPolynomial::new(m),
+      &mut MultilinearPolynomial::new(q),
+      &mut p_t,
+    )
+    .expect("prover");
+
+    // The SC verifier rebuilds the omitted linear coeff from the running
+    // claim, so swapping in another degree-3 poly is silently absorbed. The
+    // observable failure modes from `verify` alone are:
+    //   (a) wrong number of round polys, and
+    //   (b) a round poly that decompresses to the wrong degree.
+    // Each is exercised below.
+
+    // (a) Drop the last round poly.
+    let bytes = bincode::serialize(&proof).unwrap();
+    let mut short: SumcheckProof<E> = bincode::deserialize(&bytes).unwrap();
+    short.compressed_polys.pop();
+    let mut v_t = E::TE::new(b"tamper");
+    assert!(short.verify(E::Scalar::ZERO, num_vars, 3, &mut v_t).is_err());
+
+    // (b) Replace round 0 with a degree-2 polynomial.
+    let mut wrong_degree: SumcheckProof<E> = bincode::deserialize(&bytes).unwrap();
+    let low_degree =
+      UniPoly::from_evals(&vec![E::Scalar::ZERO, E::Scalar::ZERO, E::Scalar::ZERO])
+        .unwrap();
+    wrong_degree.compressed_polys[0] = low_degree.compress();
+    let mut v_t = E::TE::new(b"tamper");
+    assert!(
+      wrong_degree
+        .verify(E::Scalar::ZERO, num_vars, 3, &mut v_t)
+        .is_err()
+    );
+
+    // Sanity: the untampered proof still verifies.
+    let mut v_t = E::TE::new(b"tamper");
+    assert!(proof.verify(E::Scalar::ZERO, num_vars, 3, &mut v_t).is_ok());
+  }
+
+  #[test]
+  fn test_five_input_random_correctness() {
+    use crate::provider::{Bn254Engine, PallasHyraxEngine, T256HyraxEngine};
+    random_correctness_with::<Bn254Engine>();
+    random_correctness_with::<PallasHyraxEngine>();
+    random_correctness_with::<T256HyraxEngine>();
+  }
+
+  #[test]
+  fn test_five_input_zero_check() {
+    use crate::provider::{Bn254Engine, PallasHyraxEngine, T256HyraxEngine};
+    zero_check_correctness_with::<Bn254Engine>();
+    zero_check_correctness_with::<PallasHyraxEngine>();
+    zero_check_correctness_with::<T256HyraxEngine>();
+  }
+
+  #[test]
+  fn test_five_input_matches_three_input_when_mq_zero() {
+    use crate::provider::{Bn254Engine, PallasHyraxEngine, T256HyraxEngine};
+    matches_three_input_when_mq_zero_with::<Bn254Engine>();
+    matches_three_input_when_mq_zero_with::<PallasHyraxEngine>();
+    matches_three_input_when_mq_zero_with::<T256HyraxEngine>();
+  }
+
+  #[test]
+  fn test_five_input_verifier_rejects_tampering() {
+    use crate::provider::{Bn254Engine, PallasHyraxEngine, T256HyraxEngine};
+    verifier_rejects_tamper_with::<Bn254Engine>();
+    verifier_rejects_tamper_with::<PallasHyraxEngine>();
+    verifier_rejects_tamper_with::<T256HyraxEngine>();
   }
 }
