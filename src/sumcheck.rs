@@ -576,7 +576,6 @@ impl<E: Engine> SumcheckProof<E> {
   ///
   /// Round polynomial is degree 3 (same as the 3-input cubic SC).
   /// Returns `(proof, r, [v_a, v_b, v_c, v_m, v_q])`.
-  #[allow(dead_code)] // wired up by imod_spartan in a follow-up commit
   pub fn prove_cubic_with_five_inputs(
     claim: &E::Scalar,
     taus: Vec<E::Scalar>,
@@ -1245,7 +1244,6 @@ pub(crate) mod eq_sumcheck {
     /// Evaluate eq(tau,X) * (A*B - C - M*Q) for the Integer Mod-R1CS outer sumcheck.
     /// Same BDDT structure as the 3-input variant but with an extra `-M*Q` quadratic
     /// term in the inner polynomial. Leading coefficient picks up `-(m_1-m_0)(q_1-q_0)`.
-    #[allow(dead_code)] // wired up by imod_spartan in a follow-up commit
     #[inline]
     pub fn evaluation_points_cubic_with_five_inputs(
       &self,
@@ -1341,7 +1339,6 @@ pub(crate) mod eq_sumcheck {
 
     /// Fallback for the 5-input cubic SC when `derive_from_claim` cannot invert
     /// (i.e. tau_i = 0): compute t(-1) directly.
-    #[allow(dead_code)] // wired up by imod_spartan in a follow-up commit
     fn fallback_five_inputs(
       &self,
       t_0: E::Scalar,
