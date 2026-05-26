@@ -18,6 +18,7 @@
 
 use crate::{
   Blind, Commitment, CommitmentKey, DEFAULT_COMMITMENT_WIDTH, PCS, VerifierKey,
+  digest::SimpleDigestible,
   errors::SpartanError,
   r1cs::SparseMatrix,
   traits::{Engine, pcs::PCSEngineTrait},
@@ -39,6 +40,8 @@ pub struct IntModR1CSShape<E: Engine> {
   pub(crate) C: SparseMatrix<E::Scalar>,
   pub(crate) mods: Vec<E::Scalar>,
 }
+
+impl<E: Engine> SimpleDigestible for IntModR1CSShape<E> {}
 
 /// Witness for an Integer Mod-R1CS instance: the satisfying assignment `w`
 /// and the per-row quotients `q`, plus PCS blinds for both commitments.

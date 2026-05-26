@@ -10,15 +10,17 @@
 
 use crate::{
   Blind, CommitmentKey, VerifierKey,
+  digest::{DigestComputer, Digestible},
   errors::SpartanError,
   imod_r1cs::{IntModR1CSInstance, IntModR1CSShape, IntModR1CSWitness},
   math::Math,
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
   start_span,
   sumcheck::SumcheckProof,
-  traits::{Engine, pcs::PCSEngineTrait, transcript::TranscriptEngineTrait},
+  traits::{Engine, pcs::PCSEngineTrait, snark::SpartanDigest, transcript::TranscriptEngineTrait},
 };
 use ff::Field;
+use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -29,6 +31,7 @@ pub struct IntModSpartanProverKey<E: Engine> {
   pub(crate) ck: CommitmentKey<E>,
   pub(crate) ck_s: CommitmentKey<E>,
   pub(crate) shape: IntModR1CSShape<E>,
+  pub(crate) vk_digest: SpartanDigest,
 }
 
 /// Verifier key for the IntMod-R1CS SNARK.
@@ -37,6 +40,37 @@ pub struct IntModSpartanVerifierKey<E: Engine> {
   pub(crate) vk_ee: VerifierKey<E>,
   pub(crate) ck_s: CommitmentKey<E>,
   pub(crate) shape: IntModR1CSShape<E>,
+  pub(crate) digest: OnceCell<SpartanDigest>,
+}
+
+impl<E: Engine> Digestible for IntModSpartanVerifierKey<E> {
+  fn write_bytes<W: Sized + std::io::Write>(&self, w: &mut W) -> Result<(), std::io::Error> {
+    use bincode::Options;
+    let config = bincode::DefaultOptions::new()
+      .with_little_endian()
+      .with_fixint_encoding();
+    config
+      .serialize_into(&mut *w, &self.vk_ee)
+      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    config
+      .serialize_into(&mut *w, &self.ck_s)
+      .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    self.shape.write_bytes(w)?;
+    Ok(())
+  }
+}
+
+impl<E: Engine> IntModSpartanVerifierKey<E> {
+  /// Returns the (cached) digest binding the verifier key's public parameters.
+  pub fn digest(&self) -> Result<SpartanDigest, SpartanError> {
+    self
+      .digest
+      .get_or_try_init(|| DigestComputer::new(self).digest())
+      .cloned()
+      .map_err(|_| SpartanError::DigestError {
+        reason: "Unable to compute digest for IntModSpartanVerifierKey".to_string(),
+      })
+  }
 }
 
 /// IntMod-R1CS SNARK proof.
@@ -72,12 +106,19 @@ impl<E: Engine> IntModSpartanSNARK<E> {
     let (ck_s, _) = E::PCS::setup(b"ck_s_imod", 1, 1);
     E::PCS::precompute_ck(&ck_s);
 
-    let pk = IntModSpartanProverKey {
-      ck: ck.clone(),
+    let vk = IntModSpartanVerifierKey {
+      vk_ee,
       ck_s: ck_s.clone(),
       shape: shape.clone(),
+      digest: OnceCell::new(),
     };
-    let vk = IntModSpartanVerifierKey { vk_ee, ck_s, shape };
+    let vk_digest = vk.digest()?;
+    let pk = IntModSpartanProverKey {
+      ck,
+      ck_s,
+      shape,
+      vk_digest,
+    };
     Ok((pk, vk))
   }
 
@@ -91,7 +132,7 @@ impl<E: Engine> IntModSpartanSNARK<E> {
     let mut transcript = E::TE::new(b"IntModSpartanSNARK");
 
     // Bind the public state to the transcript.
-    absorb_shape::<E>(&pk.shape, &mut transcript);
+    transcript.absorb(b"vk", &pk.vk_digest);
     transcript.absorb(b"comm_w", &U.comm_w);
     transcript.absorb(b"comm_q", &U.comm_q);
     transcript.absorb(b"x", &U.x.as_slice());
@@ -241,7 +282,7 @@ impl<E: Engine> IntModSpartanSNARK<E> {
     let (_verify_span, verify_t) = start_span!("imod_spartan_verify");
     let mut transcript = E::TE::new(b"IntModSpartanSNARK");
 
-    absorb_shape::<E>(&vk.shape, &mut transcript);
+    transcript.absorb(b"vk", &vk.digest()?);
     transcript.absorb(b"comm_w", &U.comm_w);
     transcript.absorb(b"comm_q", &U.comm_q);
     transcript.absorb(b"x", &U.x.as_slice());
@@ -334,14 +375,6 @@ impl<E: Engine> IntModSpartanSNARK<E> {
 
 // ---------------------------------------------------------------------------
 // helpers
-
-fn absorb_shape<E: Engine>(shape: &IntModR1CSShape<E>, transcript: &mut E::TE) {
-  // Phase 1: cheap absorption. Replace with a digest once we have one.
-  transcript.absorb(b"num_cons", &E::Scalar::from(shape.num_cons as u64));
-  transcript.absorb(b"num_vars", &E::Scalar::from(shape.num_vars as u64));
-  transcript.absorb(b"num_io", &E::Scalar::from(shape.num_io as u64));
-  transcript.absorb(b"mods", &shape.mods.as_slice());
-}
 
 /// Compute ABC[y] = sum_i eq_rx[i] · (A[i,y] + r·B[i,y] + r²·C[i,y]),
 /// then right-pad to length 2·num_vars so it fits the inner-SC layout.
@@ -557,5 +590,58 @@ mod tests {
     use crate::provider::{PallasHyraxEngine, T256HyraxEngine};
     run_verify_rejects_tampering_with::<PallasHyraxEngine>();
     run_verify_rejects_tampering_with::<T256HyraxEngine>();
+  }
+
+  /// Two shapes with the same dimensions and mods but a different `A` entry
+  /// must produce distinct verifier-key digests, and a proof produced for one
+  /// must be rejected under the other's vk.
+  fn run_digest_binds_matrices_with<E: Engine>() {
+    let one = E::Scalar::ONE;
+    let two = E::Scalar::from(2);
+    let num_cons = 2usize;
+    let num_vars = 4usize;
+    let num_io = 0usize;
+    let num_cols = num_vars + 1 + num_io;
+    let mat_a1 = SparseMatrix::<E::Scalar>::new(&[(0, 0, one)], num_cons, num_cols);
+    let mat_a2 = SparseMatrix::<E::Scalar>::new(&[(0, 0, two)], num_cons, num_cols);
+    let mat_b = SparseMatrix::<E::Scalar>::new(&[(0, 1, one)], num_cons, num_cols);
+    let mat_c = SparseMatrix::<E::Scalar>::new(&[(0, 2, one)], num_cons, num_cols);
+    let mods = vec![E::Scalar::from(14u64), E::Scalar::ZERO];
+
+    let shape1 = IntModR1CSShape::<E>::new(
+      num_cons,
+      num_vars,
+      num_io,
+      mat_a1,
+      mat_b.clone(),
+      mat_c.clone(),
+      mods.clone(),
+    )
+    .unwrap();
+    let shape2 =
+      IntModR1CSShape::<E>::new(num_cons, num_vars, num_io, mat_a2, mat_b, mat_c, mods).unwrap();
+    let (pk1, vk1) = IntModSpartanSNARK::<E>::setup(shape1.clone()).unwrap();
+    let (_, vk2) = IntModSpartanSNARK::<E>::setup(shape2).unwrap();
+    assert_ne!(vk1.digest().unwrap(), vk2.digest().unwrap());
+
+    // End-to-end: a valid proof for shape1 must be rejected by shape2's vk.
+    let w = vec![
+      E::Scalar::from(3u64),
+      E::Scalar::from(5u64),
+      E::Scalar::from(1u64),
+      E::Scalar::ZERO,
+    ];
+    let q = vec![E::Scalar::from(1u64), E::Scalar::ZERO];
+    let (W, U) = IntModR1CSWitness::<E>::new(&shape1, &pk1.ck, w, q, vec![]).unwrap();
+    let proof = IntModSpartanSNARK::<E>::prove(&pk1, &U, &W).unwrap();
+    proof.verify(&vk1, &U).unwrap();
+    assert!(proof.verify(&vk2, &U).is_err());
+  }
+
+  #[test]
+  fn test_imod_spartan_digest_binds_matrices() {
+    use crate::provider::{PallasHyraxEngine, T256HyraxEngine};
+    run_digest_binds_matrices_with::<PallasHyraxEngine>();
+    run_digest_binds_matrices_with::<T256HyraxEngine>();
   }
 }
