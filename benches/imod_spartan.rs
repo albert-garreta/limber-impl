@@ -30,7 +30,10 @@ fn make_shape_and_witness(
   num_cons: usize,
   num_vars: usize,
 ) -> (IntModR1CSShape<E>, Vec<Sc>, Vec<Sc>) {
-  assert!(3 * num_cons <= num_vars, "num_vars must hold 3·num_cons columns");
+  assert!(
+    3 * num_cons <= num_vars,
+    "num_vars must hold 3·num_cons columns"
+  );
 
   let one = Sc::ONE;
   let num_io = 0;
@@ -49,13 +52,7 @@ fn make_shape_and_witness(
   let mods = vec![n_scalar; num_cons];
 
   let shape = IntModR1CSShape::<E>::from_entries(
-    num_cons,
-    num_vars,
-    num_io,
-    &a_entries,
-    &b_entries,
-    &c_entries,
-    mods,
+    num_cons, num_vars, num_io, &a_entries, &b_entries, &c_entries, mods,
   )
   .unwrap();
 
