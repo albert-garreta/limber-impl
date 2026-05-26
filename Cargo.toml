@@ -69,6 +69,14 @@ harness = false
 name = "sha256_neutronnova"
 harness = false
 
+[[bench]]
+name = "imod_spartan"
+harness = false
+
+[[bench]]
+name = "spartan_synthetic"
+harness = false
+
 [profile.release]
 debug = 1
 lto = "fat"

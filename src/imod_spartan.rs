@@ -34,6 +34,14 @@ pub struct IntModSpartanProverKey<E: Engine> {
   pub(crate) vk_digest: SpartanDigest,
 }
 
+impl<E: Engine> IntModSpartanProverKey<E> {
+  /// Commitment key used for the witness and quotient polynomials. External
+  /// callers need this to construct `IntModR1CSWitness` instances.
+  pub fn ck(&self) -> &CommitmentKey<E> {
+    &self.ck
+  }
+}
+
 /// Verifier key for the IntMod-R1CS SNARK.
 #[derive(Clone)]
 pub struct IntModSpartanVerifierKey<E: Engine> {

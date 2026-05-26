@@ -119,6 +119,48 @@ impl<E: Engine> IntModR1CSShape<E> {
     })
   }
 
+  /// Convenience constructor that takes raw `(row, col, val)` entries for
+  /// each matrix. Builds CSR matrices via the same incremental pattern
+  /// bellpepper uses (`SparseMatrix::empty()` + push to public fields),
+  /// so external callers (benchmarks, future frontends) don't need access
+  /// to the test-only `SparseMatrix::new` COO constructor.
+  ///
+  /// Entries within each row are sorted by column before insertion.
+  pub fn from_entries(
+    num_cons: usize,
+    num_vars: usize,
+    num_io: usize,
+    a_entries: &[(usize, usize, E::Scalar)],
+    b_entries: &[(usize, usize, E::Scalar)],
+    c_entries: &[(usize, usize, E::Scalar)],
+    mods: Vec<E::Scalar>,
+  ) -> Result<Self, SpartanError> {
+    let num_cols = num_vars + 1 + num_io;
+    let to_csr = |entries: &[(usize, usize, E::Scalar)]| -> SparseMatrix<E::Scalar> {
+      let mut by_row: Vec<Vec<(usize, E::Scalar)>> = vec![Vec::new(); num_cons];
+      for &(r, c, v) in entries {
+        by_row[r].push((c, v));
+      }
+      for row in &mut by_row {
+        row.sort_by_key(|x| x.0);
+      }
+      let mut m = SparseMatrix::<E::Scalar>::empty();
+      m.cols = num_cols;
+      for row in by_row {
+        for (c, v) in row {
+          m.data.push(v);
+          m.indices.push(c);
+        }
+        m.indptr.push(m.data.len());
+      }
+      m
+    };
+    let mat_a = to_csr(a_entries);
+    let mat_b = to_csr(b_entries);
+    let mat_c = to_csr(c_entries);
+    Self::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+  }
+
   /// PCS setup. The same commitment key is reused for both `w` (length
   /// `num_vars`) and `q` (length `num_cons`); we size it to the larger of
   /// the two so a single key suffices.
