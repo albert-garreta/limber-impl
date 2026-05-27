@@ -226,14 +226,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     + for<'de> Deserialize<'de>;
 
   /// Blind / commitment randomizer.
-  type Blind: Clone
-    + Debug
-    + Send
-    + Sync
-    + PartialEq
-    + Eq
-    + Serialize
-    + for<'de> Deserialize<'de>;
+  type Blind: Clone + Debug + Send + Sync + PartialEq + Eq + Serialize + for<'de> Deserialize<'de>;
 
   /// Evaluation-argument data sent in the proof.
   type EvaluationArgument: Clone + Debug + Send + Sync + Serialize + for<'de> Deserialize<'de>;
