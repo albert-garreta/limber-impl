@@ -7,7 +7,7 @@
 //! This module defines a collection of traits that define the behavior of a zkSNARK for RelaxedR1CS
 use crate::{
   errors::SpartanError,
-  traits::{Engine, Group, TranscriptReprTrait, circuit::SpartanCircuit},
+  traits::{Engine, TranscriptReprTrait, circuit::SpartanCircuit},
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +60,7 @@ pub trait DigestHelperTrait<E: Engine> {
 }
 
 // implement TranscriptReprTrait for the SpartanDigest
-impl<G: Group> TranscriptReprTrait<G> for SpartanDigest {
+impl TranscriptReprTrait for SpartanDigest {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     self.to_vec()
   }

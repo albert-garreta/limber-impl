@@ -212,7 +212,7 @@ where
 // ------------------------------------------------------------------------------------------------
 // Byte encoding for relaxed instances (needed by transcripts)
 // ------------------------------------------------------------------------------------------------
-impl<E: Engine> TranscriptReprTrait<E::GE> for RelaxedR1CSInstance<E> {
+impl<E: Engine> TranscriptReprTrait for RelaxedR1CSInstance<E> {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     [
       self.comm_W.to_transcript_bytes(),

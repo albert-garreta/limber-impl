@@ -711,7 +711,7 @@ where
   }
 }
 
-impl<E: Engine> TranscriptReprTrait<E::GE> for HyraxCommitment<E>
+impl<E: Engine> TranscriptReprTrait for HyraxCommitment<E>
 where
   E::GE: DlogGroupExt,
 {

@@ -11,6 +11,7 @@ use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
 pub mod circuit;
+pub mod mod_engine;
 pub mod pcs;
 pub mod snark;
 pub mod transcript;
@@ -34,16 +35,16 @@ pub trait Group: Clone + Copy + Debug + Send + Sync + Sized + Eq + PartialEq {
 }
 
 /// A collection of engines that are required by the library
-pub trait Engine: Clone + Copy + Debug + Send + Sync + Sized + Eq + PartialEq {
+pub trait Engine: Clone + Copy + Debug + Send + Sync + Sized + Eq + PartialEq + 'static {
   /// A type representing an element of the base field of the group
-  type Base: PrimeFieldBits + TranscriptReprTrait<Self::GE> + Serialize + for<'de> Deserialize<'de>;
+  type Base: PrimeFieldBits + TranscriptReprTrait + Serialize + for<'de> Deserialize<'de>;
 
   /// A type representing an element of the scalar field of the group
   type Scalar: PrimeFieldBits
     + PrimeFieldExt
     + Send
     + Sync
-    + TranscriptReprTrait<Self::GE>
+    + TranscriptReprTrait
     + Serialize
     + for<'de> Deserialize<'de>
     + FieldReductionConstants

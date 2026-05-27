@@ -488,7 +488,7 @@ where
   }
 }
 
-impl<E: Engine> TranscriptReprTrait<E::GE> for KZHCommitment<E>
+impl<E: Engine> TranscriptReprTrait for KZHCommitment<E>
 where
   E::GE: DlogGroupExt,
 {

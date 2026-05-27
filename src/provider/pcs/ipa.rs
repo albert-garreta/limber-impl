@@ -55,7 +55,7 @@ where
   }
 }
 
-impl<E: Engine> TranscriptReprTrait<E::GE> for InnerProductInstance<E>
+impl<E: Engine> TranscriptReprTrait for InnerProductInstance<E>
 where
   E::GE: DlogGroup,
 {

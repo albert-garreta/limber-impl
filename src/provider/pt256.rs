@@ -62,7 +62,7 @@ crate::impl_montgomery_limbs!(p256::Scalar);
 crate::impl_field_reduction_constants!(t256::Scalar);
 crate::impl_montgomery_limbs!(t256::Scalar);
 
-impl<G: Group> TranscriptReprTrait<G> for t256::Base {
+impl TranscriptReprTrait for t256::Base {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     self.to_bytes().into_iter().rev().collect()
   }

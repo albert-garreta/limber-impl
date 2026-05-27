@@ -725,7 +725,7 @@ impl<E: Engine> R1CSInstance<E> {
   }
 }
 
-impl<E: Engine> TranscriptReprTrait<E::GE> for R1CSInstance<E> {
+impl<E: Engine> TranscriptReprTrait for R1CSInstance<E> {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     [
       self.comm_W.to_transcript_bytes(),

@@ -7,10 +7,7 @@
 //! Main components:
 //! - `UniPoly`: an univariate dense polynomial in coefficient form (big endian),
 //! - `CompressedUniPoly`: a univariate dense polynomial, compressed (omitted linear term), in coefficient form (little endian),
-use crate::{
-  errors::SpartanError,
-  traits::{Group, transcript::TranscriptReprTrait},
-};
+use crate::{errors::SpartanError, traits::transcript::TranscriptReprTrait};
 use ff::PrimeField;
 use serde::{Deserialize, Serialize};
 
@@ -179,7 +176,7 @@ impl<Scalar: PrimeField> CompressedUniPoly<Scalar> {
   }
 }
 
-impl<G: Group> TranscriptReprTrait<G> for UniPoly<G::Scalar> {
+impl<Scalar: PrimeField> TranscriptReprTrait for UniPoly<Scalar> {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     let coeffs = self.compress().coeffs_except_linear_term;
     coeffs

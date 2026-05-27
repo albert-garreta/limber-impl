@@ -63,7 +63,7 @@ impl<T, Rhs, Output> ScalarMulOwned<Rhs, Output> for T where T: for<'r> ScalarMu
 /// A trait that defines the core discrete logarithm group functionality
 pub trait DlogGroup:
   Group
-  + TranscriptReprTrait<Self>
+  + TranscriptReprTrait
   + Serialize
   + for<'de> Deserialize<'de>
   + GroupOps
@@ -80,7 +80,7 @@ pub trait DlogGroup:
     + Sync
     + Serialize
     + for<'de> Deserialize<'de>
-    + TranscriptReprTrait<Self>
+    + TranscriptReprTrait
     + CurveAffine
     + SerdeObject;
 
@@ -279,13 +279,13 @@ macro_rules! impl_traits_no_dlog_ext {
       }
     }
 
-    impl<G: Group> TranscriptReprTrait<G> for $name::Scalar {
+    impl TranscriptReprTrait for $name::Scalar {
       fn to_transcript_bytes(&self) -> Vec<u8> {
         self.to_bytes().into_iter().rev().collect()
       }
     }
 
-    impl<G: DlogGroup> TranscriptReprTrait<G> for $name::Affine {
+    impl TranscriptReprTrait for $name::Affine {
       fn to_transcript_bytes(&self) -> Vec<u8> {
         let coords = self.coordinates().unwrap();
         let x_bytes = coords.x().to_bytes().into_iter();
@@ -294,7 +294,7 @@ macro_rules! impl_traits_no_dlog_ext {
       }
     }
 
-    impl<G: DlogGroup> TranscriptReprTrait<G> for $name::Point {
+    impl TranscriptReprTrait for $name::Point {
       fn to_transcript_bytes(&self) -> Vec<u8> {
         let affine = self.affine();
         let coords = affine.coordinates().unwrap();
@@ -382,7 +382,7 @@ pub trait PairingGroup: DlogGroup {
     + Sync
     + Serialize
     + for<'de> Deserialize<'de>
-    + TranscriptReprTrait<Self>;
+    + TranscriptReprTrait;
 
   /// Target group Gt (codomain of the pairing).
   type Gt: Copy + Clone + Debug + Eq + Send + Sync;

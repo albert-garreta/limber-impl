@@ -22,7 +22,7 @@ pub trait CommitmentTrait<E: Engine>:
   + Eq
   + Send
   + Sync
-  + TranscriptReprTrait<E::GE>
+  + TranscriptReprTrait
   + Serialize
   + for<'de> Deserialize<'de>
 {

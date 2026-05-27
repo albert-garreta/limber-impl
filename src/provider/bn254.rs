@@ -51,14 +51,14 @@ crate::impl_field_reduction_constants!(types::Scalar);
 crate::impl_montgomery_limbs!(types::Scalar);
 
 // BN254 is not a cycle pair, so we need to manually implement TranscriptReprTrait for the Base field
-impl<G: Group> TranscriptReprTrait<G> for types::Base {
+impl TranscriptReprTrait for types::Base {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     self.to_bytes().into_iter().rev().collect()
   }
 }
 
 // Absorbing G2 points into a G1-based transcript uses the compressed encoding.
-impl TranscriptReprTrait<types::Point> for Bn256G2Affine {
+impl TranscriptReprTrait for Bn256G2Affine {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     GroupEncoding::to_bytes(self).as_ref().to_vec()
   }
