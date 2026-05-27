@@ -40,6 +40,7 @@ pub mod traits;
 // internal modules
 mod big_num;
 mod polys;
+mod polys_modp;
 mod sumcheck;
 
 // public modules for proof systems

@@ -38,10 +38,11 @@
 
 use crate::{
   big_num::DelayedReduction,
-  traits::{Engine, PrimeFieldExt, transcript::TranscriptEngineTrait},
+  traits::{Engine, transcript::TranscriptEngineTrait},
 };
 use core::{
   fmt::Debug,
+  iter::{Product, Sum},
   ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 use ff::{Field, PrimeField};
@@ -70,6 +71,7 @@ pub trait SumcheckField:
   + Eq
   + Serialize
   + for<'de> Deserialize<'de>
+  + From<u64>
   + Add<Output = Self>
   + Sub<Output = Self>
   + Mul<Output = Self>
@@ -77,24 +79,31 @@ pub trait SumcheckField:
   + AddAssign
   + SubAssign
   + MulAssign
+  + Sum
+  + Product
   + 'static
 {
-  /// The additive identity.
+  /// The additive identity. Replaces `ff::Field::ZERO`; method form so it
+  /// works for runtime-modulus fields where the const form would not be
+  /// const-evaluable.
   fn zero() -> Self;
 
-  /// The multiplicative identity.
+  /// The multiplicative identity. Replaces `ff::Field::ONE`; method form
+  /// for the same reason as `zero()`.
   fn one() -> Self;
-
-  /// Cast a `u64` into the field. Used for small constants (e.g. round-poly
-  /// interpolation) and length-derived indices.
-  fn from_u64(v: u64) -> Self;
 
   /// Multiplicative inverse. Returns `None` if `*self == Self::zero()`.
   fn invert(&self) -> Option<Self>;
 
-  /// Reduce raw bytes (typically from a transcript squeeze) modulo the
-  /// field's modulus. Used for deriving challenges in the transcript.
-  fn from_bytes_reduce(bytes: &[u8]) -> Self;
+  /// Serialize the field element to little-endian bytes. Used by
+  /// `polys_modp` when implementing `TranscriptReprTrait` for round
+  /// polynomials.
+  fn to_le_bytes(&self) -> Vec<u8>;
+
+  // Phase 2b will add a `from_bytes_reduce(bytes: &[u8]) -> Self` method
+  // here for deriving transcript challenges in dynamic-modulus fields.
+  // For Phase 2's first cut, transcript challenges still come through
+  // `PrimeFieldExt::from_uniform` on the curve scalar.
 }
 
 /// Blanket impl: any static-modulus prime field that already implements
@@ -104,13 +113,14 @@ pub trait SumcheckField:
 impl<F> SumcheckField for F
 where
   F: PrimeField
-    + PrimeFieldExt
     + Copy
     + Send
     + Sync
     + Default
     + Serialize
     + for<'de> Deserialize<'de>
+    + Sum
+    + Product
     + 'static,
 {
   fn zero() -> Self {
@@ -119,14 +129,11 @@ where
   fn one() -> Self {
     <F as Field>::ONE
   }
-  fn from_u64(v: u64) -> Self {
-    Self::from(v)
-  }
   fn invert(&self) -> Option<Self> {
     <F as Field>::invert(self).into()
   }
-  fn from_bytes_reduce(bytes: &[u8]) -> Self {
-    <Self as PrimeFieldExt>::from_uniform(bytes)
+  fn to_le_bytes(&self) -> Vec<u8> {
+    self.to_repr().as_ref().to_vec()
   }
 }
 
