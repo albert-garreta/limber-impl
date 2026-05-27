@@ -11,6 +11,11 @@
 //! eq-factoring, no delayed-reduction Montgomery accumulators. Just the
 //! protocol math, easy to read and verify. Optimizations can be added
 //! later if benchmarks demand.
+//!
+//! After the Phase-2 step-5 refactor, all constructors of `Self::Scalar`
+//! (`zero`, `one`, `from_u64`) take the field's `Params` context, which
+//! comes from the polynomials passed in (each `MultilinearPolynomial`
+//! carries its own `Params`).
 
 use crate::{
   errors::SpartanError,
@@ -24,11 +29,9 @@ use crate::{
     transcript::TranscriptEngineTrait,
   },
 };
-use serde::{Deserialize, Serialize};
 
 /// A sumcheck proof — the per-round compressed univariate polynomials.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "")]
+#[derive(Clone, Debug)]
 pub struct SumcheckProof<E: SumcheckEngine> {
   pub(crate) compressed_polys: Vec<CompressedUniPoly<E::Scalar>>,
 }
@@ -44,11 +47,14 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
   /// `(final_claim, challenges)`. The caller is responsible for
   /// re-checking `final_claim` against the integrand's structure
   /// (e.g. for our outer SC, `eq(tau, r_x) * (v_a v_b - v_c - v_m v_q)`).
+  ///
+  /// `params` is the field's modulus context (`&()` for static fields).
   pub fn verify(
     &self,
     initial_claim: E::Scalar,
     num_rounds: usize,
     degree_bound: usize,
+    params: &<E::Scalar as SumcheckField>::Params,
     transcript: &mut E::TE,
   ) -> Result<(E::Scalar, Vec<E::Scalar>), SpartanError> {
     if self.compressed_polys.len() != num_rounds {
@@ -57,17 +63,18 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
 
     let mut r = Vec::with_capacity(num_rounds);
     let mut claim = initial_claim;
+    let zero = E::Scalar::zero(params);
+    let one = E::Scalar::one(params);
 
     for compressed in &self.compressed_polys {
-      // degree check: compressed length == degree (constant + high-degree coeffs)
       if compressed.degree() != degree_bound {
         return Err(SpartanError::InvalidSumcheckProof);
       }
       let poly = compressed.decompress(&claim);
 
       // intra-round consistency: p(0) + p(1) == running claim
-      let p0 = poly.evaluate(&E::Scalar::zero());
-      let p1 = poly.evaluate(&E::Scalar::one());
+      let p0 = poly.evaluate(&zero);
+      let p1 = poly.evaluate(&one);
       if p0 + p1 != claim {
         return Err(SpartanError::InvalidSumcheckProof);
       }
@@ -84,7 +91,8 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
   /// Degree-2 sumcheck on the integrand `A(x) * B(x)`. Returns
   /// `(proof, challenges, [A(r), B(r)])`.
   ///
-  /// Used by the inner sumcheck of imod-Spartan.
+  /// `poly_A` and `poly_B` must carry the same `Params` (the field's
+  /// modulus context); the prover reads it from `poly_A`.
   #[allow(non_snake_case, clippy::too_many_arguments)]
   pub fn prove_quad(
     claim: &E::Scalar,
@@ -96,19 +104,19 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
     assert_eq!(poly_A.len(), poly_B.len());
     assert_eq!(poly_A.len(), 1 << num_rounds);
 
+    let params = poly_A.params().clone();
+    let zero = E::Scalar::zero(&params);
+    let two = E::Scalar::from_u64(&params, 2);
+
     let mut r = Vec::with_capacity(num_rounds);
     let mut compressed_polys = Vec::with_capacity(num_rounds);
     let mut running_claim = *claim;
-    let two = E::Scalar::from(2);
 
     for _ in 0..num_rounds {
-      // After previous binds, poly_A has 2n entries: lower half = X=0
-      // evaluations, upper half = X=1 evaluations. Compute the round
-      // polynomial at X = 0, 1, 2 (3 points → degree 2).
       let n = poly_A.len() / 2;
-      let mut eval_0 = E::Scalar::zero();
-      let mut eval_1 = E::Scalar::zero();
-      let mut eval_2 = E::Scalar::zero();
+      let mut eval_0 = zero;
+      let mut eval_1 = zero;
+      let mut eval_2 = zero;
 
       for i in 0..n {
         let a0 = poly_A[i];
@@ -119,7 +127,6 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
         eval_0 += a0 * b0;
         eval_1 += a1 * b1;
 
-        // Linear extension to X=2: a(2) = 2*a1 - a0, same for b.
         let a2 = two * a1 - a0;
         let b2 = two * b1 - b0;
         eval_2 += a2 * b2;
@@ -127,7 +134,7 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
 
       debug_assert_eq!(eval_0 + eval_1, running_claim);
 
-      let round_poly = UniPoly::from_evals(&[eval_0, eval_1, eval_2])?;
+      let round_poly = UniPoly::from_evals(&[eval_0, eval_1, eval_2], &params)?;
       transcript.absorb(b"p", &round_poly);
       let r_i = transcript.squeeze(b"c")?;
       compressed_polys.push(round_poly.compress());
@@ -146,9 +153,8 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
   /// Degree-3 sumcheck on the imod outer-SC integrand
   ///   `eq(tau, x) * (A(x) * B(x) - C(x) - M(x) * Q(x))`.
   ///
-  /// Returns `(proof, challenges, [v_a, v_b, v_c, v_m, v_q])`. The
-  /// initial claim is implicitly zero (the integrand vanishes on a
-  /// satisfying assignment).
+  /// Returns `(proof, challenges, [v_a, v_b, v_c, v_m, v_q])`.
+  /// All polynomials must carry the same `Params`.
   #[allow(non_snake_case, clippy::too_many_arguments)]
   pub fn prove_cubic_with_five_inputs(
     claim: &E::Scalar,
@@ -168,30 +174,26 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
     assert_eq!(poly_M.len(), expected_len);
     assert_eq!(poly_Q.len(), expected_len);
 
-    // Build the eq table and bind it like any other MLE each round.
-    // O(2^num_rounds) memory — fine for our Phase-2 sizes; revisit with
-    // Gruen factoring if needed.
-    let eq_evals = EqPolynomial::evals_from_points(&taus);
-    let mut poly_eq = MultilinearPolynomial::new(eq_evals);
+    let params = poly_A.params().clone();
+    let zero = E::Scalar::zero(&params);
+    let two = E::Scalar::from_u64(&params, 2);
+    let three = E::Scalar::from_u64(&params, 3);
+
+    let eq_evals = EqPolynomial::evals_from_points(&taus, &params);
+    let mut poly_eq = MultilinearPolynomial::new(eq_evals, params.clone());
 
     let mut r = Vec::with_capacity(num_rounds);
     let mut compressed_polys = Vec::with_capacity(num_rounds);
     let mut running_claim = *claim;
 
-    let two = E::Scalar::from(2);
-    let three = E::Scalar::from(3);
-
     for _ in 0..num_rounds {
       let n = poly_A.len() / 2;
-      let mut eval_0 = E::Scalar::zero();
-      let mut eval_1 = E::Scalar::zero();
-      let mut eval_2 = E::Scalar::zero();
-      let mut eval_3 = E::Scalar::zero();
+      let mut eval_0 = zero;
+      let mut eval_1 = zero;
+      let mut eval_2 = zero;
+      let mut eval_3 = zero;
 
-      // For each surviving variable index `i`, evaluate the integrand at
-      // X = 0, 1, 2, 3 (4 points → degree 3).
       for i in 0..n {
-        // Lower-half (X=0) and upper-half (X=1) evaluations
         let eq0 = poly_eq[i];
         let eq1 = poly_eq[n + i];
         let a0 = poly_A[i];
@@ -205,9 +207,6 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
         let q0 = poly_Q[i];
         let q1 = poly_Q[n + i];
 
-        // Linear extension to X=2 and X=3:
-        //   p(2) = 2*p(1) - p(0)
-        //   p(3) = 3*p(1) - 2*p(0)
         let eq2 = two * eq1 - eq0;
         let eq3 = three * eq1 - two * eq0;
         let a2 = two * a1 - a0;
@@ -229,7 +228,7 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
 
       debug_assert_eq!(eval_0 + eval_1, running_claim);
 
-      let round_poly = UniPoly::from_evals(&[eval_0, eval_1, eval_2, eval_3])?;
+      let round_poly = UniPoly::from_evals(&[eval_0, eval_1, eval_2, eval_3], &params)?;
       transcript.absorb(b"p", &round_poly);
       let r_i = transcript.squeeze(b"c")?;
       compressed_polys.push(round_poly.compress());
@@ -274,29 +273,29 @@ mod tests {
     let n = 1usize << num_rounds;
     let A = rand_vec(n, 1);
     let B = rand_vec(n, 2);
-    let claim: F = A.iter().zip(B.iter()).map(|(a, b)| *a * *b).sum();
+    let claim: F = A
+      .iter()
+      .zip(B.iter())
+      .fold(F::ZERO, |acc, (a, b)| acc + *a * *b);
 
-    let mut poly_A = MultilinearPolynomial::new(A);
-    let mut poly_B = MultilinearPolynomial::new(B);
+    let mut poly_A = MultilinearPolynomial::new(A, ());
+    let mut poly_B = MultilinearPolynomial::new(B, ());
 
     let mut pt = <E as Engine>::TE::new(b"test");
     let (proof, r_prover, final_evals) =
       SumcheckProof::<E>::prove_quad(&claim, num_rounds, &mut poly_A, &mut poly_B, &mut pt)
         .unwrap();
 
-    // verifier
     let mut vt = <E as Engine>::TE::new(b"test");
-    let (final_claim, r_verifier) = proof.verify(claim, num_rounds, 2, &mut vt).unwrap();
+    let (final_claim, r_verifier) = proof.verify(claim, num_rounds, 2, &(), &mut vt).unwrap();
 
     assert_eq!(r_prover, r_verifier);
-    // final claim must equal A(r) * B(r)
     assert_eq!(final_claim, final_evals[0] * final_evals[1]);
   }
 
   #[test]
   #[allow(non_snake_case)]
   fn prove_cubic_with_five_inputs_roundtrips_on_satisfying_witness() {
-    // Construct A, B, C, M, Q so that A*B == C + M*Q pointwise.
     let num_rounds = 3usize;
     let n = 1usize << num_rounds;
     let A = rand_vec(n, 10);
@@ -307,15 +306,15 @@ mod tests {
 
     let taus = rand_vec(num_rounds, 20);
 
-    let mut poly_A = MultilinearPolynomial::new(A);
-    let mut poly_B = MultilinearPolynomial::new(B);
-    let mut poly_C = MultilinearPolynomial::new(C);
-    let mut poly_M = MultilinearPolynomial::new(M);
-    let mut poly_Q = MultilinearPolynomial::new(Q);
+    let mut poly_A = MultilinearPolynomial::new(A, ());
+    let mut poly_B = MultilinearPolynomial::new(B, ());
+    let mut poly_C = MultilinearPolynomial::new(C, ());
+    let mut poly_M = MultilinearPolynomial::new(M, ());
+    let mut poly_Q = MultilinearPolynomial::new(Q, ());
 
     let mut pt = <E as Engine>::TE::new(b"test");
     let (proof, r_prover, finals) = SumcheckProof::<E>::prove_cubic_with_five_inputs(
-      &F::zero(),
+      &F::ZERO,
       taus.clone(),
       &mut poly_A,
       &mut poly_B,
@@ -326,15 +325,13 @@ mod tests {
     )
     .unwrap();
 
-    // verifier
     let mut vt = <E as Engine>::TE::new(b"test");
-    let (final_claim, r_verifier) = proof.verify(F::zero(), num_rounds, 3, &mut vt).unwrap();
+    let (final_claim, r_verifier) = proof.verify(F::ZERO, num_rounds, 3, &(), &mut vt).unwrap();
 
     assert_eq!(r_prover, r_verifier);
 
-    // reconstruct: final_claim should equal eq(tau, r) * (va*vb - vc - vm*vq)
     let (va, vb, vc, vm, vq) = (finals[0], finals[1], finals[2], finals[3], finals[4]);
-    let eq_tau_r = EqPolynomial::new(taus).evaluate(&r_verifier);
+    let eq_tau_r = EqPolynomial::new(taus, ()).evaluate(&r_verifier);
     let expected = eq_tau_r * (va * vb - vc - vm * vq);
     assert_eq!(final_claim, expected);
   }
@@ -346,33 +343,33 @@ mod tests {
     let n = 1usize << num_rounds;
     let A = rand_vec(n, 30);
     let B = rand_vec(n, 31);
-    let claim: F = A.iter().zip(B.iter()).map(|(a, b)| *a * *b).sum();
+    let claim: F = A
+      .iter()
+      .zip(B.iter())
+      .fold(F::ZERO, |acc, (a, b)| acc + *a * *b);
 
-    let mut poly_A = MultilinearPolynomial::new(A);
-    let mut poly_B = MultilinearPolynomial::new(B);
+    let mut poly_A = MultilinearPolynomial::new(A, ());
+    let mut poly_B = MultilinearPolynomial::new(B, ());
 
     let mut pt = <E as Engine>::TE::new(b"test");
     let (proof, _r, _finals) =
       SumcheckProof::<E>::prove_quad(&claim, num_rounds, &mut poly_A, &mut poly_B, &mut pt)
         .unwrap();
 
-    // Tamper mode 1: drop a round so the proof has the wrong length. The
-    // intra-round-consistency check would silently accept any tampering of
-    // the compressed constant term (since `decompress` recovers the linear
-    // coefficient from the running claim, preserving `p(0) + p(1)`), so we
-    // need a tamper that breaks an invariant the verifier *actually*
-    // checks. Length mismatch and degree bound are both checked.
     let mut short = proof.clone();
     short.compressed_polys.pop();
     let mut vt = <E as Engine>::TE::new(b"test");
-    assert!(short.verify(claim, num_rounds, 2, &mut vt).is_err());
+    assert!(short.verify(claim, num_rounds, 2, &(), &mut vt).is_err());
 
-    // Tamper mode 2: replace a round poly with one of the wrong degree.
     let mut wrong_deg = proof;
     wrong_deg.compressed_polys[0]
       .coeffs_except_linear_term
       .pop();
     let mut vt2 = <E as Engine>::TE::new(b"test");
-    assert!(wrong_deg.verify(claim, num_rounds, 2, &mut vt2).is_err());
+    assert!(
+      wrong_deg
+        .verify(claim, num_rounds, 2, &(), &mut vt2)
+        .is_err()
+    );
   }
 }

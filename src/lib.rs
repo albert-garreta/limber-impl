@@ -39,6 +39,7 @@ pub mod traits;
 
 // internal modules
 mod big_num;
+mod dyn_prime;
 mod polys;
 mod polys_modp;
 mod sumcheck;

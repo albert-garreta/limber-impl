@@ -4,19 +4,21 @@ use crate::{polys_modp::eq::EqPolynomial, traits::mod_engine::SumcheckField};
 use core::ops::Index;
 
 /// Dense MLE stored as evaluations over `{0,1}^num_vars`. Length is a
-/// power of two.
+/// power of two. Carries the field's modulus context so constructors
+/// like `F::zero(&params)` can be called internally.
 pub struct MultilinearPolynomial<F: SumcheckField> {
   pub(crate) Z: Vec<F>,
+  pub(crate) params: F::Params,
 }
 
 impl<F: SumcheckField> MultilinearPolynomial<F> {
   /// New from evaluation vector. Panics if length isn't a power of two.
-  pub fn new(Z: Vec<F>) -> Self {
+  pub fn new(Z: Vec<F>, params: F::Params) -> Self {
     assert!(
       Z.len().is_power_of_two(),
       "MultilinearPolynomial length must be a power of two"
     );
-    Self { Z }
+    Self { Z, params }
   }
 
   /// Number of stored evaluations (i.e. `2^num_vars`).
@@ -32,6 +34,11 @@ impl<F: SumcheckField> MultilinearPolynomial<F> {
   /// Number of free variables remaining (`log2(len)`).
   pub fn num_vars(&self) -> usize {
     self.Z.len().trailing_zeros() as usize
+  }
+
+  /// Access the stored field modulus context.
+  pub fn params(&self) -> &F::Params {
+    &self.params
   }
 
   /// Take ownership of the underlying evaluation vector.
@@ -53,7 +60,6 @@ impl<F: SumcheckField> MultilinearPolynomial<F> {
     let n = self.Z.len() / 2;
     let (left, right) = self.Z.split_at_mut(n);
     for i in 0..n {
-      // left[i] <- left[i] + r * (right[i] - left[i])
       let delta = right[i] - left[i];
       left[i] += *r * delta;
     }
@@ -63,8 +69,11 @@ impl<F: SumcheckField> MultilinearPolynomial<F> {
   /// Evaluate at `r ∈ F^num_vars`. Computes `sum_k eq(r, k) · Z[k]`.
   pub fn evaluate(&self, r: &[F]) -> F {
     assert_eq!(r.len(), self.num_vars());
-    let chis = EqPolynomial::evals_from_points(r);
-    chis.iter().zip(self.Z.iter()).map(|(c, z)| *c * *z).sum()
+    let chis = EqPolynomial::evals_from_points(r, &self.params);
+    chis
+      .iter()
+      .zip(self.Z.iter())
+      .fold(F::zero(&self.params), |acc, (c, z)| acc + *c * *z)
   }
 }
 
@@ -85,31 +94,29 @@ mod tests {
 
   #[test]
   fn bind_matches_evaluate_for_constant_dimension() {
-    // `bind_poly_var_top(r)` binds the top variable (first in the eval
-    // vector under our convention). For a 2-variable polynomial, that's
-    // `x_0`. Then `evaluate(&[s])` on the 1-variable bound poly evaluates
-    // at the remaining variable `x_1 = s`. So bound_eval corresponds to
-    // the direct evaluation at `(x_0=r, x_1=s)`, which is
-    // `full.evaluate(&[r, s])`.
     let z: Vec<F> = (0..4).map(|i| F::from((11 + i) as u64)).collect();
-    let mut p = MultilinearPolynomial::new(z.clone());
+    let mut p = MultilinearPolynomial::new(z.clone(), ());
     let r = F::from(7);
     p.bind_poly_var_top(&r);
     let s = F::from(13);
     let bound_eval = p.evaluate(&[s]);
 
-    let full = MultilinearPolynomial::new(z);
+    let full = MultilinearPolynomial::new(z, ());
     let full_eval = full.evaluate(&[r, s]);
     assert_eq!(bound_eval, full_eval);
   }
 
   #[test]
   fn evaluate_matches_dot_product() {
+    use ff::Field;
     let z: Vec<F> = (0..8).map(|i| F::from((i + 1) as u64)).collect();
-    let p = MultilinearPolynomial::new(z.clone());
+    let p = MultilinearPolynomial::new(z.clone(), ());
     let r: Vec<F> = (0..3).map(|i| F::from((5 + i) as u64)).collect();
-    let chis = EqPolynomial::evals_from_points(&r);
-    let expected: F = chis.iter().zip(z.iter()).map(|(c, v)| *c * *v).sum();
+    let chis = EqPolynomial::evals_from_points(&r, &());
+    let expected: F = chis
+      .iter()
+      .zip(z.iter())
+      .fold(F::ZERO, |acc, (c, v)| acc + *c * *v);
     assert_eq!(p.evaluate(&r), expected);
   }
 }
