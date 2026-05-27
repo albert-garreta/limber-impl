@@ -5,9 +5,12 @@ use crate::{
   errors::SpartanError,
   traits::{mod_engine::SumcheckField, transcript::TranscriptReprTrait},
 };
+use serde::{Deserialize, Serialize};
 
 /// Univariate dense polynomial stored in **big-endian** order:
 /// `coeffs[0]` is the constant term, `coeffs[k]` is the `x^k` term.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct UniPoly<F: SumcheckField> {
   pub coeffs: Vec<F>,
 }
@@ -15,6 +18,8 @@ pub struct UniPoly<F: SumcheckField> {
 /// `UniPoly` with the linear coefficient (`coeffs[1]`) omitted.
 /// Recoverable from the round's running claim via
 /// `p(0) + p(1) = claim`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct CompressedUniPoly<F: SumcheckField> {
   pub coeffs_except_linear_term: Vec<F>,
 }

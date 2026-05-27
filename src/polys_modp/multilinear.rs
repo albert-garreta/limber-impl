@@ -85,8 +85,12 @@ mod tests {
 
   #[test]
   fn bind_matches_evaluate_for_constant_dimension() {
-    // For a 2-variable polynomial p(x_0, x_1), binding x_1 to r and
-    // evaluating the result at x_0 = s should equal p(s, r).
+    // `bind_poly_var_top(r)` binds the top variable (first in the eval
+    // vector under our convention). For a 2-variable polynomial, that's
+    // `x_0`. Then `evaluate(&[s])` on the 1-variable bound poly evaluates
+    // at the remaining variable `x_1 = s`. So bound_eval corresponds to
+    // the direct evaluation at `(x_0=r, x_1=s)`, which is
+    // `full.evaluate(&[r, s])`.
     let z: Vec<F> = (0..4).map(|i| F::from((11 + i) as u64)).collect();
     let mut p = MultilinearPolynomial::new(z.clone());
     let r = F::from(7);
@@ -95,7 +99,7 @@ mod tests {
     let bound_eval = p.evaluate(&[s]);
 
     let full = MultilinearPolynomial::new(z);
-    let full_eval = full.evaluate(&[s, r]);
+    let full_eval = full.evaluate(&[r, s]);
     assert_eq!(bound_eval, full_eval);
   }
 

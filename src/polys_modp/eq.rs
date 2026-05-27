@@ -24,14 +24,22 @@ impl<F: SumcheckField> EqPolynomial<F> {
   }
 
   /// Build the full eq-table: `evals[k] = eq(r, k)` for every
-  /// `k ∈ {0,1}^{|r|}`, returned as a length-`2^|r|` vector in
-  /// little-endian-bit indexing (`k = (k_0, k_1, …)`).
+  /// `k ∈ {0,1}^{|r|}`, returned as a length-`2^|r|` vector.
+  ///
+  /// **Bit-ordering convention** (matches `src/polys/eq.rs`): `r` is
+  /// consumed in **reverse** so that the resulting table aligns with
+  /// the top-down binding order used by `MultilinearPolynomial::
+  /// bind_poly_var_top`. After binding the top variable to challenge
+  /// `r_0` (round 0), then `r_1` (round 1), …, the final value
+  /// `evals[0]` of the bound table equals `eq(r, [r_0, r_1, …, r_{n-1}])`
+  /// — i.e. the natural `EqPolynomial::new(r).evaluate(&challenges)`
+  /// without reversal.
   pub fn evals_from_points(r: &[F]) -> Vec<F> {
     let one = F::one();
     let mut evals = vec![F::zero(); 1usize << r.len()];
     evals[0] = one;
     let mut size = 1usize;
-    for &r_i in r.iter() {
+    for &r_i in r.iter().rev() {
       let one_minus_r = one - r_i;
       for i in 0..size {
         let v = evals[i];
@@ -54,15 +62,17 @@ mod tests {
 
   #[test]
   fn eq_table_consistent_with_evaluate() {
-    // eq(r, k) computed via the table should match the direct evaluation.
+    // Convention (matches `src/polys/eq.rs`): `evals_from_points` consumes
+    // `r` in reverse, so `table[k]`'s bit `i` corresponds to `r[len-1-i]`.
+    // The matching `x` for direct evaluation reverses the bit ordering.
     let r: Vec<F> = (0..4).map(|i| F::from((7 + i) as u64)).collect();
     let table = EqPolynomial::evals_from_points(&r);
     let eq = EqPolynomial::new(r.clone());
+    let n = r.len();
     for (k, &table_val) in table.iter().enumerate() {
-      // little-endian-bit indexing
-      let x: Vec<F> = (0..r.len())
+      let x: Vec<F> = (0..n)
         .map(|i| {
-          if (k >> i) & 1 == 1 {
+          if (k >> (n - 1 - i)) & 1 == 1 {
             F::one()
           } else {
             F::zero()

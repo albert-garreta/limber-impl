@@ -42,6 +42,7 @@ mod big_num;
 mod polys;
 mod polys_modp;
 mod sumcheck;
+mod sumcheck_modp;
 
 // public modules for proof systems
 pub mod imod_r1cs; // Integer Mod-R1CS relation (paper Def 5.4)
