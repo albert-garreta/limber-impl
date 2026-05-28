@@ -21,10 +21,10 @@ use crate::{
     bn254::types as bn254_types,
     keccak::Keccak256Transcript,
     pasta::{pallas, vesta},
-    pcs::{hyrax_pc::HyraxPCS, kzh_pc::KZHPCS},
+    pcs::{hyrax_pc::HyraxPCS, kzh_pc::KZHPCS, trivial_modpcs::TrivialModPCS},
     pt256::{p256, t256},
   },
-  traits::Engine,
+  traits::{Engine, mod_engine::ModEngine},
 };
 use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
@@ -88,4 +88,16 @@ impl Engine for Bn254Engine {
   type TE = Keccak256Transcript<Self>;
   //type PCS = HyraxPCS<Self>;
   type PCS = KZHPCS<Self>;
+}
+
+// ---- ModEngine impls (Phase 2 step 6: trivial backward-compat) ----------
+//
+// Smoke-test the `ModEngine` / `ModPCSEngineTrait` machinery by wiring up
+// the existing curve+Hyrax engines as ModEngines whose `Scalar` is just the
+// curve scalar (no dynamic prime yet). Step 7 will add ModEngines with
+// `Scalar = DynPrime<LIMBS>` and a Mod-PCS that bridges DynPrime ↔ curve
+// scalar.
+
+impl ModEngine for T256HyraxEngine {
+  type ModPCS = TrivialModPCS<Self>;
 }

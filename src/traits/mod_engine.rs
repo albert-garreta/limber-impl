@@ -36,7 +36,10 @@
 //! blanket impls; step 4 adds the first `ModEngine` impl (a trivial
 //! backward-compat wrapper around an existing `Engine`).
 
-use crate::traits::{Engine, transcript::TranscriptEngineTrait};
+use crate::{
+  errors::SpartanError,
+  traits::{Engine, transcript::TranscriptEngineTrait},
+};
 use core::{
   fmt::Debug,
   ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
@@ -234,9 +237,62 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Evaluation-argument data sent in the proof.
   type EvaluationArgument: Clone + Debug + Send + Sync + Serialize + for<'de> Deserialize<'de>;
 
-  // TODO step 2: add the method signatures (`setup`, `blind`, `commit`,
-  // `prove`, `verify`, etc.) once `ModEngine::TE` is available. The shapes
-  // will mirror `PCSEngineTrait` (see `traits/pcs.rs`) with `E::Scalar`
-  // substituted in place of the curve scalar, and the transcript parameter
-  // typed as `&mut E::TE`.
+  /// Sample commitment keys for vectors of length up to `n`.
+  fn setup(
+    label: &'static [u8],
+    n: usize,
+    width: usize,
+  ) -> (Self::CommitmentKey, Self::VerifierKey);
+
+  /// Eagerly initialize any lazily-computed tables in the commitment key.
+  /// Default no-op; override to match `PCSEngineTrait::precompute_ck`.
+  fn precompute_ck(_ck: &Self::CommitmentKey) {}
+
+  /// Sample a fresh blind suitable for committing a polynomial of length `n`.
+  ///
+  /// Mirrors `PCSEngineTrait::blind` for the Phase-2 step-6 wrapping
+  /// pattern. For future hash-based / non-hiding Mod-PCS impls, this can
+  /// return a unit-typed sentinel (see `docs/imod_followups.md`).
+  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
+
+  /// Commit to a polynomial whose evaluations are in `E::Scalar`.
+  fn commit(
+    ck: &Self::CommitmentKey,
+    v: &[E::Scalar],
+    r: &Self::Blind,
+    is_small: bool,
+  ) -> Result<Self::Commitment, SpartanError>;
+
+  /// Length / shape sanity check on a commitment.
+  fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
+
+  /// Prove a polynomial opening at `point` ∈ `E::Scalar^n` to claimed
+  /// commitment-of-eval `comm_eval`. Mirrors the existing
+  /// `PCSEngineTrait::prove` signature; `ck_eval` is the size-1
+  /// commitment key for the eval (Pedersen-specific; future hash-based
+  /// impls can keep this as `()` per the followups doc).
+  #[allow(clippy::too_many_arguments)]
+  fn prove(
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comm: &Self::Commitment,
+    poly: &[E::Scalar],
+    blind: &Self::Blind,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    blind_eval: &Self::Blind,
+  ) -> Result<Self::EvaluationArgument, SpartanError>;
+
+  /// Verify a polynomial opening.
+  #[allow(clippy::too_many_arguments)]
+  fn verify(
+    vk: &Self::VerifierKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comm: &Self::Commitment,
+    point: &[E::Scalar],
+    comm_eval: &Self::Commitment,
+    arg: &Self::EvaluationArgument,
+  ) -> Result<(), SpartanError>;
 }
