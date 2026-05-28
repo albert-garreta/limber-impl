@@ -124,6 +124,18 @@ impl<const LIMBS: usize> SumcheckField for DynPrime<LIMBS> {
   fn to_le_bytes(&self) -> Vec<u8> {
     self.retrieve().to_le_bytes().as_slice().to_vec()
   }
+
+  fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self {
+    // Take up to LIMBS*8 bytes (little-endian), build a Uint, and let
+    // `DynPrime::new` reduce it mod the modulus. See the bias note on the
+    // trait method.
+    let n = Uint::<LIMBS>::BYTES;
+    let take = bytes.len().min(n);
+    let mut buf = vec![0u8; n];
+    buf[..take].copy_from_slice(&bytes[..take]);
+    let value = Uint::<LIMBS>::from_le_slice(&buf);
+    Self::new(value, params)
+  }
 }
 
 #[cfg(test)]

@@ -6,7 +6,10 @@
 
 //! This module provides the trait definitions for transcript functionality in the Spartan2 library.
 //! Transcripts are used for Fiat-Shamir transformations to make interactive proof systems non-interactive.
-use crate::{errors::SpartanError, traits::mod_engine::SumcheckEngine};
+use crate::{
+  errors::SpartanError,
+  traits::mod_engine::{SumcheckEngine, SumcheckField},
+};
 
 /// This trait allows types to implement how they want to be added to `TranscriptEngine`.
 ///
@@ -22,8 +25,24 @@ pub trait TranscriptReprTrait: Send + Sync {
 
 /// This trait defines the behavior of a transcript engine compatible with Spartan
 pub trait TranscriptEngineTrait<E: SumcheckEngine>: Send + Sync {
-  /// initializes the transcript
-  fn new(label: &'static [u8]) -> Self;
+  /// Initialize the transcript with the field's modulus context.
+  ///
+  /// The `params` are needed so that `squeeze` can construct challenges in
+  /// dynamic-modulus fields (where the modulus is a runtime value carried
+  /// in `params`). For static-modulus fields `params` is `()`.
+  fn new_with_params(label: &'static [u8], params: <E::Scalar as SumcheckField>::Params) -> Self
+  where
+    Self: Sized;
+
+  /// Initialize the transcript. Convenience for fields whose `Params` is
+  /// `Default` (i.e. all static-modulus fields, where `Params = ()`).
+  fn new(label: &'static [u8]) -> Self
+  where
+    Self: Sized,
+    <E::Scalar as SumcheckField>::Params: Default,
+  {
+    Self::new_with_params(label, Default::default())
+  }
 
   /// returns a scalar element of the field as a challenge
   fn squeeze(&mut self, label: &'static [u8]) -> Result<E::Scalar, SpartanError>;

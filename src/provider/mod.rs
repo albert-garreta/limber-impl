@@ -17,6 +17,7 @@ pub mod traits;
 mod msm;
 
 use crate::{
+  dyn_prime::DynPrime,
   provider::{
     bn254::types as bn254_types,
     keccak::Keccak256Transcript,
@@ -24,7 +25,7 @@ use crate::{
     pcs::{hyrax_pc::HyraxPCS, kzh_pc::KZHPCS, trivial_modpcs::TrivialModPCS},
     pt256::{p256, t256},
   },
-  traits::{Engine, mod_engine::ModEngine},
+  traits::{Engine, mod_engine::ModEngine, mod_engine::SumcheckEngine},
 };
 use core::fmt::Debug;
 use serde::{Deserialize, Serialize};
@@ -100,4 +101,17 @@ impl Engine for Bn254Engine {
 
 impl ModEngine for T256HyraxEngine {
   type ModPCS = TrivialModPCS<Self>;
+}
+
+/// A Phase-2 engine whose sumcheck arithmetic runs over the dynamic-prime
+/// field `DynPrime<4>` (256-bit, runtime modulus). This is *not* an
+/// `Engine` — it's a `SumcheckEngine` only, used to drive `sumcheck_modp`
+/// over a runtime prime. (The full `ModEngine` impl, pairing it with a
+/// Mod-PCS, lands in step 7b.)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct T256DynPrimeEngine;
+
+impl SumcheckEngine for T256DynPrimeEngine {
+  type Scalar = DynPrime<4>;
+  type TE = Keccak256Transcript<Self>;
 }

@@ -8,7 +8,7 @@
 use crate::{
   errors::SpartanError,
   traits::{
-    Engine, PrimeFieldExt,
+    mod_engine::{SumcheckEngine, SumcheckField},
     transcript::{TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
@@ -23,10 +23,11 @@ const KECCAK256_PREFIX_CHALLENGE_HI: u8 = 1;
 
 /// Provides an implementation of `TranscriptEngine`
 #[derive(Debug, Clone)]
-pub struct Keccak256Transcript<E: Engine> {
+pub struct Keccak256Transcript<E: SumcheckEngine> {
   round: u16,
   state: [u8; KECCAK256_STATE_SIZE],
   transcript: Keccak256,
+  params: <E::Scalar as SumcheckField>::Params,
   _p: PhantomData<E>,
 }
 
@@ -53,8 +54,8 @@ fn compute_updated_state(keccak_instance: Keccak256, input: &[u8]) -> [u8; KECCA
     .unwrap()
 }
 
-impl<E: Engine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
-  fn new(label: &'static [u8]) -> Self {
+impl<E: SumcheckEngine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
+  fn new_with_params(label: &'static [u8], params: <E::Scalar as SumcheckField>::Params) -> Self {
     let keccak_instance = Keccak256::new();
     let input = [PERSONA_TAG, label].concat();
     let output = compute_updated_state(keccak_instance.clone(), &input);
@@ -63,6 +64,7 @@ impl<E: Engine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
       round: 0u16,
       state: output,
       transcript: keccak_instance,
+      params,
       _p: PhantomData,
     }
   }
@@ -89,8 +91,11 @@ impl<E: Engine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
     self.state.copy_from_slice(&output);
     self.transcript = Keccak256::new();
 
-    // squeeze out a challenge
-    Ok(E::Scalar::from_uniform(&output))
+    // squeeze out a challenge. `from_bytes_reduce` forwards to
+    // `PrimeFieldExt::from_uniform` for static-modulus fields (preserving
+    // the prior behavior / test vectors) and reduces bytes mod the runtime
+    // modulus for dynamic-modulus fields.
+    Ok(E::Scalar::from_bytes_reduce(&self.params, &output))
   }
 
   fn absorb<T: TranscriptReprTrait>(&mut self, label: &'static [u8], o: &T) {

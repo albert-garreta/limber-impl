@@ -38,7 +38,7 @@
 
 use crate::{
   errors::SpartanError,
-  traits::{Engine, transcript::TranscriptEngineTrait},
+  traits::{Engine, PrimeFieldExt, transcript::TranscriptEngineTrait},
 };
 use core::{
   fmt::Debug,
@@ -86,7 +86,7 @@ pub trait SumcheckField:
   /// Arithmetic ops between two `Self` values don't need params because
   /// dynamic-field implementors (e.g. `crypto-bigint::MontyForm`) carry
   /// the params per element internally.
-  type Params: Clone + Send + Sync + 'static;
+  type Params: Clone + Debug + Send + Sync + 'static;
 
   /// The additive identity. Replaces `ff::Field::ZERO`; method form so it
   /// works for runtime-modulus fields where the const form would not be
@@ -109,10 +109,17 @@ pub trait SumcheckField:
   /// polynomials.
   fn to_le_bytes(&self) -> Vec<u8>;
 
-  // Phase 2b will add a `from_bytes_reduce(params: &Self::Params, bytes:
-  // &[u8]) -> Self` method here for deriving transcript challenges in
-  // dynamic-modulus fields. For Phase 2's first cut, transcript challenges
-  // still come through `PrimeFieldExt::from_uniform` on the curve scalar.
+  /// Reduce raw bytes (from a transcript squeeze) into a field element.
+  /// Used to derive Fiat-Shamir challenges. For static-modulus fields this
+  /// forwards to `PrimeFieldExt::from_uniform`; for dynamic-modulus fields
+  /// it builds an integer from the bytes and reduces mod the modulus.
+  ///
+  /// NOTE (followup): the dynamic-field implementation currently consumes
+  /// at most `LIMBS * 8` bytes, so for a modulus near that width the
+  /// challenge is slightly biased. Fine for the Phase-2 prototype; a
+  /// soundness-grade version needs wide reduction (≥ modulus_bits + 128
+  /// input bits). Tracked in docs/imod_followups.md.
+  fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self;
 }
 
 /// Blanket impl: any static-modulus prime field that already implements
@@ -121,7 +128,7 @@ pub trait SumcheckField:
 /// path — existing code keeps running without any per-type impls.
 impl<F> SumcheckField for F
 where
-  F: PrimeField + Copy + Send + Sync + 'static,
+  F: PrimeField + PrimeFieldExt + Copy + Send + Sync + 'static,
 {
   type Params = ();
 
@@ -139,6 +146,9 @@ where
   }
   fn to_le_bytes(&self) -> Vec<u8> {
     self.to_repr().as_ref().to_vec()
+  }
+  fn from_bytes_reduce(_: &(), bytes: &[u8]) -> Self {
+    <F as PrimeFieldExt>::from_uniform(bytes)
   }
 }
 

@@ -372,4 +372,74 @@ mod tests {
         .is_err()
     );
   }
+
+  /// The load-bearing Phase-2 test: run the 5-input cubic sumcheck over the
+  /// dynamic-prime field `DynPrime<4>` (not a static curve scalar). Same
+  /// shape as `prove_cubic_with_five_inputs_roundtrips_on_satisfying_witness`
+  /// but with `Scalar = DynPrime<4>` parameterized by a runtime 256-bit
+  /// prime. Exercises DynPrime arithmetic + transcript-over-DynPrime +
+  /// the polys_modp types end-to-end.
+  #[test]
+  #[allow(non_snake_case)]
+  fn prove_cubic_over_dynprime_roundtrips() {
+    use crate::dyn_prime::DynPrime;
+    use crate::provider::T256DynPrimeEngine;
+    use crypto_bigint::{Odd, U256, modular::FixedMontyParams};
+
+    type ME = T256DynPrimeEngine;
+    type DP = DynPrime<4>;
+
+    // secp256k1 base field prime: prime (so 2/3/6 are invertible) and odd
+    // (required for Montgomery). Stands in for a verifier-sampled prime.
+    let modulus =
+      U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+    let params = FixedMontyParams::new(Odd::new(modulus).unwrap());
+
+    let num_rounds = 3usize;
+    let n = 1usize << num_rounds;
+    let mk = |seed: u64| -> Vec<DP> {
+      (0..n)
+        .map(|i| DP::from_u64(&params, seed.wrapping_mul(i as u64 + 1).wrapping_add(1)))
+        .collect()
+    };
+    let A = mk(7);
+    let B = mk(11);
+    let M = mk(13);
+    let Q = mk(17);
+    let C: Vec<DP> = (0..n).map(|i| A[i] * B[i] - M[i] * Q[i]).collect();
+    let taus: Vec<DP> = (0..num_rounds)
+      .map(|i| DP::from_u64(&params, (i as u64) + 5))
+      .collect();
+
+    let mut poly_A = MultilinearPolynomial::new(A, params);
+    let mut poly_B = MultilinearPolynomial::new(B, params);
+    let mut poly_C = MultilinearPolynomial::new(C, params);
+    let mut poly_M = MultilinearPolynomial::new(M, params);
+    let mut poly_Q = MultilinearPolynomial::new(Q, params);
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"test", params);
+    let (proof, r_prover, finals) = SumcheckProof::<ME>::prove_cubic_with_five_inputs(
+      &DP::zero(&params),
+      taus.clone(),
+      &mut poly_A,
+      &mut poly_B,
+      &mut poly_C,
+      &mut poly_M,
+      &mut poly_Q,
+      &mut pt,
+    )
+    .unwrap();
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"test", params);
+    let (final_claim, r_verifier) = proof
+      .verify(DP::zero(&params), num_rounds, 3, &params, &mut vt)
+      .unwrap();
+
+    assert_eq!(r_prover, r_verifier);
+
+    let (va, vb, vc, vm, vq) = (finals[0], finals[1], finals[2], finals[3], finals[4]);
+    let eq_tau_r = EqPolynomial::new(taus, params).evaluate(&r_verifier);
+    let expected = eq_tau_r * (va * vb - vc - vm * vq);
+    assert_eq!(final_claim, expected);
+  }
 }
