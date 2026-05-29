@@ -115,3 +115,7 @@ impl SumcheckEngine for T256DynPrimeEngine {
   type Scalar = DynPrime<4>;
   type TE = Keccak256Transcript<Self>;
 }
+
+impl ModEngine for T256DynPrimeEngine {
+  type ModPCS = crate::provider::pcs::bridge_modpcs::BridgeModPCS;
+}
