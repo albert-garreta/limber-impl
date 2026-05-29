@@ -38,7 +38,10 @@
 
 use crate::{
   errors::SpartanError,
-  traits::{Engine, PrimeFieldExt, transcript::TranscriptEngineTrait},
+  traits::{
+    Engine, PrimeFieldExt,
+    transcript::{TranscriptEngineTrait, TranscriptReprTrait},
+  },
 };
 use core::{
   fmt::Debug,
@@ -74,6 +77,7 @@ pub trait SumcheckField:
   + AddAssign
   + SubAssign
   + MulAssign
+  + TranscriptReprTrait
   + 'static
 {
   /// Per-modulus context. For static-modulus fields this is `()` (the
@@ -128,7 +132,7 @@ pub trait SumcheckField:
 /// path — existing code keeps running without any per-type impls.
 impl<F> SumcheckField for F
 where
-  F: PrimeField + PrimeFieldExt + Copy + Send + Sync + 'static,
+  F: PrimeField + PrimeFieldExt + TranscriptReprTrait + Copy + Send + Sync + 'static,
 {
   type Params = ();
 
@@ -228,16 +232,16 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
 
   /// Commitment value, absorbable into the transcript.
   ///
-  /// (Step 2 will replace `TranscriptReprTrait` with a marker-free
-  /// `TranscriptRepr` trait — keeping the group bound here for now would
-  /// require `E` to expose a `GE`, which we deliberately don't, so the
-  /// bound is added back in step 2 alongside the transcript-trait change.)
+  /// `TranscriptReprTrait` is marker-free (no `<G: Group>`) since the
+  /// Phase-2 transcript trait split — non-group-based PCSes can implement
+  /// it without inventing a placeholder curve group.
   type Commitment: Clone
     + Debug
     + Send
     + Sync
     + PartialEq
     + Eq
+    + TranscriptReprTrait
     + Serialize
     + for<'de> Deserialize<'de>;
 

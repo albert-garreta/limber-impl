@@ -12,7 +12,7 @@
 //! time. See [[project-paper-revision-modpcs]] and
 //! [[project-phase2-parallel-sumcheck]] in memory for the broader plan.
 
-use crate::traits::mod_engine::SumcheckField;
+use crate::traits::{mod_engine::SumcheckField, transcript::TranscriptReprTrait};
 use crypto_bigint::{
   Uint,
   modular::{FixedMontyForm, FixedMontyParams},
@@ -135,6 +135,15 @@ impl<const LIMBS: usize> SumcheckField for DynPrime<LIMBS> {
     buf[..take].copy_from_slice(&bytes[..take]);
     let value = Uint::<LIMBS>::from_le_slice(&buf);
     Self::new(value, params)
+  }
+}
+
+// Absorbing a DynPrime into a ByteTranscript: hand over its canonical LE
+// bytes. The Phase-2 SNARK driver needs this to absorb mods, IO, and the
+// outer-SC claims into the shared Fiat-Shamir chain.
+impl<const LIMBS: usize> TranscriptReprTrait for DynPrime<LIMBS> {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    self.to_le_bytes()
   }
 }
 
