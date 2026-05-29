@@ -14,7 +14,11 @@ use crate::{
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
   r1cs::{R1CSShape, RelaxedR1CSInstance, RelaxedR1CSWitness, SparseMatrix},
   sumcheck::SumcheckProof,
-  traits::{Engine, pcs::PCSEngineTrait, transcript::TranscriptEngineTrait},
+  traits::{
+    Engine,
+    pcs::PCSEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
+  },
 };
 use ff::Field;
 use serde::{Deserialize, Serialize};

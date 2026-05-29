@@ -17,7 +17,12 @@ use crate::{
   polys::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
   start_span,
   sumcheck::SumcheckProof,
-  traits::{Engine, pcs::PCSEngineTrait, snark::SpartanDigest, transcript::TranscriptEngineTrait},
+  traits::{
+    Engine,
+    pcs::PCSEngineTrait,
+    snark::SpartanDigest,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
+  },
 };
 use ff::Field;
 use once_cell::sync::OnceCell;

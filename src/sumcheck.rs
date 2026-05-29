@@ -24,7 +24,10 @@ use crate::{
   },
   r1cs::SplitMultiRoundR1CSShape,
   start_span,
-  traits::{Engine, transcript::TranscriptEngineTrait},
+  traits::{
+    Engine,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
+  },
   zk::{NeutronNovaVerifierCircuit, SpartanVerifierCircuit},
 };
 use ff::Field;

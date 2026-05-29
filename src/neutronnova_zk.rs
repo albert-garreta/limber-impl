@@ -45,7 +45,7 @@ use crate::{
     circuit::SpartanCircuit,
     pcs::{FoldingEngineTrait, PCSEngineTrait},
     snark::{DigestHelperTrait, SpartanDigest},
-    transcript::TranscriptEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
   zk::NeutronNovaVerifierCircuit,
 };

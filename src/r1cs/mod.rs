@@ -14,7 +14,7 @@ use crate::{
   traits::{
     Engine,
     pcs::{FoldingEngineTrait, PCSEngineTrait},
-    transcript::{TranscriptEngineTrait, TranscriptReprTrait},
+    transcript::{ByteTranscript, TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
 use core::cmp::max;

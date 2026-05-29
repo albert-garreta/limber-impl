@@ -26,7 +26,7 @@ use crate::{
   },
   traits::{
     mod_engine::{SumcheckEngine, SumcheckField},
-    transcript::TranscriptEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
 

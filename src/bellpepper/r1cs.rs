@@ -18,7 +18,7 @@ use crate::{
     Engine,
     circuit::{MultiRoundCircuit, SpartanCircuit},
     pcs::PCSEngineTrait,
-    transcript::TranscriptEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
 use bellpepper::gadgets::num::AllocatedNum;

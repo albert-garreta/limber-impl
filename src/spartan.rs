@@ -30,7 +30,7 @@ use crate::{
     circuit::SpartanCircuit,
     pcs::PCSEngineTrait,
     snark::{DigestHelperTrait, R1CSSNARKTrait, SpartanDigest},
-    transcript::TranscriptEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
 use ff::Field;

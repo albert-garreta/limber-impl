@@ -10,7 +10,8 @@ use crate::{
   provider::traits::{DlogGroup, DlogGroupExt},
   traits::{
     Engine,
-    transcript::{TranscriptEngineTrait, TranscriptReprTrait},
+    mod_engine::SumcheckField,
+    transcript::{ByteTranscript, TranscriptReprTrait},
   },
 };
 use core::fmt::Debug;
@@ -129,12 +130,12 @@ where
     h_c: &E::GE,
     U: &InnerProductInstance<E>,
     W: &InnerProductWitness<E>,
-    transcript: &mut E::TE,
+    transcript: &mut impl ByteTranscript,
   ) -> Result<Self, SpartanError> {
     transcript.dom_sep(Self::protocol_name());
 
     // absorb the instance in the transcript
-    transcript.absorb(b"U", U);
+    transcript.absorb_bytes(b"U", &U.to_transcript_bytes());
 
     // produce randomness for the proofs using fast CSPRNG
     let mut rng = rand::thread_rng();
@@ -147,10 +148,10 @@ where
     let delta = E::GE::vartime_multiscalar_mul(&d_vec, &ck[0..d_vec.len()], true)? + *h * r_delta;
     let beta = E::GE::group(ck_c) * inner_product(&U.b_vec, &d_vec) + *h_c * r_beta;
 
-    transcript.absorb(b"delta", &delta);
-    transcript.absorb(b"beta", &beta);
+    transcript.absorb_bytes(b"delta", &delta.to_transcript_bytes());
+    transcript.absorb_bytes(b"beta", &beta.to_transcript_bytes());
 
-    let r = transcript.squeeze(b"r")?;
+    let r = E::Scalar::from_bytes_reduce(&(), &transcript.squeeze_bytes(b"r")?);
 
     let z_vec = (0..d_vec.len())
       .into_par_iter()
@@ -178,17 +179,17 @@ where
     h_c: &E::GE,
     n: usize,
     U: &InnerProductInstance<E>,
-    transcript: &mut E::TE,
+    transcript: &mut impl ByteTranscript,
   ) -> Result<(), SpartanError> {
     transcript.dom_sep(Self::protocol_name());
 
     // absorb the instance in the transcript
-    transcript.absorb(b"U", U);
+    transcript.absorb_bytes(b"U", &U.to_transcript_bytes());
 
-    transcript.absorb(b"delta", &self.delta);
-    transcript.absorb(b"beta", &self.beta);
+    transcript.absorb_bytes(b"delta", &self.delta.to_transcript_bytes());
+    transcript.absorb_bytes(b"beta", &self.beta.to_transcript_bytes());
 
-    let r = transcript.squeeze(b"r")?;
+    let r = E::Scalar::from_bytes_reduce(&(), &transcript.squeeze_bytes(b"r")?);
 
     if self.z_vec.len() != n || ck.len() < self.z_vec.len() {
       return Err(SpartanError::InvalidInputLength {

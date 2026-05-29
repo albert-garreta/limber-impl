@@ -8,7 +8,7 @@
 //! We require the commitment engine to provide a commitment to vectors with a single group element
 use crate::{
   errors::SpartanError,
-  traits::{Engine, TranscriptReprTrait},
+  traits::{Engine, TranscriptReprTrait, transcript::ByteTranscript},
 };
 use core::fmt::Debug;
 use ff::Field;
@@ -114,11 +114,17 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
   /// Returns an error if the combination fails
   fn combine_blinds(blinds: &[Self::Blind]) -> Result<Self::Blind, SpartanError>;
 
-  /// A method to prove the evaluation of a multilinear polynomial
+  /// A method to prove the evaluation of a multilinear polynomial.
+  ///
+  /// The transcript is field-agnostic (`ByteTranscript`): the PCS reduces
+  /// raw challenge bytes into its own scalar field internally. This lets a
+  /// Mod-PCS compiler delegate to the underlying PCS on a shared transcript
+  /// whose "native" field differs (e.g. a Z_p sumcheck transcript driving
+  /// an F_q Pedersen opening).
   fn prove(
     ck: &Self::CommitmentKey,
     ck_eval: &Self::CommitmentKey,
-    transcript: &mut E::TE,
+    transcript: &mut impl ByteTranscript,
     comm: &Self::Commitment,
     poly: &[E::Scalar],
     blind: &Self::Blind,
@@ -131,7 +137,7 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
   fn verify(
     vk: &Self::VerifierKey,
     ck_eval: &Self::CommitmentKey,
-    transcript: &mut E::TE,
+    transcript: &mut impl ByteTranscript,
     comm: &Self::Commitment,
     point: &[E::Scalar],
     comm_eval: &Self::Commitment,

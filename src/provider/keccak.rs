@@ -9,7 +9,7 @@ use crate::{
   errors::SpartanError,
   traits::{
     mod_engine::{SumcheckEngine, SumcheckField},
-    transcript::{TranscriptEngineTrait, TranscriptReprTrait},
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
 use core::marker::PhantomData;
@@ -54,22 +54,8 @@ fn compute_updated_state(keccak_instance: Keccak256, input: &[u8]) -> [u8; KECCA
     .unwrap()
 }
 
-impl<E: SumcheckEngine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
-  fn new_with_params(label: &'static [u8], params: <E::Scalar as SumcheckField>::Params) -> Self {
-    let keccak_instance = Keccak256::new();
-    let input = [PERSONA_TAG, label].concat();
-    let output = compute_updated_state(keccak_instance.clone(), &input);
-
-    Self {
-      round: 0u16,
-      state: output,
-      transcript: keccak_instance,
-      params,
-      _p: PhantomData,
-    }
-  }
-
-  fn squeeze(&mut self, label: &'static [u8]) -> Result<E::Scalar, SpartanError> {
+impl<E: SumcheckEngine> ByteTranscript for Keccak256Transcript<E> {
+  fn squeeze_bytes(&mut self, label: &'static [u8]) -> Result<[u8; 64], SpartanError> {
     // we gather the full input from the round, preceded by the current state of the transcript
     let input = [
       DOM_SEP_TAG,
@@ -91,21 +77,42 @@ impl<E: SumcheckEngine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
     self.state.copy_from_slice(&output);
     self.transcript = Keccak256::new();
 
-    // squeeze out a challenge. `from_bytes_reduce` forwards to
-    // `PrimeFieldExt::from_uniform` for static-modulus fields (preserving
-    // the prior behavior / test vectors) and reduces bytes mod the runtime
-    // modulus for dynamic-modulus fields.
-    Ok(E::Scalar::from_bytes_reduce(&self.params, &output))
+    Ok(output)
   }
 
-  fn absorb<T: TranscriptReprTrait>(&mut self, label: &'static [u8], o: &T) {
+  fn absorb_bytes(&mut self, label: &'static [u8], bytes: &[u8]) {
     self.transcript.update(label);
-    self.transcript.update(o.to_transcript_bytes());
+    self.transcript.update(bytes);
   }
 
   fn dom_sep(&mut self, bytes: &'static [u8]) {
     self.transcript.update(DOM_SEP_TAG);
     self.transcript.update(bytes);
+  }
+}
+
+impl<E: SumcheckEngine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
+  fn new_with_params(label: &'static [u8], params: <E::Scalar as SumcheckField>::Params) -> Self {
+    let keccak_instance = Keccak256::new();
+    let input = [PERSONA_TAG, label].concat();
+    let output = compute_updated_state(keccak_instance.clone(), &input);
+
+    Self {
+      round: 0u16,
+      state: output,
+      transcript: keccak_instance,
+      params,
+      _p: PhantomData,
+    }
+  }
+
+  fn squeeze(&mut self, label: &'static [u8]) -> Result<E::Scalar, SpartanError> {
+    // squeeze raw bytes then reduce into the field. `from_bytes_reduce`
+    // forwards to `PrimeFieldExt::from_uniform` for static-modulus fields
+    // (preserving the prior behavior / test vectors) and reduces bytes mod
+    // the runtime modulus for dynamic-modulus fields.
+    let output = self.squeeze_bytes(label)?;
+    Ok(E::Scalar::from_bytes_reduce(&self.params, &output))
   }
 }
 
@@ -115,7 +122,7 @@ mod tests {
     provider::{PallasHyraxEngine, VestaHyraxEngine, keccak::Keccak256Transcript},
     traits::{
       Engine, PrimeFieldExt,
-      transcript::{TranscriptEngineTrait, TranscriptReprTrait},
+      transcript::{ByteTranscript, TranscriptEngineTrait, TranscriptReprTrait},
     },
   };
   use ff::PrimeField;

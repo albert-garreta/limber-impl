@@ -10,7 +10,7 @@ use crate::{
   traits::{
     Engine, PrimeFieldExt,
     pcs::{CommitmentTrait, PCSEngineTrait},
-    transcript::{TranscriptEngineTrait, TranscriptReprTrait},
+    transcript::{ByteTranscript, TranscriptReprTrait},
   },
 };
 use core::marker::PhantomData;
@@ -325,7 +325,7 @@ where
   fn prove(
     ck: &Self::CommitmentKey,
     _ck_eval: &Self::CommitmentKey,
-    transcript: &mut <E as Engine>::TE,
+    transcript: &mut impl ByteTranscript,
     comm: &Self::Commitment,
     evals_vec: &[<E as Engine>::Scalar],
     _blind: &Self::Blind,
@@ -391,7 +391,7 @@ where
   fn verify(
     vk: &Self::VerifierKey,
     ck_eval: &Self::CommitmentKey,
-    transcript: &mut <E as Engine>::TE,
+    transcript: &mut impl ByteTranscript,
     comm: &Self::Commitment,
     point: &[<E as Engine>::Scalar],
     comm_eval: &Self::Commitment,

@@ -12,7 +12,7 @@ use crate::{
   traits::{
     Engine,
     pcs::{FoldingEngineTrait, PCSEngineTrait},
-    transcript::TranscriptEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
 use serde::{Deserialize, Serialize};

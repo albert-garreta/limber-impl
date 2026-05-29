@@ -37,7 +37,7 @@ use crate::{
     circuit::SpartanCircuit,
     pcs::{FoldingEngineTrait, PCSEngineTrait},
     snark::{DigestHelperTrait, R1CSSNARKTrait, SpartanDigest},
-    transcript::TranscriptEngineTrait,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
   },
   zk::SpartanVerifierCircuit,
 };

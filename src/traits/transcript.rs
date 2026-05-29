@@ -23,8 +23,35 @@ pub trait TranscriptReprTrait: Send + Sync {
   fn to_transcript_bytes(&self) -> Vec<u8>;
 }
 
-/// This trait defines the behavior of a transcript engine compatible with Spartan
-pub trait TranscriptEngineTrait<E: SumcheckEngine>: Send + Sync {
+/// Field-agnostic transcript operations: absorb raw bytes, squeeze raw
+/// bytes, and domain separation.
+///
+/// This is the byte-level Fiat-Shamir chain. A single byte-chain can feed
+/// multiple field reductions — e.g. a Phase-2 SNARK's `Z_p` sumcheck and
+/// the underlying PCS's `F_q` opening both read challenges from the *same*
+/// `ByteTranscript`, each reducing the raw bytes into its own field. This
+/// decoupling is what lets `sumcheck_modp` (arithmetic over a dynamic
+/// prime) share one transcript with a curve-based PCS opening.
+pub trait ByteTranscript: Send + Sync {
+  /// Squeeze 64 raw bytes of challenge material under a label.
+  fn squeeze_bytes(&mut self, label: &'static [u8]) -> Result<[u8; 64], SpartanError>;
+
+  /// Absorb raw bytes under a label.
+  fn absorb_bytes(&mut self, label: &'static [u8], bytes: &[u8]);
+
+  /// Add a domain separator.
+  fn dom_sep(&mut self, bytes: &'static [u8]);
+
+  /// Absorb anything implementing `TranscriptReprTrait`, via its bytes.
+  /// Field-agnostic: absorbing only ever moves bytes into the chain.
+  fn absorb<T: TranscriptReprTrait>(&mut self, label: &'static [u8], o: &T) {
+    self.absorb_bytes(label, &o.to_transcript_bytes());
+  }
+}
+
+/// This trait defines the behavior of a transcript engine compatible with
+/// Spartan. It layers field-typed conveniences over [`ByteTranscript`].
+pub trait TranscriptEngineTrait<E: SumcheckEngine>: ByteTranscript {
   /// Initialize the transcript with the field's modulus context.
   ///
   /// The `params` are needed so that `squeeze` can construct challenges in
@@ -46,12 +73,6 @@ pub trait TranscriptEngineTrait<E: SumcheckEngine>: Send + Sync {
 
   /// returns a scalar element of the field as a challenge
   fn squeeze(&mut self, label: &'static [u8]) -> Result<E::Scalar, SpartanError>;
-
-  /// absorbs any type that implements `TranscriptReprTrait` under a label
-  fn absorb<T: TranscriptReprTrait>(&mut self, label: &'static [u8], o: &T);
-
-  /// adds a domain separator
-  fn dom_sep(&mut self, bytes: &'static [u8]);
 }
 
 impl<T: TranscriptReprTrait> TranscriptReprTrait for &[T] {
