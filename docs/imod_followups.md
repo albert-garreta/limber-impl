@@ -205,24 +205,36 @@ size; promote into a phase plan when picked up.
 
 ### Performance / structure
 
-- **Phase-2 prover is ~10× slower than Phase-1 at comparable shape.**
-  Initial bench numbers from `benches/imod_spartan_modp.rs` (2026-06-01,
-  Apple Silicon, default features):
-  - At `(num_cons=2^6, num_vars=2^8)`: P1 prove 7.2ms, P2 prove 73ms; P1
-    verify 6.7ms, P2 verify 73ms. Setup is comparable (~18ms each).
-  - At `(num_cons=2^8, num_vars=2^10)`: P2 prove 136ms, P2 verify 132ms.
-  - Scaling from `2^6→2^8` constraints: P2 prove 1.86×, sub-linear.
+- **Phase-2 prover is ~10× plain Spartan at the smallest shape.**
+  Bench numbers (Apple Silicon, default features, 2026-06-01) at
+  `(num_cons=2^6, num_vars=2^8)`:
 
-  Dominant Phase-2 costs from inspection (not yet attributed by profile):
-  DynPrime arithmetic in the sumcheck (~3-5× per op vs t256::Scalar), s
+  |                          | Setup | Prove | Verify |
+  |--------------------------|-------|-------|--------|
+  | Plain Spartan (p=q)      | 18ms  | 7.1ms | 5.5ms  |
+  | Phase-1 imod (p=q)       | 18ms  | 7.2ms | 6.7ms  |
+  | Phase-2 imod (p≠q)       | 18ms  | 73ms  | 73ms   |
+
+  Phase-1 imod is essentially indistinguishable from plain Spartan
+  (~22% verify overhead from the extra Q-poly opening) — the
+  [[feedback_imod_perf_target]] "small constant factor" is being met for
+  the `p=q` regime.
+
+  Phase-2 imod at `(2^8, 2^10)`: prove 136ms, verify 132ms. Sub-linear
+  scaling from `2^6→2^8` (prove grew 1.86×, ratio to plain Spartan should
+  shrink at larger shapes since IntEval's overhead is more constant).
+
+  Dominant Phase-2 costs (not yet attributed by profile): DynPrime
+  arithmetic in the sumcheck (~3-5× per op vs t256::Scalar), `s`
   rejection-sampled small primes per Mod-PCS open (Miller-Rabin is
   measurable), and step-C identity opens (3 Hyrax opens per iteration per
   prime). All three are addressed elsewhere in this list.
 
-  **Per [[feedback_imod_perf_target]], we want imod within a small
-  constant factor of *plain* Spartan**, not just within a small factor of
-  Phase-1 imod. Need to bench plain Spartan at the same shape and report
-  the full P0/P1/P2 ratio.
+  Caveat on the comparison: P1/P2 imod synthetic shape has 3 nnz/row
+  (one per matrix); plain Spartan's bellpepper-synthesized multiplication
+  uses denser matrices. Proof-size comparison is therefore not
+  apples-to-apples; constraint count is the meaningful axis until we
+  shape-match more carefully.
 
 - **`IntEvalEvalArg` is huge under default params.** Step C produces, per
   prove call: `s` chains × `t` iterations × 2 polynomial Hyrax commits, plus

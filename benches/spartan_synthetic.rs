@@ -80,10 +80,10 @@ impl<E: Engine> SpartanCircuit<E> for SyntheticMulCircuit<E::Scalar> {
 }
 
 fn spartan_synthetic_benches(c: &mut Criterion) {
-  // Match imod_spartan bench: num_cons targets 2^k for k ∈ {10, 12, 14}.
-  // Plain Spartan pads internally, so the realised shape may be slightly
-  // larger than N.
-  let configs: &[usize] = &[1 << 10, 1 << 12, 1 << 14];
+  // Match imod_spartan(_modp) bench: num_cons targets 2^k for k ∈ {6, 10,
+  // 12, 14}. Plain Spartan pads internally, so the realised shape may be
+  // slightly larger than N.
+  let configs: &[usize] = &[1 << 6, 1 << 10, 1 << 12, 1 << 14];
 
   for &n in configs {
     let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new(n);
