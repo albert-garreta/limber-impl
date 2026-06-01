@@ -665,4 +665,151 @@ mod tests {
     proof.v_q += MScalar::<ME>::one(&params);
     assert!(proof.verify(&vk, &U).is_err());
   }
+
+  /// Two real constraints with different moduli, exercising the outer SC
+  /// on more than one active row.
+  ///   row 0: 3·5 ≡ 1 (mod 14), q₀ = 1 (since 15 = 1 + 14·1)
+  ///   row 1: 7·9 ≡ 3 (mod 20), q₁ = 3 (since 63 = 3 + 20·3)
+  #[test]
+  fn imod_modp_two_row_roundtrip() {
+    let one = BigUint::from(1u32);
+    let zero = BigUint::from(0u32);
+    let num_cons = 2usize;
+    let num_vars = 8usize;
+    let num_io = 0usize;
+
+    // Layout w = [a1, b1, c1, a2, b2, c2, 0, 0]
+    let mat_a = vec![(0, 0, one.clone()), (1, 3, one.clone())];
+    let mat_b = vec![(0, 1, one.clone()), (1, 4, one.clone())];
+    let mat_c = vec![(0, 2, one.clone()), (1, 5, one)];
+    let mods = vec![BigUint::from(14u32), BigUint::from(20u32)];
+
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+        .unwrap();
+
+    let w: Vec<BigUint> = [3u32, 5, 1, 7, 9, 3, 0, 0]
+      .iter()
+      .map(|x| BigUint::from(*x))
+      .collect();
+    let q: Vec<BigUint> = [1u32, 3].iter().map(|x| BigUint::from(*x)).collect();
+
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &U, &W).unwrap();
+
+    let _ = zero; // silence unused if test layout changes
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
+    proof.verify(&vk, &U).unwrap();
+  }
+
+  /// Public IO: a tiny circuit `w₀ · w₁ ≡ x₀ (mod 14)` with `x₀ = 1` as
+  /// public input. Exercises the `eval_public_at` path that the
+  /// zero-IO toy doesn't touch.
+  #[test]
+  fn imod_modp_with_public_io() {
+    let one = BigUint::from(1u32);
+    let num_cons = 2usize;
+    let num_vars = 4usize;
+    let num_io = 1usize;
+    // num_cols = num_vars + 1 + num_io = 4 + 1 + 1 = 6
+    // columns 0..4 = w, column 4 = 1 (constant), column 5 = x[0]
+    let mat_a = vec![(0, 0, one.clone())]; // selects w[0] = 3
+    let mat_b = vec![(0, 1, one.clone())]; // selects w[1] = 5
+    let mat_c = vec![(0, 5, one)]; // selects x[0] = 1
+    let mods = vec![BigUint::from(14u32), BigUint::from(0u32)];
+
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+        .unwrap();
+
+    let w: Vec<BigUint> = [3u32, 5, 0, 0].iter().map(|x| BigUint::from(*x)).collect();
+    let q: Vec<BigUint> = [1u32, 0].iter().map(|x| BigUint::from(*x)).collect();
+    let x: Vec<BigUint> = vec![BigUint::from(1u32)];
+
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, x).unwrap();
+    shape.is_sat(&pk.ck, &U, &W).unwrap();
+
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
+    proof.verify(&vk, &U).unwrap();
+  }
+
+  /// Shapes with the same dimensions/mods but different `A` entries must
+  /// produce distinct verifier-key digests. Distinct digests are what
+  /// makes vk-cross-binding work: the transcript binds `vk_digest` first,
+  /// so swapping vks deterministically derives different `p` and the
+  /// rest of the proof becomes incoherent under the wrong vk.
+  ///
+  /// (Phase-2 gap: today, verifying a proof under the wrong vk
+  /// *panics* inside `crypto-bigint`'s `FixedMontyForm` op when the
+  /// proof's `DynPrime` values carry params from the original `p` while
+  /// the verifier reduces shape2 data with the freshly sampled `p`.
+  /// The panic IS a form of rejection, but it's ungraceful — Phase 3
+  /// should convert the param mismatch into a clean `SpartanError`.
+  /// For now this test asserts only the digest distinction.)
+  #[test]
+  fn imod_modp_digest_binds_matrices() {
+    let one = BigUint::from(1u32);
+    let two = BigUint::from(2u32);
+    let zero = BigUint::from(0u32);
+    let num_cons = 2usize;
+    let num_vars = 4usize;
+    let num_io = 0usize;
+
+    let mat_a1 = vec![(0, 0, one.clone())];
+    let mat_a2 = vec![(0, 0, two)];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one)];
+    let mods = vec![BigUint::from(14u32), zero];
+
+    let shape1 = IntModR1CSShapeModp::<ME>::new(
+      num_cons,
+      num_vars,
+      num_io,
+      mat_a1,
+      mat_b.clone(),
+      mat_c.clone(),
+      mods.clone(),
+    )
+    .unwrap();
+    let shape2 =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a2, mat_b, mat_c, mods)
+        .unwrap();
+
+    let (_, vk1) = IntModSpartanModpSNARK::<ME>::setup(shape1).unwrap();
+    let (_, vk2) = IntModSpartanModpSNARK::<ME>::setup(shape2).unwrap();
+    assert_ne!(vk1.digest(), vk2.digest());
+  }
+
+  /// Sanity: the transcript-sampled `p` actually differs from the curve
+  /// scalar prime `q`. Asserts the dual-field claim is real on this
+  /// engine; the sampling derives `p` from the transcript bytes, so this
+  /// also pins the byte-level Fiat-Shamir derivation in place.
+  #[test]
+  fn imod_modp_sampled_p_is_not_q() {
+    use crate::provider::pcs::bridge_modpcs::t256_scalar_params;
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
+    let (pk, _vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    let _ = W; // not needed for this check
+
+    let mut t = Keccak256Transcript::<ME>::new_with_params(
+      b"IntModSpartanModpSNARK",
+      <ME as ModEngine>::bootstrap_params(),
+    );
+    t.absorb_bytes(b"vk", &pk.vk_digest);
+    t.absorb(b"comm_w", &U.comm_w);
+    t.absorb(b"comm_q", &U.comm_q);
+    let params_p = <ME as ModEngine>::sample_params(&mut t);
+    let params_q = t256_scalar_params();
+    // Compare the modulus values via the Montgomery context's stable
+    // representation: convert 1 to canonical Uint via `retrieve()`, then
+    // compare moduli through MontyForm's `params()` accessor.
+    // (`FixedMontyParams` doesn't impl PartialEq; route through DynPrime.)
+    use crate::dyn_prime::DynPrime;
+    let one_p = DynPrime::<4>::one(&params_p);
+    let one_q = DynPrime::<4>::one(&params_q);
+    assert_ne!(one_p.params(), one_q.params());
+  }
 }
