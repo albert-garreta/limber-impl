@@ -30,16 +30,20 @@
 
 use crate::{
   errors::SpartanError,
+  polys::eq::EqPolynomial,
   provider::{T256DynPrimeEngine, T256HyraxEngine, pcs::hyrax_pc::HyraxPCS, pt256::t256},
   traits::{
     PrimeFieldExt,
-    mod_engine::{ModPCSEngineTrait, SumcheckEngine},
+    mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
     pcs::PCSEngineTrait,
-    transcript::TranscriptReprTrait,
+    transcript::{ByteTranscript, TranscriptReprTrait},
   },
 };
 use core::marker::PhantomData;
-use num_bigint::BigUint;
+use ff::{Field, PrimeField};
+use num_bigint::{BigInt, BigUint, Sign};
+use num_integer::Integer;
+use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 
 /// Underlying standard PCS: Hyrax over T256.
@@ -297,12 +301,33 @@ pub struct IntEvalBlind {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
 }
 
-/// Evaluation argument — currently a placeholder containing only the
-/// underlying Hyrax eval-argument. Step B will extend this to carry the
-/// small-prime opens; step C will carry the partial-eval oracles.
+/// One per-small-prime opening: the F-side evaluation `F_y^(i)`, the
+/// blind used to commit it, and the Hyrax evaluation argument for the
+/// opening at the small-prime-reduced point.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SmallPrimeOpening {
+  /// F_y^(i) = f_F(r mod p_i), the F-evaluation at the small-prime-
+  /// reduced point. Sent in the clear; verifier checks it for the
+  /// CRT congruence `to_int(F_y^(i)) ≡ int_v' (mod p_i)`.
+  pub f_y: t256::Scalar,
+  /// Blind used to commit `f_y`. Verifier reconstructs `comm_eval_i`
+  /// from `(f_y, blind_eval)` and feeds it to `Hyrax::verify`.
+  pub blind_eval: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  /// Hyrax evaluation argument for the opening at `r mod p_i`.
+  pub hyrax_arg: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::EvaluationArgument,
+}
+
+/// Evaluation argument: the prover-sent integer evaluation `int_v'` and
+/// `s` small-prime openings. Step B targets the no-iteration (`n ≤ k`)
+/// regime; step C will add partial-eval oracles.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntEvalEvalArg {
-  pub(crate) _todo: (),
+  /// `int_v' = f(int_r)` as a signed integer. Negative values come from
+  /// `(1 - r_i)` factors in the multilinear chi. Serialized as
+  /// `(sign, magnitude_le_bytes)`.
+  pub int_v_prime: BigInt,
+  /// One per small prime sampled from the transcript.
+  pub openings: Vec<SmallPrimeOpening>,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -313,6 +338,139 @@ fn biguint_to_scalar(v: &BigUint) -> t256::Scalar {
   let mut bytes = v.to_bytes_le();
   bytes.resize(64, 0);
   <t256::Scalar as PrimeFieldExt>::from_uniform(&bytes)
+}
+
+/// `t256::Scalar → BigUint` via the canonical (non-Montgomery) integer
+/// representation. Inverse of `biguint_to_scalar` for inputs that fit
+/// in the scalar field.
+fn scalar_to_biguint(s: &t256::Scalar) -> BigUint {
+  BigUint::from_bytes_le(s.to_repr().as_ref())
+}
+
+/// `t256::Scalar → BigInt` in *balanced* representation. The canonical
+/// integer in `[0, q)` is reinterpreted as a signed integer in
+/// `[-q/2, q/2)`: values `≥ ⌈q/2⌉` become `value - q`. Used by the
+/// IntEval CRT check: when the integer evaluation is negative, the F
+/// arithmetic produces a result near `q` (because `(1 - r_i)` wraps to
+/// `q + 1 - r_i`), so the verifier must lift back to a signed value.
+fn scalar_to_balanced_int(s: &t256::Scalar) -> BigInt {
+  let v = scalar_to_biguint(s);
+  let q = t256_q();
+  let half = &q >> 1;
+  if v > half {
+    BigInt::from(v) - BigInt::from(q)
+  } else {
+    BigInt::from(v)
+  }
+}
+
+/// The T256 scalar field's characteristic `q` as a `BigUint`. Computed
+/// once via `(q - 1) + 1` from `-Scalar::ONE`'s representation (same
+/// trick as `bridge_modpcs::t256_scalar_params`); cheap enough to
+/// recompute per call since it's just byte arithmetic.
+fn t256_q() -> BigUint {
+  let q_minus_1 = (-<t256::Scalar as Field>::ONE).to_repr();
+  let mut bytes = q_minus_1.as_ref().to_vec();
+  let mut carry = 1u8;
+  for b in bytes.iter_mut() {
+    let (v, c) = b.overflowing_add(carry);
+    *b = v;
+    carry = u8::from(c);
+  }
+  debug_assert_eq!(carry, 0);
+  BigUint::from_bytes_le(&bytes)
+}
+
+/// Canonical integer in `[0, p)` from a `DynPrime<4>` value.
+fn dyn_to_biguint(d: &crate::dyn_prime::DynPrime<4>) -> BigUint {
+  BigUint::from_bytes_le(&d.to_le_bytes())
+}
+
+/// Extract `p` (the dynamic prime) from a non-empty point. Uses the
+/// modulus carried by the first component's `FixedMontyParams<4>`.
+fn extract_p(point: &[crate::dyn_prime::DynPrime<4>]) -> Result<BigUint, SpartanError> {
+  let p0 = point.first().ok_or(SpartanError::InternalError {
+    reason: "IntEvalModPCS: point must have at least one component to extract p".to_string(),
+  })?;
+  let modulus = p0.params().modulus();
+  // `modulus` is `&Odd<Uint<4>>`; `.as_ref()` gives the inner `Uint<4>`.
+  let bytes = modulus.as_ref().to_le_bytes();
+  Ok(BigUint::from_bytes_le(bytes.as_slice()))
+}
+
+/// Compute the signed integer MLE evaluation `sum_k chi_int(k, point) ·
+/// poly[k]`, where `chi_int(k, point) = prod_i (k_i · point_i + (1-k_i) ·
+/// (1-point_i))` over Z (no reduction). Returns the full integer.
+///
+/// Used by the IntEval prover to compute `int_v' = f(int_r)`. The result
+/// can be huge — bounded by `2^n · p^n · max(|poly|)` in magnitude — and
+/// can be negative when `(1 - point_i)` flips signs.
+fn integer_mle_evaluate(poly: &[BigUint], point: &[BigUint]) -> BigInt {
+  let n = poly.len();
+  let num_vars = n.trailing_zeros() as usize;
+  debug_assert_eq!(1 << num_vars, n);
+  debug_assert_eq!(point.len(), num_vars);
+
+  // Pre-lift point components to BigInt.
+  let point_int: Vec<BigInt> = point.iter().map(|x| BigInt::from(x.clone())).collect();
+  let one = BigInt::one();
+
+  // Walk all 2^num_vars hypercube points. Bit-order matches
+  // `EqPolynomial::evals_from_points`: variable `i ∈ [0, num_vars)`
+  // corresponds to bit `num_vars - 1 - i` of `k`.
+  let mut acc = BigInt::zero();
+  for (k, poly_k) in poly.iter().enumerate().take(n) {
+    let mut chi = one.clone();
+    for (i, pi) in point_int.iter().enumerate().take(num_vars) {
+      let bit = (k >> (num_vars - 1 - i)) & 1;
+      let factor = if bit == 1 { pi.clone() } else { &one - pi };
+      chi *= factor;
+    }
+    acc += chi * BigInt::from(poly_k.clone());
+  }
+  acc
+}
+
+/// Rejection-sample a small prime in `[2^{log_p - 1}, 2^{log_p})` from
+/// the transcript via Miller-Rabin / Lucas BPSW. Squeezes 64 bytes at a
+/// time, builds a `log_p`-bit candidate with the MSB and LSB forced,
+/// runs `crypto_primes::is_prime`, and retries on composite. The two
+/// sides (prover & verifier) drive the transcript identically, so they
+/// arrive at the same prime.
+fn sample_small_prime<T: ByteTranscript>(
+  transcript: &mut T,
+  log_p: usize,
+) -> Result<BigUint, SpartanError> {
+  use crypto_primes::{Flavor, is_prime};
+  // `crypto_primes::is_prime` works over `Uint<L>`; we use `U256` here
+  // since `log_p` is bounded by `LOG_Q = 256`.
+  use crypto_bigint::U256;
+  assert!(log_p > 1 && log_p <= LOG_Q);
+  let bytes_needed = log_p.div_ceil(8);
+  loop {
+    let bytes = transcript.squeeze_bytes(b"sample_small_p")?;
+    let mut buf = [0u8; 32];
+    buf[..bytes_needed].copy_from_slice(&bytes[..bytes_needed]);
+    // Force MSB of bit (log_p - 1) so candidate has exactly log_p bits;
+    // force LSB so it's odd. Clear bits above log_p - 1 so width is exact.
+    let top_byte = (log_p - 1) / 8;
+    let top_bit_in_byte = (log_p - 1) % 8;
+    // Clear bits above log_p - 1.
+    if top_byte < 32 {
+      let mask_top: u8 = (1u16 << (top_bit_in_byte + 1)).wrapping_sub(1) as u8;
+      buf[top_byte] &= mask_top;
+      for b in &mut buf[(top_byte + 1)..] {
+        *b = 0;
+      }
+    }
+    // Force MSB and LSB.
+    buf[top_byte] |= 1u8 << top_bit_in_byte;
+    buf[0] |= 0x01;
+    let candidate = U256::from_le_slice(&buf);
+    if is_prime(Flavor::Any, &candidate) {
+      return Ok(BigUint::from_bytes_le(&buf));
+    }
+  }
 }
 
 /// Sound Mod-PCS for `T256DynPrimeEngine`. See module docs.
@@ -428,43 +586,197 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
   }
 
   fn prove(
-    _ck: &Self::CommitmentKey,
-    _ck_eval: &Self::CommitmentKey,
-    _transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
-    _comm: &Self::Commitment,
-    _poly: &[BigUint],
-    _blind: &Self::Blind,
-    _point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
-    _eval: &BigUint,
+    ck: &Self::CommitmentKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comm: &Self::Commitment,
+    poly: &[BigUint],
+    blind: &Self::Blind,
+    point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    eval: &BigUint,
     _comm_eval: &Self::Commitment,
     _blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
-    // TODO Phase 3 step B: sample s small primes from the transcript,
-    // open the F-commitment at `point mod p_i` for each, package the
-    // s eval claims into the evaluation argument.
-    Err(SpartanError::InternalError {
-      reason: "IntEvalModPCS::prove not yet implemented (Phase 3 step B)".to_string(),
+    let params = &ck.params;
+    let num_vars = point.len();
+    if num_vars > params.k {
+      // Phase 3 step C: partial-evaluation iteration. Not yet wired.
+      return Err(SpartanError::InternalError {
+        reason: format!(
+          "IntEvalModPCS::prove: num_vars={num_vars} > k={}; partial-eval \
+           iteration is Phase-3 step C (not yet implemented)",
+          params.k
+        ),
+      });
+    }
+
+    // 1. Compute the signed integer evaluation `int_v' = f(int_r)`.
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v_prime = integer_mle_evaluate(poly, &int_point);
+
+    // 2. Prover-side sanity: `eval ≡ int_v' (mod p)`.
+    let p = extract_p(point)?;
+    let int_v_mod_p = int_v_prime.mod_floor(&BigInt::from(p.clone()));
+    let int_v_mod_p_u = int_v_mod_p
+      .to_biguint()
+      .expect("mod_floor of a BigInt by a positive BigUint is non-negative");
+    if &int_v_mod_p_u != eval {
+      return Err(SpartanError::InternalError {
+        reason: "IntEvalModPCS::prove: eval ≠ int_v' mod p (prover bug)".to_string(),
+      });
+    }
+
+    // 3. Bind `int_v'` into the transcript so verifier re-samples same primes.
+    absorb_bigint(transcript, &int_v_prime);
+
+    // 4. For each small prime `p_i`, compute `r_i = int_r mod p_i`,
+    //    cast to F, and produce a Hyrax opening of `poly_fq` at `r_i_fq`.
+    let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
+    let mut openings = Vec::with_capacity(params.s);
+    for _ in 0..params.s {
+      let p_i = sample_small_prime(transcript, params.log_p)?;
+      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % &p_i).collect();
+      let r_i_fq: Vec<t256::Scalar> = r_i_int.iter().map(biguint_to_scalar).collect();
+
+      let f_y = mle_evaluate_fq(&poly_fq, &r_i_fq);
+      let blind_eval_i = Hyrax::blind(&ck_eval.inner, 1);
+      let comm_eval_i = Hyrax::commit(&ck_eval.inner, &[f_y], &blind_eval_i, false)?;
+      let hyrax_arg = Hyrax::prove(
+        &ck.inner,
+        &ck_eval.inner,
+        transcript,
+        &comm.inner,
+        &poly_fq,
+        &blind.inner,
+        &r_i_fq,
+        &comm_eval_i,
+        &blind_eval_i,
+      )?;
+
+      openings.push(SmallPrimeOpening {
+        f_y,
+        blind_eval: blind_eval_i,
+        hyrax_arg,
+      });
+    }
+
+    Ok(IntEvalEvalArg {
+      int_v_prime,
+      openings,
     })
   }
 
   fn verify(
-    _vk: &Self::VerifierKey,
-    _ck_eval: &Self::CommitmentKey,
-    _transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
-    _comm: &Self::Commitment,
-    _point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
-    _eval: &BigUint,
+    vk: &Self::VerifierKey,
+    ck_eval: &Self::CommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comm: &Self::Commitment,
+    point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    eval: &BigUint,
     _comm_eval: &Self::Commitment,
-    _arg: &Self::EvaluationArgument,
+    arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
-    // TODO Phase 3 step B: re-sample the same s small primes from the
-    // transcript, verify each F-PCS opening, check `to_int(F_y^(i)) ≡
-    // int_v' mod p_i` and the CRT-implied congruence with the claimed
-    // Z_p eval.
-    Err(SpartanError::InternalError {
-      reason: "IntEvalModPCS::verify not yet implemented (Phase 3 step B)".to_string(),
-    })
+    let params = &vk.params;
+    let num_vars = point.len();
+    if num_vars > params.k {
+      return Err(SpartanError::InternalError {
+        reason: format!(
+          "IntEvalModPCS::verify: num_vars={num_vars} > k={}; partial-eval \
+           iteration is Phase-3 step C (not yet implemented)",
+          params.k
+        ),
+      });
+    }
+    if arg.openings.len() != params.s {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+
+    // 1. Check `eval ≡ int_v' (mod p)`.
+    let p = extract_p(point)?;
+    let int_v_mod_p = arg.int_v_prime.mod_floor(&BigInt::from(p.clone()));
+    let int_v_mod_p_u = int_v_mod_p
+      .to_biguint()
+      .ok_or(SpartanError::InvalidSumcheckProof)?;
+    if &int_v_mod_p_u != eval {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+
+    // 2. Re-derive transcript binding identically to the prover.
+    absorb_bigint(transcript, &arg.int_v_prime);
+
+    // 3. Re-sample s small primes and verify each opening.
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    for opening in &arg.openings {
+      let p_i = sample_small_prime(transcript, params.log_p)?;
+      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % &p_i).collect();
+      let r_i_fq: Vec<t256::Scalar> = r_i_int.iter().map(biguint_to_scalar).collect();
+
+      // Re-commit to `f_y` using the prover-sent blind; this binds
+      // `comm_eval_i` to the specific `f_y` value the prover claims.
+      let comm_eval_i = Hyrax::commit(&ck_eval.inner, &[opening.f_y], &opening.blind_eval, false)?;
+      Hyrax::verify(
+        &vk.inner,
+        &ck_eval.inner,
+        transcript,
+        &comm.inner,
+        &r_i_fq,
+        &comm_eval_i,
+        &opening.hyrax_arg,
+      )?;
+
+      // CRT congruence check: `to_int(f_y) ≡ int_v' (mod p_i)` in the
+      // *balanced* F representation. `chi` factors include `(1 - r_i)`
+      // which the F arithmetic computes as `q + 1 - r_i` — i.e. the
+      // F value sits near `q` whenever the corresponding integer chi is
+      // negative. Treating `f_y` as a signed integer in `[-q/2, q/2)`
+      // recovers the integer value the integer MLE would produce; both
+      // sides must agree mod p_i.
+      let f_y_balanced = scalar_to_balanced_int(&opening.f_y);
+      let lhs = f_y_balanced
+        .mod_floor(&BigInt::from(p_i.clone()))
+        .to_biguint()
+        .ok_or(SpartanError::InvalidSumcheckProof)?;
+      let rhs = arg
+        .int_v_prime
+        .mod_floor(&BigInt::from(p_i.clone()))
+        .to_biguint()
+        .ok_or(SpartanError::InvalidSumcheckProof)?;
+      if lhs != rhs {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+    }
+
+    Ok(())
   }
+}
+
+/// Multilinear evaluation of `poly_fq` at point `r` over F. Mirrors the
+/// dot-product form `sum_k chi(r, k) · poly[k]` used elsewhere.
+fn mle_evaluate_fq(poly_fq: &[t256::Scalar], r: &[t256::Scalar]) -> t256::Scalar {
+  let chis = EqPolynomial::evals_from_points(r);
+  debug_assert_eq!(chis.len(), poly_fq.len());
+  let mut acc = t256::Scalar::ZERO;
+  for (c, v) in chis.iter().zip(poly_fq.iter()) {
+    acc += *c * *v;
+  }
+  acc
+}
+
+/// Absorb a `BigInt` into a `ByteTranscript` as `(sign_byte, LE
+/// magnitude bytes)`. Sign byte is `0` for non-negative, `1` for
+/// negative. Length-prefixed by usize → 8 bytes LE so re-derivation is
+/// unambiguous.
+fn absorb_bigint<T: ByteTranscript>(transcript: &mut T, x: &BigInt) {
+  let sign_byte: u8 = match x.sign() {
+    Sign::Minus => 1,
+    _ => 0,
+  };
+  let mag = x.magnitude().to_bytes_le();
+  let mut buf = Vec::with_capacity(1 + 8 + mag.len());
+  buf.push(sign_byte);
+  buf.extend_from_slice(&(mag.len() as u64).to_le_bytes());
+  buf.extend_from_slice(&mag);
+  transcript.absorb_bytes(b"int_v_prime", &buf);
 }
 
 #[cfg(test)]
@@ -566,33 +878,155 @@ mod tests {
     assert!(matches!(err, SpartanError::InvalidInputLength { .. }));
   }
 
-  /// prove/verify currently error with a not-yet-implemented marker —
-  /// pins that the trait surface compiles and that we land step B's
-  /// implementation here.
+  /// Helper: build params for a small dynamic prime so we can
+  /// deterministically evaluate the polynomial at a known Z_p point.
+  fn small_dyn_params() -> crypto_bigint::modular::FixedMontyParams<4> {
+    use crypto_bigint::{Odd, U256};
+    // A small prime (37) so the integer evaluation is human-verifiable.
+    crypto_bigint::modular::FixedMontyParams::new(Odd::new(U256::from(37u32)).unwrap())
+  }
+
+  /// End-to-end IntEval prove/verify for the `n ≤ k` regime.
   #[test]
-  fn prove_verify_todo_markers() {
-    let n = 4usize;
-    let (ck, vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-test", n, 256);
+  fn prove_verify_roundtrips_small_witness() {
+    let num_vars = 4usize;
+    let n = 1usize << num_vars; // 16
+    let (ck, vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-rt", n, 256);
     let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
-    let params = crate::provider::pcs::bridge_modpcs::t256_scalar_params();
+    let dyn_params = small_dyn_params();
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
-    let point: Vec<DP> = (0..2)
-      .map(|i| DP::from_u64(&params, (i as u64) + 1))
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
       .collect();
+
+    // Oracle Z_p eval: take the integer evaluation reduced mod p.
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v = integer_mle_evaluate(&poly, &int_point);
+    let p: BigUint = BigUint::from(37u32);
+    let eval = int_v
+      .mod_floor(&BigInt::from(p.clone()))
+      .to_biguint()
+      .unwrap();
+
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let eval_bu = BigUint::from(0u32);
     let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
       &ck_eval,
-      std::slice::from_ref(&eval_bu),
+      std::slice::from_ref(&eval),
       &blind_eval,
       false,
     )
     .unwrap();
 
-    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &ck_eval,
+      &mut pt,
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+      &comm_eval,
+      &blind_eval,
+    )
+    .unwrap();
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
+    )
+    .unwrap();
+  }
+
+  /// Verifier rejects a tampered claimed Z_p eval.
+  #[test]
+  fn verify_rejects_wrong_eval() {
+    let num_vars = 4usize;
+    let n = 1usize << num_vars;
+    let (ck, vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-rt", n, 256);
+    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
+
+    let dyn_params = small_dyn_params();
+    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v = integer_mle_evaluate(&poly, &int_point);
+    let p = BigUint::from(37u32);
+    let real_eval = int_v
+      .mod_floor(&BigInt::from(p.clone()))
+      .to_biguint()
+      .unwrap();
+    // Tamper: add 1 mod 37.
+    let bad_eval = (real_eval.clone() + BigUint::from(1u32)) % &p;
+
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&real_eval),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &ck_eval,
+      &mut pt,
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &real_eval,
+      &comm_eval,
+      &blind_eval,
+    )
+    .unwrap();
+
+    // Verifier with the bad eval claim must reject.
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    let err = <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk, &ck_eval, &mut vt, &comm, &point, &bad_eval, &comm_eval, &arg,
+    )
+    .unwrap_err();
+    assert!(matches!(err, SpartanError::InvalidSumcheckProof));
+  }
+
+  /// Prove rejects an `n > k` poly (Phase-3 step C boundary).
+  #[test]
+  fn prove_errors_above_k() {
+    use crypto_bigint::{Odd, U256};
+    let n = 1usize << 12; // 12 > k=7 (default)
+    let (ck, _vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-big", n, 256);
+    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
+    let dyn_params = small_dyn_params();
+    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32)).collect();
+    let point: Vec<DP> = (0..12)
+      .map(|i| DP::from_u64(&dyn_params, (i as u64) % 37))
+      .collect();
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
+    let eval = BigUint::from(0u32);
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
+    let _ = (Odd::new(U256::from(3u32)), U256::ZERO);
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
     let err = <MP as ModPCSEngineTrait<ME>>::prove(
       &ck,
       &ck_eval,
@@ -601,17 +1035,9 @@ mod tests {
       &poly,
       &blind,
       &point,
-      &eval_bu,
+      &eval,
       &comm_eval,
       &blind_eval,
-    )
-    .unwrap_err();
-    assert!(matches!(err, SpartanError::InternalError { .. }));
-
-    let arg = IntEvalEvalArg { _todo: () };
-    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
-    let err = <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &eval_bu, &comm_eval, &arg,
     )
     .unwrap_err();
     assert!(matches!(err, SpartanError::InternalError { .. }));

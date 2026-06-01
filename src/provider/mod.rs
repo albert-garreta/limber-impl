@@ -121,11 +121,10 @@ impl SumcheckEngine for T256DynPrimeEngine {
 }
 
 impl ModEngine for T256DynPrimeEngine {
-  // Phase-2 stub: unsound `TrivialIntModPCS` so the SNARK driver flow runs
-  // end-to-end under p ≠ q. The real (sound) IntEval-based Mod-PCS lands
-  // in Phase 3; `BridgeModPCS` (formerly the p=q skeleton) stays in tree
-  // as a reference but isn't wired up.
-  type ModPCS = crate::provider::pcs::trivial_int_modpcs::TrivialIntModPCS<Self>;
+  // Phase-3 step B: sound IntEvalModPCS (small-prime fingerprinting +
+  // Hyrax-T256 underneath). TrivialIntModPCS and BridgeModPCS remain
+  // in tree as reference / fallback impls but aren't wired up.
+  type ModPCS = crate::provider::pcs::inteval_modpcs::IntEvalModPCS;
 
   /// Bootstrap params: smallest valid odd-modulus `FixedMontyParams<4>`
   /// (modulus = 3). Used only for transcript construction before the
