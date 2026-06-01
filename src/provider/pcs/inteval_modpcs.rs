@@ -398,6 +398,74 @@ fn extract_p(point: &[crate::dyn_prime::DynPrime<4>]) -> Result<BigUint, Spartan
   Ok(BigUint::from_bytes_le(bytes.as_slice()))
 }
 
+/// Truncated (toward-zero) divmod. Returns `(q, r)` with `q · d + r = g`
+/// and `sign(r) = sign(g)` (or `r = 0`); `|r| < d`. Used by IntEval's
+/// partial-evaluation decomposition for *symmetric* remainder/quotient,
+/// matching the user-preferred convention (deviates from the paper's
+/// floor-division `⌊·/p_i⌋`). The integer identity `a + p · b = g`
+/// holds the same for both, so soundness is unchanged.
+fn truncated_divmod(g: &BigInt, d: &BigUint) -> (BigInt, BigInt) {
+  let d_big = BigInt::from(d.clone());
+  let q = g / &d_big;
+  let r = g - &q * &d_big;
+  (q, r)
+}
+
+/// Public shift bound for an `a_j` polynomial: under truncated divmod
+/// with divisor `p_i`, `a_j(x) ∈ (-p_i, p_i)`. Using the universal
+/// upper bound `P = 2^log_p` for all primes in the sample range gives
+/// a constant shift per-`params`, independent of the specific `p_i`.
+fn shift_a(params: &IntEvalParams) -> BigUint {
+  BigUint::one() << params.log_p
+}
+
+/// Public shift bound for a `b_j` polynomial: per the paper's bound
+/// `||g_j|| < (q-P)/2` and `|b_j| ≤ ||g_j||/p_i`, we have
+/// `|b_j| < (q-P)/(2 p_i) < q/(2·P/2) = q/P` (using `p_i ≥ P/2`).
+/// So shifting by `⌊q/P⌋` is sound. Like `shift_a`, this is a public
+/// per-`params` constant.
+fn shift_b(params: &IntEvalParams) -> BigUint {
+  &t256_q() / (BigUint::one() << params.log_p)
+}
+
+/// Integer partial-evaluation at the *last* `k` variables. Given a
+/// multilinear polynomial `poly` of `2^n_cur` evaluations and a binding
+/// vector `r_lower` of length `k`, returns the `2^(n_cur - k)`
+/// evaluations of `g(X) = poly(X, r_lower)`. Computed over Z (no
+/// reduction); intermediate magnitudes can grow large.
+fn integer_partial_evaluate_top_k(poly: &[BigInt], r_lower: &[BigUint]) -> Vec<BigInt> {
+  let k = r_lower.len();
+  let two_k = 1usize << k;
+  assert!(poly.len().is_multiple_of(two_k));
+  let new_size = poly.len() / two_k;
+
+  let r_int: Vec<BigInt> = r_lower.iter().map(|x| BigInt::from(x.clone())).collect();
+  let one = BigInt::one();
+
+  // Precompute integer chi(r_lower, y) for y ∈ [0, 2^k). Bit-order
+  // matches `EqPolynomial::evals_from_points`: variable i corresponds
+  // to bit (k-1-i) of y.
+  let chi_table: Vec<BigInt> = (0..two_k)
+    .map(|y| {
+      let mut chi = one.clone();
+      for (i, ri) in r_int.iter().enumerate().take(k) {
+        let bit = (y >> (k - 1 - i)) & 1;
+        let factor = if bit == 1 { ri.clone() } else { &one - ri };
+        chi *= factor;
+      }
+      chi
+    })
+    .collect();
+
+  let mut result = vec![BigInt::zero(); new_size];
+  for (x, slot) in result.iter_mut().enumerate().take(new_size) {
+    for (y, chi_y) in chi_table.iter().enumerate().take(two_k) {
+      *slot += &poly[x * two_k + y] * chi_y;
+    }
+  }
+  result
+}
+
 /// Compute the signed integer MLE evaluation `sum_k chi_int(k, point) ·
 /// poly[k]`, where `chi_int(k, point) = prod_i (k_i · point_i + (1-k_i) ·
 /// (1-point_i))` over Z (no reduction). Returns the full integer.
@@ -832,6 +900,47 @@ mod tests {
         "derive(log_T_f={}, k={}, n={}) → log_P={}, s={}",
         p.log_t_f, p.k, num_vars, p.log_p, p.s
       );
+    }
+  }
+
+  /// Truncated divmod gives symmetric `(q, r)`: `divmod(-g) = (-q, -r)`.
+  #[test]
+  fn truncated_divmod_is_symmetric() {
+    for (g, d, eq, er) in [
+      (7i64, 2u64, 3i64, 1i64),
+      (-7, 2, -3, -1),
+      (8, 2, 4, 0),
+      (-8, 2, -4, 0),
+      (-7, 3, -2, -1),
+      (0, 5, 0, 0),
+    ] {
+      let (q, r) = truncated_divmod(&BigInt::from(g), &BigUint::from(d));
+      assert_eq!(q, BigInt::from(eq), "q wrong for {g} / {d}");
+      assert_eq!(r, BigInt::from(er), "r wrong for {g} mod {d}");
+      // Identity always holds.
+      assert_eq!(&q * BigInt::from(d) + &r, BigInt::from(g));
+    }
+  }
+
+  /// Partial-eval at the last variable should match a 2-step direct
+  /// evaluation: poly is 8 evals (3 vars), partial-eval the last var,
+  /// then evaluate the remaining 2-var poly at a 2-component point.
+  #[test]
+  fn integer_partial_evaluate_matches_full_eval() {
+    // poly[x_0, x_1, x_2] = 100·x_0 + 10·x_1 + x_2 (over Z).
+    // The evaluation table walks (x_0, x_1, x_2) in big-endian bit order,
+    // so poly[(b2 b1 b0)] = 100·b2 + 10·b1 + b0.
+    let poly: Vec<BigInt> = (0..8u32)
+      .map(|k| BigInt::from(100 * ((k >> 2) & 1) + 10 * ((k >> 1) & 1) + (k & 1)))
+      .collect();
+    // Partial-eval at last variable to value 3.
+    let r_last = vec![BigUint::from(3u32)];
+    let g = integer_partial_evaluate_top_k(&poly, &r_last);
+    assert_eq!(g.len(), 4);
+    // g[(b2 b1)] = poly(b2, b1, 3) = 100·b2 + 10·b1 + 3.
+    for k in 0..4u32 {
+      let expected = BigInt::from(100 * ((k >> 1) & 1) + 10 * (k & 1) + 3);
+      assert_eq!(g[k as usize], expected);
     }
   }
 
