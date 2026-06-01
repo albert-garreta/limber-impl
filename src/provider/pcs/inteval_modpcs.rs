@@ -31,7 +31,10 @@
 use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
-  provider::{T256DynPrimeEngine, T256HyraxEngine, pcs::hyrax_pc::HyraxPCS, pt256::t256},
+  provider::{
+    T256DynPrimeEngine, T256HyraxEngine, keccak::Keccak256Transcript, pcs::hyrax_pc::HyraxPCS,
+    pt256::t256,
+  },
   traits::{
     PrimeFieldExt,
     mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
@@ -317,17 +320,45 @@ pub struct SmallPrimeOpening {
   pub hyrax_arg: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::EvaluationArgument,
 }
 
+/// One iteration's oracle commitments + identity-check openings at γ.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IterationOracles {
+  /// Hyrax commitment to the *shifted* `a_j` (each coefficient + `shift_a`).
+  pub comm_a_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// Hyrax commitment to the *shifted* `b_j`.
+  pub comm_b_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// Opening of `a_{j-1}` at `(γ[0..n-jk], r^(i)[n-jk+1..n-(j-1)k])`.
+  /// For `j=1` this opens the *input* polynomial's commitment, not an
+  /// `IterationOracles` commitment.
+  pub open_a_prev: SmallPrimeOpening,
+  /// Opening of `a_j` at `γ[0..n-jk]`.
+  pub open_a_curr: SmallPrimeOpening,
+  /// Opening of `b_j` at `γ[0..n-jk]`.
+  pub open_b_curr: SmallPrimeOpening,
+}
+
+/// Per-prime chain: `t = ⌈(n-k)/k⌉` iterations plus the final-remainder
+/// opening at `r^(i)[0..n-tk]`. For `n ≤ k` the iterations vec is empty
+/// and `final_open` opens the input polynomial at `r^(i)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChainData {
+  /// Per-iteration oracle commitments and identity-check openings.
+  pub iterations: Vec<IterationOracles>,
+  /// `a_t(r^(i)[0..n-tk])` — opens the final remainder commitment for
+  /// `t ≥ 1`; opens the input polynomial commitment for `t = 0`.
+  pub final_open: SmallPrimeOpening,
+}
+
 /// Evaluation argument: the prover-sent integer evaluation `int_v'` and
-/// `s` small-prime openings. Step B targets the no-iteration (`n ≤ k`)
-/// regime; step C will add partial-eval oracles.
+/// one per-prime chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntEvalEvalArg {
   /// `int_v' = f(int_r)` as a signed integer. Negative values come from
-  /// `(1 - r_i)` factors in the multilinear chi. Serialized as
-  /// `(sign, magnitude_le_bytes)`.
+  /// `(1 - r_i)` factors in the multilinear chi.
   pub int_v_prime: BigInt,
-  /// One per small prime sampled from the transcript.
-  pub openings: Vec<SmallPrimeOpening>,
+  /// One per small prime sampled from the transcript. Length matches
+  /// `params.s`.
+  pub chains: Vec<ChainData>,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -667,70 +698,233 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let params = &ck.params;
     let num_vars = point.len();
-    if num_vars > params.k {
-      // Phase 3 step C: partial-evaluation iteration. Not yet wired.
-      return Err(SpartanError::InternalError {
-        reason: format!(
-          "IntEvalModPCS::prove: num_vars={num_vars} > k={}; partial-eval \
-           iteration is Phase-3 step C (not yet implemented)",
-          params.k
-        ),
-      });
-    }
+    let with_iter = num_vars > params.k;
 
-    // 1. Compute the signed integer evaluation `int_v' = f(int_r)`.
+    // 1. int_v' = f(int_r) over Z.
     let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
     let int_v_prime = integer_mle_evaluate(poly, &int_point);
 
-    // 2. Prover-side sanity: `eval ≡ int_v' (mod p)`.
+    // 2. Sanity: eval ≡ int_v' (mod p).
     let p = extract_p(point)?;
-    let int_v_mod_p = int_v_prime.mod_floor(&BigInt::from(p.clone()));
-    let int_v_mod_p_u = int_v_mod_p
+    let int_v_mod_p_u = int_v_prime
+      .mod_floor(&BigInt::from(p.clone()))
       .to_biguint()
-      .expect("mod_floor of a BigInt by a positive BigUint is non-negative");
+      .expect("mod_floor by a positive divisor is non-negative");
     if &int_v_mod_p_u != eval {
       return Err(SpartanError::InternalError {
         reason: "IntEvalModPCS::prove: eval ≠ int_v' mod p (prover bug)".to_string(),
       });
     }
 
-    // 3. Bind `int_v'` into the transcript so verifier re-samples same primes.
+    // 3. Bind int_v' into the transcript.
     absorb_bigint(transcript, &int_v_prime);
 
-    // 4. For each small prime `p_i`, compute `r_i = int_r mod p_i`,
-    //    cast to F, and produce a Hyrax opening of `poly_fq` at `r_i_fq`.
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
-    let mut openings = Vec::with_capacity(params.s);
+
+    // 4. Phase 1: per prime, sample p_i, run all t iterations (if any),
+    //    committing a_j_shifted / b_j_shifted and absorbing into the
+    //    transcript. We stash the per-chain prover state needed to
+    //    generate openings in phase 2.
+    let mut chain_states: Vec<ChainProverState> = Vec::with_capacity(params.s);
     for _ in 0..params.s {
       let p_i = sample_small_prime(transcript, params.log_p)?;
       let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % &p_i).collect();
-      let r_i_fq: Vec<t256::Scalar> = r_i_int.iter().map(biguint_to_scalar).collect();
 
-      let f_y = mle_evaluate_fq(&poly_fq, &r_i_fq);
-      let blind_eval_i = Hyrax::blind(&ck_eval.inner, 1);
-      let comm_eval_i = Hyrax::commit(&ck_eval.inner, &[f_y], &blind_eval_i, false)?;
-      let hyrax_arg = Hyrax::prove(
-        &ck.inner,
-        &ck_eval.inner,
-        transcript,
-        &comm.inner,
-        &poly_fq,
-        &blind.inner,
-        &r_i_fq,
-        &comm_eval_i,
-        &blind_eval_i,
-      )?;
+      let mut state = ChainProverState {
+        p_i: p_i.clone(),
+        r_i_int: r_i_int.clone(),
+        iters: Vec::new(),
+      };
 
-      openings.push(SmallPrimeOpening {
-        f_y,
-        blind_eval: blind_eval_i,
-        hyrax_arg,
+      if with_iter {
+        let t = num_vars.saturating_sub(params.k).div_ceil(params.k);
+        let n = num_vars;
+        let k = params.k;
+
+        // a_prev starts as the input polynomial.
+        let mut a_prev_int: Vec<BigInt> = poly.iter().map(|x| BigInt::from(x.clone())).collect();
+
+        for j in 1..=t {
+          let lo = n - j * k;
+          let hi = n - (j - 1) * k;
+          let r_lower = &r_i_int[lo..hi];
+
+          let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
+          let mut a_j_int = Vec::with_capacity(g_j_int.len());
+          let mut b_j_int = Vec::with_capacity(g_j_int.len());
+          for g in &g_j_int {
+            let (b, a) = truncated_divmod(g, &p_i);
+            a_j_int.push(a);
+            b_j_int.push(b);
+          }
+
+          let s_a = BigInt::from(shift_a(params));
+          let s_b = BigInt::from(shift_b(params));
+          let a_j_shifted: Vec<BigUint> = a_j_int
+            .iter()
+            .map(|x| (x + &s_a).to_biguint().expect("shift makes non-negative"))
+            .collect();
+          let b_j_shifted: Vec<BigUint> = b_j_int
+            .iter()
+            .map(|x| (x + &s_b).to_biguint().expect("shift makes non-negative"))
+            .collect();
+
+          let a_j_shifted_fq: Vec<t256::Scalar> =
+            a_j_shifted.iter().map(biguint_to_scalar).collect();
+          let b_j_shifted_fq: Vec<t256::Scalar> =
+            b_j_shifted.iter().map(biguint_to_scalar).collect();
+
+          let a_blind = Hyrax::blind(&ck.inner, a_j_shifted_fq.len());
+          let b_blind = Hyrax::blind(&ck.inner, b_j_shifted_fq.len());
+          let comm_a_shifted = Hyrax::commit(&ck.inner, &a_j_shifted_fq, &a_blind, false)?;
+          let comm_b_shifted = Hyrax::commit(&ck.inner, &b_j_shifted_fq, &b_blind, false)?;
+
+          transcript.absorb(b"a_shifted", &comm_a_shifted);
+          transcript.absorb(b"b_shifted", &comm_b_shifted);
+
+          state.iters.push(IterationProverState {
+            a_shifted_fq: a_j_shifted_fq,
+            a_blind: a_blind.clone(),
+            comm_a_shifted: comm_a_shifted.clone(),
+            b_shifted_fq: b_j_shifted_fq,
+            b_blind,
+            comm_b_shifted,
+          });
+
+          a_prev_int = a_j_int;
+        }
+      }
+
+      chain_states.push(state);
+    }
+
+    // 5. Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
+    let gamma_fq: Vec<t256::Scalar> = if with_iter {
+      (0..(num_vars - params.k))
+        .map(|i| {
+          let bytes = transcript.squeeze_bytes(b"gamma")?;
+          let label = (i as u64).to_le_bytes();
+          transcript.absorb_bytes(b"gamma_idx", &label);
+          Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+        })
+        .collect::<Result<Vec<_>, SpartanError>>()?
+    } else {
+      Vec::new()
+    };
+
+    // 6. Phase 2: per chain, generate openings.
+    let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
+    for state in chain_states {
+      let ChainProverState {
+        p_i: _,
+        r_i_int,
+        iters,
+      } = state;
+
+      // 6a. Generate identity-check openings for each iteration j.
+      let mut iter_oracles = Vec::with_capacity(iters.len());
+      let n = num_vars;
+      let k = params.k;
+      for (jm1, iter_state) in iters.iter().enumerate() {
+        let j = jm1 + 1;
+        let prefix_len = n - j * k;
+        let lo = n - j * k;
+        let hi = n - (j - 1) * k;
+        let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
+        let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
+        let gamma_extended: Vec<t256::Scalar> = gamma_prefix
+          .iter()
+          .chain(r_lower_fq.iter())
+          .copied()
+          .collect();
+
+        // a_{j-1}: for j=1 is the input commitment; otherwise iters[j-2]'s comm_a_shifted.
+        let (a_prev_comm, a_prev_poly_fq, a_prev_blind) = if j == 1 {
+          (comm.inner.clone(), poly_fq.clone(), blind.inner.clone())
+        } else {
+          let prev = &iters[jm1 - 1];
+          (
+            prev.comm_a_shifted.clone(),
+            prev.a_shifted_fq.clone(),
+            prev.a_blind.clone(),
+          )
+        };
+
+        let open_a_prev = hyrax_open_at(
+          &ck.inner,
+          &ck_eval.inner,
+          transcript,
+          &a_prev_comm,
+          &a_prev_poly_fq,
+          &a_prev_blind,
+          &gamma_extended,
+        )?;
+        let open_a_curr = hyrax_open_at(
+          &ck.inner,
+          &ck_eval.inner,
+          transcript,
+          &iter_state.comm_a_shifted,
+          &iter_state.a_shifted_fq,
+          &iter_state.a_blind,
+          &gamma_prefix,
+        )?;
+        let open_b_curr = hyrax_open_at(
+          &ck.inner,
+          &ck_eval.inner,
+          transcript,
+          &iter_state.comm_b_shifted,
+          &iter_state.b_shifted_fq,
+          &iter_state.b_blind,
+          &gamma_prefix,
+        )?;
+
+        iter_oracles.push(IterationOracles {
+          comm_a_shifted: iter_state.comm_a_shifted.clone(),
+          comm_b_shifted: iter_state.comm_b_shifted.clone(),
+          open_a_prev,
+          open_a_curr,
+          open_b_curr,
+        });
+      }
+
+      // 6b. Final-remainder open: a_t at r_i[0..n-tk]. For t=0 this opens
+      //     the *input* polynomial at the full r_i (step B path).
+      let t = iters.len();
+      let final_point_int: Vec<BigUint> = r_i_int[..(num_vars - t * params.k)].to_vec();
+      let final_point_fq: Vec<t256::Scalar> =
+        final_point_int.iter().map(biguint_to_scalar).collect();
+      let final_open = if t == 0 {
+        hyrax_open_at(
+          &ck.inner,
+          &ck_eval.inner,
+          transcript,
+          &comm.inner,
+          &poly_fq,
+          &blind.inner,
+          &final_point_fq,
+        )?
+      } else {
+        let last = &iters[t - 1];
+        hyrax_open_at(
+          &ck.inner,
+          &ck_eval.inner,
+          transcript,
+          &last.comm_a_shifted,
+          &last.a_shifted_fq,
+          &last.a_blind,
+          &final_point_fq,
+        )?
+      };
+
+      chains.push(ChainData {
+        iterations: iter_oracles,
+        final_open,
       });
     }
 
     Ok(IntEvalEvalArg {
       int_v_prime,
-      openings,
+      chains,
     })
   }
 
@@ -746,23 +940,20 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
   ) -> Result<(), SpartanError> {
     let params = &vk.params;
     let num_vars = point.len();
-    if num_vars > params.k {
-      return Err(SpartanError::InternalError {
-        reason: format!(
-          "IntEvalModPCS::verify: num_vars={num_vars} > k={}; partial-eval \
-           iteration is Phase-3 step C (not yet implemented)",
-          params.k
-        ),
-      });
-    }
-    if arg.openings.len() != params.s {
+    let with_iter = num_vars > params.k;
+    let n = num_vars;
+    let k = params.k;
+    let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
+
+    if arg.chains.len() != params.s {
       return Err(SpartanError::InvalidSumcheckProof);
     }
 
-    // 1. Check `eval ≡ int_v' (mod p)`.
+    // 1. eval ≡ int_v' (mod p).
     let p = extract_p(point)?;
-    let int_v_mod_p = arg.int_v_prime.mod_floor(&BigInt::from(p.clone()));
-    let int_v_mod_p_u = int_v_mod_p
+    let int_v_mod_p_u = arg
+      .int_v_prime
+      .mod_floor(&BigInt::from(p.clone()))
       .to_biguint()
       .ok_or(SpartanError::InvalidSumcheckProof)?;
     if &int_v_mod_p_u != eval {
@@ -772,35 +963,137 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     // 2. Re-derive transcript binding identically to the prover.
     absorb_bigint(transcript, &arg.int_v_prime);
 
-    // 3. Re-sample s small primes and verify each opening.
     let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
-    for opening in &arg.openings {
+
+    // 3. Phase 1: per chain, re-sample p_i, then for each iteration
+    //    consume comm_a_shifted / comm_b_shifted from the arg and absorb
+    //    them identically.
+    let mut chain_primes: Vec<(BigUint, Vec<BigUint>)> = Vec::with_capacity(params.s);
+    for chain in &arg.chains {
       let p_i = sample_small_prime(transcript, params.log_p)?;
       let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % &p_i).collect();
-      let r_i_fq: Vec<t256::Scalar> = r_i_int.iter().map(biguint_to_scalar).collect();
 
-      // Re-commit to `f_y` using the prover-sent blind; this binds
-      // `comm_eval_i` to the specific `f_y` value the prover claims.
-      let comm_eval_i = Hyrax::commit(&ck_eval.inner, &[opening.f_y], &opening.blind_eval, false)?;
-      Hyrax::verify(
+      if chain.iterations.len() != t {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+      for iter in &chain.iterations {
+        transcript.absorb(b"a_shifted", &iter.comm_a_shifted);
+        transcript.absorb(b"b_shifted", &iter.comm_b_shifted);
+      }
+
+      chain_primes.push((p_i, r_i_int));
+    }
+
+    // 4. Sample γ if iterating, identically to prover.
+    let gamma_fq: Vec<t256::Scalar> = if with_iter {
+      (0..(n - k))
+        .map(|i| {
+          let bytes = transcript.squeeze_bytes(b"gamma")?;
+          let label = (i as u64).to_le_bytes();
+          transcript.absorb_bytes(b"gamma_idx", &label);
+          Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+        })
+        .collect::<Result<Vec<_>, SpartanError>>()?
+    } else {
+      Vec::new()
+    };
+
+    // 5. Phase 2: per chain, verify each iteration's three openings +
+    //    identity check, then verify the final-remainder opening + CRT.
+    let shift_a_fq = biguint_to_scalar(&shift_a(params));
+    let shift_b_fq = biguint_to_scalar(&shift_b(params));
+
+    for (chain_idx, chain) in arg.chains.iter().enumerate() {
+      let (p_i, r_i_int) = &chain_primes[chain_idx];
+      let p_i_fq = biguint_to_scalar(p_i);
+
+      for (jm1, iter) in chain.iterations.iter().enumerate() {
+        let j = jm1 + 1;
+        let prefix_len = n - j * k;
+        let lo = n - j * k;
+        let hi = n - (j - 1) * k;
+        let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
+        let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
+        let gamma_extended: Vec<t256::Scalar> = gamma_prefix
+          .iter()
+          .chain(r_lower_fq.iter())
+          .copied()
+          .collect();
+
+        let a_prev_comm = if j == 1 {
+          comm.inner.clone()
+        } else {
+          chain.iterations[jm1 - 1].comm_a_shifted.clone()
+        };
+
+        hyrax_verify_open(
+          &vk.inner,
+          &ck_eval.inner,
+          transcript,
+          &a_prev_comm,
+          &gamma_extended,
+          &iter.open_a_prev,
+        )?;
+        hyrax_verify_open(
+          &vk.inner,
+          &ck_eval.inner,
+          transcript,
+          &iter.comm_a_shifted,
+          &gamma_prefix,
+          &iter.open_a_curr,
+        )?;
+        hyrax_verify_open(
+          &vk.inner,
+          &ck_eval.inner,
+          transcript,
+          &iter.comm_b_shifted,
+          &gamma_prefix,
+          &iter.open_b_curr,
+        )?;
+
+        // Identity check in F: a_j(γ) + p_i · b_j(γ) ?= a_{j-1}(γ_ext).
+        // a_prev for j=1 is the *unshifted* input poly (no subtract);
+        // otherwise a_prev_shifted: subtract shift_a.
+        let lhs_a = iter.open_a_curr.f_y - shift_a_fq;
+        let lhs_b = iter.open_b_curr.f_y - shift_b_fq;
+        let lhs = lhs_a + p_i_fq * lhs_b;
+        let rhs = if j == 1 {
+          iter.open_a_prev.f_y
+        } else {
+          iter.open_a_prev.f_y - shift_a_fq
+        };
+        if lhs != rhs {
+          return Err(SpartanError::InvalidSumcheckProof);
+        }
+      }
+
+      // Final remainder verification.
+      let final_point_fq: Vec<t256::Scalar> = r_i_int[..(n - t * k)]
+        .iter()
+        .map(biguint_to_scalar)
+        .collect();
+      let final_comm = if t == 0 {
+        comm.inner.clone()
+      } else {
+        chain.iterations[t - 1].comm_a_shifted.clone()
+      };
+      hyrax_verify_open(
         &vk.inner,
         &ck_eval.inner,
         transcript,
-        &comm.inner,
-        &r_i_fq,
-        &comm_eval_i,
-        &opening.hyrax_arg,
+        &final_comm,
+        &final_point_fq,
+        &chain.final_open,
       )?;
 
-      // CRT congruence check: `to_int(f_y) ≡ int_v' (mod p_i)` in the
-      // *balanced* F representation. `chi` factors include `(1 - r_i)`
-      // which the F arithmetic computes as `q + 1 - r_i` — i.e. the
-      // F value sits near `q` whenever the corresponding integer chi is
-      // negative. Treating `f_y` as a signed integer in `[-q/2, q/2)`
-      // recovers the integer value the integer MLE would produce; both
-      // sides must agree mod p_i.
-      let f_y_balanced = scalar_to_balanced_int(&opening.f_y);
-      let lhs = f_y_balanced
+      // CRT check: (final_open.f_y [- shift_a if t>0]) interpreted as a
+      // *balanced* integer ≡ int_v' (mod p_i).
+      let final_f = if t == 0 {
+        chain.final_open.f_y
+      } else {
+        chain.final_open.f_y - shift_a_fq
+      };
+      let lhs = scalar_to_balanced_int(&final_f)
         .mod_floor(&BigInt::from(p_i.clone()))
         .to_biguint()
         .ok_or(SpartanError::InvalidSumcheckProof)?;
@@ -828,6 +1121,83 @@ fn mle_evaluate_fq(poly_fq: &[t256::Scalar], r: &[t256::Scalar]) -> t256::Scalar
     acc += *c * *v;
   }
   acc
+}
+
+/// Prover-side per-iteration state. Lives only during prove, never
+/// serialized — holds the underlying F polynomial / blind / commitment
+/// for both `a_j_shifted` and `b_j_shifted` so phase 2 can produce
+/// openings at γ.
+struct IterationProverState {
+  a_shifted_fq: Vec<t256::Scalar>,
+  a_blind: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  comm_a_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  b_shifted_fq: Vec<t256::Scalar>,
+  b_blind: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  comm_b_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+}
+
+/// Prover-side per-chain state collected in phase 1 and consumed in
+/// phase 2.
+struct ChainProverState {
+  p_i: BigUint,
+  r_i_int: Vec<BigUint>,
+  iters: Vec<IterationProverState>,
+}
+
+/// Helper: open the Hyrax commitment `comm` at `point` to produce a
+/// `SmallPrimeOpening` (eval value + blind + Hyrax eval-argument). The
+/// underlying polynomial `poly_fq` and its `blind` are inputs.
+fn hyrax_open_at(
+  ck: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  poly_fq: &[t256::Scalar],
+  blind: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  point: &[t256::Scalar],
+) -> Result<SmallPrimeOpening, SpartanError> {
+  let f_y = mle_evaluate_fq(poly_fq, point);
+  let blind_eval = Hyrax::blind(ck_eval, 1);
+  let comm_eval = Hyrax::commit(ck_eval, &[f_y], &blind_eval, false)?;
+  let arg = Hyrax::prove(
+    ck,
+    ck_eval,
+    transcript,
+    comm,
+    poly_fq,
+    blind,
+    point,
+    &comm_eval,
+    &blind_eval,
+  )?;
+  Ok(SmallPrimeOpening {
+    f_y,
+    blind_eval,
+    hyrax_arg: arg,
+  })
+}
+
+/// Mirror of `hyrax_open_at` on the verifier side: reconstruct
+/// `comm_eval` from the prover-sent `(f_y, blind_eval)` and verify the
+/// Hyrax argument against the polynomial commitment `comm` at `point`.
+fn hyrax_verify_open(
+  vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
+  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  point: &[t256::Scalar],
+  opening: &SmallPrimeOpening,
+) -> Result<(), SpartanError> {
+  let comm_eval = Hyrax::commit(ck_eval, &[opening.f_y], &opening.blind_eval, false)?;
+  Hyrax::verify(
+    vk,
+    ck_eval,
+    transcript,
+    comm,
+    point,
+    &comm_eval,
+    &opening.hyrax_arg,
+  )
 }
 
 /// Absorb a `BigInt` into a `ByteTranscript` as `(sign_byte, LE
@@ -1110,22 +1480,37 @@ mod tests {
     assert!(matches!(err, SpartanError::InvalidSumcheckProof));
   }
 
-  /// Prove rejects an `n > k` poly (Phase-3 step C boundary).
+  /// Step C end-to-end: `n > k` triggers the partial-eval iteration
+  /// path. Uses explicit small-k params (k=2) so a 4-var poly hits
+  /// `t = ⌈(4-2)/2⌉ = 1` iteration.
   #[test]
-  fn prove_errors_above_k() {
-    use crypto_bigint::{Odd, U256};
-    let n = 1usize << 12; // 12 > k=7 (default)
-    let (ck, _vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-big", n, 256);
+  fn prove_verify_roundtrips_with_iteration() {
+    let num_vars = 4usize;
+    let n = 1usize << num_vars; // 16
+    // Small-k config so the partial-eval iteration path triggers.
+    // `derive` picks the largest valid log_p and the smallest s.
+    let small_params =
+      IntEvalParams::derive_no_limb_split(8, 2, num_vars).expect("valid derived params");
+    let (ck, vk) = IntEvalModPCS::setup_with_params(b"inteval-iter", n, 256, small_params).unwrap();
     let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
+
     let dyn_params = small_dyn_params();
-    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32)).collect();
-    let point: Vec<DP> = (0..12)
-      .map(|i| DP::from_u64(&dyn_params, (i as u64) % 37))
+    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 3 + 5) % 37))
       .collect();
+
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v = integer_mle_evaluate(&poly, &int_point);
+    let p = BigUint::from(37u32);
+    let eval = int_v
+      .mod_floor(&BigInt::from(p.clone()))
+      .to_biguint()
+      .unwrap();
+
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let eval = BigUint::from(0u32);
     let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
       &ck_eval,
       std::slice::from_ref(&eval),
@@ -1133,10 +1518,9 @@ mod tests {
       false,
     )
     .unwrap();
-    let _ = (Odd::new(U256::from(3u32)), U256::ZERO);
 
-    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let err = <MP as ModPCSEngineTrait<ME>>::prove(
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
       &ck,
       &ck_eval,
       &mut pt,
@@ -1148,7 +1532,12 @@ mod tests {
       &comm_eval,
       &blind_eval,
     )
-    .unwrap_err();
-    assert!(matches!(err, SpartanError::InternalError { .. }));
+    .unwrap();
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
+    )
+    .unwrap();
   }
 }

@@ -93,6 +93,100 @@ size; promote into a phase plan when picked up.
 
 (none yet)
 
+## Phase 3 follow-ups (identified during step A–C implementation, 2026-06-01)
+
+### Performance / structure
+
+- **`IntEvalEvalArg` is huge under default params.** Step C produces, per
+  prove call: `s` chains × `t` iterations × 2 polynomial Hyrax commits, plus
+  `s × (3t + 1)` Hyrax openings (each carries `f_y`, `blind_eval`, and a
+  Hyrax eval-argument). For default params (s≈10, t depends on n/k), this
+  grows fast. **Fix candidates:**
+  - Batched Hyrax openings: a single multi-point open per oracle instead of
+    one Hyrax::prove per (i, j, oracle).
+  - Re-randomize across primes: many of the openings are at the same γ-prefix
+    but on different oracles — a single random-linear-combination open could
+    replace 3 of them per iteration.
+  - Compact the BigInt `int_v_prime` serialization (currently sign byte +
+    8-byte LE length + LE magnitude; could be tighter).
+
+- **Per-`p_i` matrix-style work is not parallelized.** The `s` chains are
+  embarrassingly parallel — each is independent until γ is sampled. **Fix:**
+  rayon-parallelize the per-chain phase 1 loop in `IntEvalModPCS::prove`.
+  Same for verify. Probably ~3-5× speedup on prove for default `s = 10`.
+
+- **`mle_evaluate_fq` walks the full eq-table every call.** Each γ-prefix
+  opening recomputes the eq-table from scratch. For step C, each chain
+  recomputes the same γ-prefix table many times. **Fix:** cache the
+  γ-prefix eq-tables once per (prefix_len), reuse across chains.
+
+- **Integer partial-eval allocates a full chi table.** `integer_partial_evaluate_top_k`
+  builds a `2^k`-length `Vec<BigInt>` of chi values, then dot-products. For
+  larger `k` this is memory-heavy. **Fix:** streaming computation — accumulate
+  the output directly without materializing chi[]. Minor; only matters at
+  large k.
+
+- **Small-prime rejection sampling does up to 16 bytes of work per try, but
+  squeezes 64.** `sample_small_prime` squeezes a full 64-byte transcript
+  block per candidate. The remaining 48 bytes are wasted. **Fix:** absorb-
+  once, candidate-from-bytes-with-counter, retry without re-squeezing.
+  Tiny perf win; probably not worth the complexity.
+
+- **`shift_b` per-call recomputes `t256_q()`.** Cheap but unnecessary —
+  `q` is a constant. **Fix:** `once_cell::sync::Lazy<BigUint>` for `q`.
+
+### Correctness boundaries / TODOs
+
+- **Range check on commit is not implemented.** Phase-3 step D. Without it,
+  IntEvalModPCS soundness depends on the application enforcing the witness
+  bound. The non-negative witness assumption + the `T_f` parameter define
+  the bound; we need a sumcheck-based bit-decomposition or lookup argument
+  to enforce it.
+
+- **`prove_with_iter` chain commitments aren't bound to `p_i`.** The
+  transcript absorbs `comm_a_shifted` / `comm_b_shifted` but not the prime
+  they were computed against. Two chains with the same commits but different
+  primes would be indistinguishable to the FS chain. **Fix candidate:**
+  absorb `p_i` (or a label `i` + the actual p_i bytes) before the iteration
+  commits. Probably already implicit via the prime-sample ordering, but
+  worth double-checking.
+
+- **Verifier cross-vk panic still unfixed.** From Phase 2's
+  `imod_modp_digest_binds_matrices` test note: verifying a proof under the
+  wrong vk currently panics inside crypto-bigint when `DynPrime` ops hit
+  mismatched `FixedMontyParams`. Should convert to a clean `SpartanError`.
+
+- **`scalar_to_balanced_int` only used for step B's final eval.** Step C's
+  identity check and final remainder use `shift_a`/`shift_b` subtraction
+  in F instead — no balancing needed (the F-arithmetic stays positive
+  thanks to the shifts). Code path could be cleaned up.
+
+### Param derivation
+
+- **`IntEvalParams::derive` picks the smallest valid k from `k_start = log λ`
+  upward.** This isn't always the optimal choice — sometimes a *larger* k
+  gives fewer iterations and better commitment cost (per the table in §4.4).
+  **Fix:** rank by `compute_params.py`-style `extra_commit_ratio` and pick
+  the best.
+
+- **`validate` uses the paper's strict text formula for Soundness 1, which
+  the paper's *own* table rows don't satisfy.** We've documented this — the
+  script uses a tighter analysis. Our strict check is conservative (rejects
+  valid-per-the-script configs). **Fix:** port the script's formula.
+
+### Code hygiene
+
+- **`TrivialIntModPCS` and `BridgeModPCS` are now dead code.** Kept as
+  reference. After Phase 3 is stable, delete.
+
+- **The IntEval impl is concrete to `T256DynPrimeEngine`.** No abstraction
+  over which underlying F-PCS to use. Once we have multiple `ModEngine`s,
+  consider generalizing — but probably not before then.
+
+- **No serialization tests for `IntEvalEvalArg`.** The struct includes
+  `BigInt` (Sign + magnitude) and `Vec<HyraxCommitment>` etc; nothing
+  exercises that the bincode roundtrip works. Add a smoke test.
+
 ## Phase 2+ design considerations: keeping ModPCSEngineTrait hash-PCS-friendly
 
 When fleshing out `ModPCSEngineTrait`'s method signatures (step 2 onwards),
