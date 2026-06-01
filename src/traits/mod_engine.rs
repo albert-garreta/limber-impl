@@ -304,9 +304,11 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 
   /// Prove that the integer-valued polynomial `poly` evaluates at the
-  /// `Z_p` point `point` to the `Z_p` value committed in `comm_eval`.
-  /// Soundly implementing this for `p ≠ q` is the IntEval protocol
-  /// (Phase 3); the Phase-2 stub leaves it unproven.
+  /// `Z_p` point `point` to `eval` (the canonical integer in `[0, p)`
+  /// representing the `Z_p` evaluation). `comm_eval` is the commitment
+  /// to `eval` from the calling SNARK driver; sound Mod-PCS impls
+  /// (Phase-3 IntEval) also use `eval` directly for the integer-side
+  /// consistency check.
   #[allow(clippy::too_many_arguments)]
   fn prove(
     ck: &Self::CommitmentKey,
@@ -316,11 +318,14 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[E::Scalar],
+    eval: &BigUint,
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
 
-  /// Verify a polynomial opening.
+  /// Verify a polynomial opening. `eval` is the canonical integer in
+  /// `[0, p)` representing the claimed `Z_p` evaluation; the IntEval
+  /// protocol uses it to check `int_v' ≡ eval (mod p)`.
   #[allow(clippy::too_many_arguments)]
   fn verify(
     vk: &Self::VerifierKey,
@@ -328,6 +333,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     transcript: &mut E::TE,
     comm: &Self::Commitment,
     point: &[E::Scalar],
+    eval: &BigUint,
     comm_eval: &Self::Commitment,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError>;

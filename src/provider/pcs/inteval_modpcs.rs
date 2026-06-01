@@ -435,6 +435,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     _poly: &[BigUint],
     _blind: &Self::Blind,
     _point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    _eval: &BigUint,
     _comm_eval: &Self::Commitment,
     _blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
@@ -452,6 +453,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     _transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
     _comm: &Self::Commitment,
     _point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    _eval: &BigUint,
     _comm_eval: &Self::Commitment,
     _arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
@@ -581,9 +583,14 @@ mod tests {
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval =
-      <MP as ModPCSEngineTrait<ME>>::commit(&ck_eval, &[BigUint::from(0u32)], &blind_eval, false)
-        .unwrap();
+    let eval_bu = BigUint::from(0u32);
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval_bu),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
     let err = <MP as ModPCSEngineTrait<ME>>::prove(
@@ -594,6 +601,7 @@ mod tests {
       &poly,
       &blind,
       &point,
+      &eval_bu,
       &comm_eval,
       &blind_eval,
     )
@@ -603,7 +611,7 @@ mod tests {
     let arg = IntEvalEvalArg { _todo: () };
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
     let err = <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &comm_eval, &arg,
+      &vk, &ck_eval, &mut vt, &comm, &point, &eval_bu, &comm_eval, &arg,
     )
     .unwrap_err();
     assert!(matches!(err, SpartanError::InternalError { .. }));

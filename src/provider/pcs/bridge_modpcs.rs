@@ -126,13 +126,12 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for BridgeModPCS {
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    _eval: &BigUint,
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_t256_scalar).collect();
     let point_fq = dyn_vec_to_scalars(point)?;
-    // The shared (DynPrime) transcript is a `ByteTranscript`, which is
-    // exactly what `Hyrax::prove` now accepts — no fork/reinterpret.
     Hyrax::prove(
       ck, ck_eval, transcript, comm, &poly_fq, blind, &point_fq, comm_eval, blind_eval,
     )
@@ -144,6 +143,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for BridgeModPCS {
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
     comm: &Self::Commitment,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    _eval: &BigUint,
     comm_eval: &Self::Commitment,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
@@ -210,8 +210,14 @@ mod tests {
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly_bu, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval =
-      <MP as ModPCSEngineTrait<ME>>::commit(&ck_eval, &[to_bu(&eval)], &blind_eval, false).unwrap();
+    let eval_bu = to_bu(&eval);
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval_bu),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
     let arg = <MP as ModPCSEngineTrait<ME>>::prove(
@@ -222,13 +228,16 @@ mod tests {
       &poly_bu,
       &blind,
       &point,
+      &eval_bu,
       &comm_eval,
       &blind_eval,
     )
     .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
-    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &ck_eval, &mut vt, &comm, &point, &comm_eval, &arg)
-      .unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk, &ck_eval, &mut vt, &comm, &point, &eval_bu, &comm_eval, &arg,
+    )
+    .unwrap();
   }
 }

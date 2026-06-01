@@ -130,6 +130,7 @@ impl<M: ModEngine> ModPCSEngineTrait<M> for TrivialIntModPCS<M> {
     _poly: &[BigUint],
     _blind: &Self::Blind,
     _point: &[<M as SumcheckEngine>::Scalar],
+    _eval: &BigUint,
     _comm_eval: &Self::Commitment,
     _blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
@@ -142,6 +143,7 @@ impl<M: ModEngine> ModPCSEngineTrait<M> for TrivialIntModPCS<M> {
     _transcript: &mut <M as SumcheckEngine>::TE,
     _comm: &Self::Commitment,
     _point: &[<M as SumcheckEngine>::Scalar],
+    _eval: &BigUint,
     _comm_eval: &Self::Commitment,
     _arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {

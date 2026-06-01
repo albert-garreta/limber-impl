@@ -104,6 +104,7 @@ where
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[M::Scalar],
+    _eval: &BigUint,
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
@@ -119,6 +120,7 @@ where
     transcript: &mut M::TE,
     comm: &Self::Commitment,
     point: &[M::Scalar],
+    _eval: &BigUint,
     comm_eval: &Self::Commitment,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
@@ -172,8 +174,13 @@ mod tests {
     let blind = <MP as ModPCSEngineTrait<E>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<E>>::commit(&ck, &poly, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<E>>::blind(&ck_eval, 1);
-    let comm_eval =
-      <MP as ModPCSEngineTrait<E>>::commit(&ck_eval, &[eval_b], &blind_eval, false).unwrap();
+    let comm_eval = <MP as ModPCSEngineTrait<E>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval_b),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
 
     let mut transcript_p = <E as Engine>::TE::new(b"smoke");
     let arg = <MP as ModPCSEngineTrait<E>>::prove(
@@ -184,6 +191,7 @@ mod tests {
       &poly,
       &blind,
       &point,
+      &eval_b,
       &comm_eval,
       &blind_eval,
     )
@@ -197,6 +205,7 @@ mod tests {
       &mut transcript_v,
       &comm,
       &point,
+      &eval_b,
       &comm_eval,
       &arg,
     )

@@ -291,8 +291,12 @@ where
     // BigUint in [0, p).
     let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
     let blind_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
-    let comm_eval_w =
-      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&pk.ck_s, &[eval_w_bu], &blind_eval_w, false)?;
+    let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
+      &pk.ck_s,
+      std::slice::from_ref(&eval_w_bu),
+      &blind_eval_w,
+      false,
+    )?;
     let eval_arg_w = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
       &pk.ck,
       &pk.ck_s,
@@ -301,6 +305,7 @@ where
       &W.w,
       &W.r_w,
       &r_y[1..],
+      &eval_w_bu,
       &comm_eval_w,
       &blind_eval_w,
     )?;
@@ -308,8 +313,12 @@ where
     // Mod-PCS open Q at r_x.
     let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
     let blind_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
-    let comm_eval_q =
-      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&pk.ck_s, &[v_q_bu], &blind_eval_q, false)?;
+    let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
+      &pk.ck_s,
+      std::slice::from_ref(&v_q_bu),
+      &blind_eval_q,
+      false,
+    )?;
     let eval_arg_q = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
       &pk.ck,
       &pk.ck_s,
@@ -318,6 +327,7 @@ where
       &W.q,
       &W.r_q,
       &r_x,
+      &v_q_bu,
       &comm_eval_q,
       &blind_eval_q,
     )?;
@@ -434,7 +444,7 @@ where
     let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
     let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
       &vk.ck_s,
-      &[eval_w_bu],
+      std::slice::from_ref(&eval_w_bu),
       &self.blind_eval_w,
       false,
     )?;
@@ -444,20 +454,26 @@ where
       &mut transcript,
       &U.comm_w,
       &r_y[1..],
+      &eval_w_bu,
       &comm_eval_w,
       &self.eval_arg_w,
     )?;
 
     // Mod-PCS verification for Q at r_x.
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
-    let comm_eval_q =
-      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&vk.ck_s, &[v_q_bu], &self.blind_eval_q, false)?;
+    let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
+      &vk.ck_s,
+      std::slice::from_ref(&v_q_bu),
+      &self.blind_eval_q,
+      false,
+    )?;
     <ModPCS<M> as ModPCSEngineTrait<M>>::verify(
       &vk.vk_ee,
       &vk.ck_s,
       &mut transcript,
       &U.comm_q,
       &r_x,
+      &v_q_bu,
       &comm_eval_q,
       &self.eval_arg_q,
     )?;
