@@ -115,6 +115,26 @@ impl ModEngine for T256HyraxEngine {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct T256DynPrimeEngine;
 
+/// The T256 scalar field's prime as a `FixedMontyParams<4>`. Useful when
+/// you want a `DynPrime<4>` whose modulus matches the static `t256::Scalar`
+/// (e.g. for `p = q` mode in tests). Computed as `(q-1) + 1` from
+/// `-Scalar::ONE` to avoid parsing `PrimeField::MODULUS` string formats.
+pub fn t256_scalar_params() -> crypto_bigint::modular::FixedMontyParams<4> {
+  use crypto_bigint::{Odd, U256};
+  use ff::{Field, PrimeField};
+  let q_minus_1 = (-<pt256::t256::Scalar as Field>::ONE).to_repr();
+  let mut bytes = q_minus_1.as_ref().to_vec();
+  let mut carry = 1u8;
+  for b in bytes.iter_mut() {
+    let (v, c) = b.overflowing_add(carry);
+    *b = v;
+    carry = u8::from(c);
+  }
+  debug_assert_eq!(carry, 0, "addition carried out of the modulus width");
+  let modulus = U256::from_le_slice(&bytes);
+  crypto_bigint::modular::FixedMontyParams::new(Odd::new(modulus).unwrap())
+}
+
 impl SumcheckEngine for T256DynPrimeEngine {
   type Scalar = DynPrime<4>;
   type TE = Keccak256Transcript<Self>;
@@ -122,8 +142,7 @@ impl SumcheckEngine for T256DynPrimeEngine {
 
 impl ModEngine for T256DynPrimeEngine {
   // Phase-3 step B: sound IntEvalModPCS (small-prime fingerprinting +
-  // Hyrax-T256 underneath). TrivialIntModPCS and BridgeModPCS remain
-  // in tree as reference / fallback impls but aren't wired up.
+  // Hyrax-T256 underneath).
   type ModPCS = crate::provider::pcs::inteval_modpcs::IntEvalModPCS;
 
   /// Bootstrap params: smallest valid odd-modulus `FixedMontyParams<4>`

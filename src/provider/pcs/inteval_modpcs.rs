@@ -362,9 +362,9 @@ pub struct IntEvalEvalArg {
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
-/// for inputs below the scalar field, otherwise reduces uniformly. Same
-/// convention as `BridgeModPCS`. Phase 3 step D will add the range check
-/// that turns this into a *sound* commitment to a bounded integer.
+/// for inputs below the scalar field, otherwise reduces uniformly. Phase 3
+/// step D will add the range check that turns this into a *sound*
+/// commitment to a bounded integer.
 fn biguint_to_scalar(v: &BigUint) -> t256::Scalar {
   let mut bytes = v.to_bytes_le();
   bytes.resize(64, 0);
@@ -396,9 +396,8 @@ fn scalar_to_balanced_int(s: &t256::Scalar) -> BigInt {
 }
 
 /// The T256 scalar field's characteristic `q` as a `BigUint`. Computed
-/// once via `(q - 1) + 1` from `-Scalar::ONE`'s representation (same
-/// trick as `bridge_modpcs::t256_scalar_params`); cheap enough to
-/// recompute per call since it's just byte arithmetic.
+/// once via `(q - 1) + 1` from `-Scalar::ONE`'s representation; cheap
+/// enough to recompute per call since it's just byte arithmetic.
 fn t256_q() -> BigUint {
   let q_minus_1 = (-<t256::Scalar as Field>::ONE).to_repr();
   let mut bytes = q_minus_1.as_ref().to_vec();

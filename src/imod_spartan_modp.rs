@@ -804,7 +804,7 @@ mod tests {
   /// also pins the byte-level Fiat-Shamir derivation in place.
   #[test]
   fn imod_modp_sampled_p_is_not_q() {
-    use crate::provider::pcs::bridge_modpcs::t256_scalar_params;
+    use crate::provider::t256_scalar_params;
     let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
     let (pk, _vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
     let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();

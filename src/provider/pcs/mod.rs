@@ -10,9 +10,7 @@
 pub mod ipa;
 
 // implementations of polynomial commitment schemes
-pub mod bridge_modpcs;
 pub mod hyrax_pc;
 pub mod inteval_modpcs;
 pub mod kzh_pc;
-pub mod trivial_int_modpcs;
 pub mod trivial_modpcs;
