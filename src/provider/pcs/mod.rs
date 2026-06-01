@@ -13,4 +13,5 @@ pub mod ipa;
 pub mod bridge_modpcs;
 pub mod hyrax_pc;
 pub mod kzh_pc;
+pub mod trivial_int_modpcs;
 pub mod trivial_modpcs;

@@ -48,6 +48,7 @@ use core::{
   ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 use ff::{Field, PrimeField};
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 
 /// A field-like interface suitable for sumcheck arithmetic.
@@ -208,8 +209,27 @@ pub trait ModEngine: SumcheckEngine {
   /// internals; the SNARK code that calls it does not.
   type ModPCS: ModPCSEngineTrait<Self>;
 
-  // TODO step 2: add `type TE: TranscriptEngineTrait<Self>` once the
-  // transcript trait bound is relaxed. See SumcheckEngine note above.
+  /// Placeholder `Params` used to construct the transcript *before* the
+  /// real `p` is sampled. The transcript's typed `squeeze<F>` is never
+  /// called against this placeholder — only the byte-level absorb/squeeze
+  /// operations run pre-`sample_params`. After sampling, the driver calls
+  /// `Keccak256Transcript::set_params` with the real `params`.
+  ///
+  /// For static-modulus fields, return the `Params` default (`()`). For
+  /// dynamic-modulus fields, return any valid params (e.g. the smallest
+  /// valid odd modulus). No default impl: requiring every `ModEngine`
+  /// impl to spell this out avoids the `Params: Default` bound rippling
+  /// into every driver method that touches a transcript.
+  fn bootstrap_params() -> <Self::Scalar as SumcheckField>::Params;
+
+  /// Sample the runtime modulus context for `Self::Scalar` from a
+  /// `ByteTranscript`. For static-modulus fields, return the `Params`
+  /// default (`()`) and absorb/squeeze nothing. For dynamic-modulus
+  /// fields, run the actual rejection-sampling / primality-testing loop
+  /// that drives the verifier-sampled prime `p`.
+  fn sample_params<T: crate::traits::transcript::ByteTranscript>(
+    transcript: &mut T,
+  ) -> <Self::Scalar as SumcheckField>::Params;
 }
 
 /// PCS interface for committing polynomials whose evaluations come from a
@@ -269,10 +289,13 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// return a unit-typed sentinel (see `docs/imod_followups.md`).
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
 
-  /// Commit to a polynomial whose evaluations are in `E::Scalar`.
+  /// Commit to an **integer-valued** polynomial. Each entry is a
+  /// non-negative bounded integer in `BigUint` form — `p`-independent and
+  /// chosen before the runtime prime `p` is sampled, so the commitment
+  /// binds the integers themselves.
   fn commit(
     ck: &Self::CommitmentKey,
-    v: &[E::Scalar],
+    v: &[BigUint],
     r: &Self::Blind,
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError>;
@@ -280,18 +303,17 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Length / shape sanity check on a commitment.
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 
-  /// Prove a polynomial opening at `point` ∈ `E::Scalar^n` to claimed
-  /// commitment-of-eval `comm_eval`. Mirrors the existing
-  /// `PCSEngineTrait::prove` signature; `ck_eval` is the size-1
-  /// commitment key for the eval (Pedersen-specific; future hash-based
-  /// impls can keep this as `()` per the followups doc).
+  /// Prove that the integer-valued polynomial `poly` evaluates at the
+  /// `Z_p` point `point` to the `Z_p` value committed in `comm_eval`.
+  /// Soundly implementing this for `p ≠ q` is the IntEval protocol
+  /// (Phase 3); the Phase-2 stub leaves it unproven.
   #[allow(clippy::too_many_arguments)]
   fn prove(
     ck: &Self::CommitmentKey,
     ck_eval: &Self::CommitmentKey,
     transcript: &mut E::TE,
     comm: &Self::Commitment,
-    poly: &[E::Scalar],
+    poly: &[BigUint],
     blind: &Self::Blind,
     point: &[E::Scalar],
     comm_eval: &Self::Commitment,

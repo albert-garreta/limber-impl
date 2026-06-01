@@ -15,12 +15,24 @@
 use crate::{
   errors::SpartanError,
   traits::{
-    Engine,
+    Engine, PrimeFieldExt,
     mod_engine::{ModEngine, ModPCSEngineTrait},
     pcs::PCSEngineTrait,
   },
 };
 use core::marker::PhantomData;
+use num_bigint::BigUint;
+
+/// Convert a `BigUint` into a static-modulus prime-field scalar by
+/// padding the little-endian bytes to 64 bytes and feeding them through
+/// `PrimeFieldExt::from_uniform`. The wide reduction is value-preserving
+/// when the integer fits in the scalar field, and uniformly reduces
+/// otherwise — matching the Phase-2 small-witness assumption.
+fn biguint_to_scalar<F: PrimeFieldExt>(v: &BigUint) -> F {
+  let mut bytes = v.to_bytes_le();
+  bytes.resize(64, 0);
+  F::from_uniform(&bytes)
+}
 
 /// Mod-PCS whose implementation is "delegate everything to `E::PCS`".
 /// Only usable for `ModEngine` impls where `Scalar = Engine::Scalar`
@@ -72,11 +84,12 @@ where
 
   fn commit(
     ck: &Self::CommitmentKey,
-    v: &[M::Scalar],
+    v: &[BigUint],
     r: &Self::Blind,
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError> {
-    E::PCS::commit(ck, v, r, is_small)
+    let v_fq: Vec<E::Scalar> = v.iter().map(biguint_to_scalar::<E::Scalar>).collect();
+    E::PCS::commit(ck, &v_fq, r, is_small)
   }
 
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError> {
@@ -88,14 +101,15 @@ where
     ck_eval: &Self::CommitmentKey,
     transcript: &mut M::TE,
     comm: &Self::Commitment,
-    poly: &[M::Scalar],
+    poly: &[BigUint],
     blind: &Self::Blind,
     point: &[M::Scalar],
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
+    let poly_fq: Vec<E::Scalar> = poly.iter().map(biguint_to_scalar::<E::Scalar>).collect();
     E::PCS::prove(
-      ck, ck_eval, transcript, comm, poly, blind, point, comm_eval, blind_eval,
+      ck, ck_eval, transcript, comm, &poly_fq, blind, point, comm_eval, blind_eval,
     )
   }
 
@@ -140,20 +154,26 @@ mod tests {
     let (ck, vk) = <MP as ModPCSEngineTrait<E>>::setup(b"trivial-modpcs-test", n, 256);
     let (ck_eval, _) = <MP as ModPCSEngineTrait<E>>::setup(b"ck_eval", 1, 1);
 
-    // Random polynomial + evaluation point.
-    let poly: Vec<F> = (0..n).map(|_| F::random(&mut rng)).collect();
+    // Random polynomial in BigUint (small integers fit in F_q).
+    use ff::PrimeField;
+    let poly_fq: Vec<F> = (0..n).map(|_| F::random(&mut rng)).collect();
     let point: Vec<F> = (0..num_vars).map(|_| F::random(&mut rng)).collect();
 
-    // Eval the multilinear at the point directly (oracle).
+    // Eval the multilinear at the point directly (oracle), in F_q so the
+    // trivial test exercises the p = q path.
     use crate::polys_modp::multilinear::MultilinearPolynomial;
-    let eval = MultilinearPolynomial::new(poly.clone(), ()).evaluate(&point);
+    let eval = MultilinearPolynomial::new(poly_fq.clone(), ()).evaluate(&point);
 
-    // Commit and prove.
+    // Integer view of the polynomial / eval, for the BigUint commit API.
+    let to_biguint = |x: &F| BigUint::from_bytes_le(x.to_repr().as_ref());
+    let poly: Vec<BigUint> = poly_fq.iter().map(to_biguint).collect();
+    let eval_b = to_biguint(&eval);
+
     let blind = <MP as ModPCSEngineTrait<E>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<E>>::commit(&ck, &poly, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<E>>::blind(&ck_eval, 1);
     let comm_eval =
-      <MP as ModPCSEngineTrait<E>>::commit(&ck_eval, &[eval], &blind_eval, false).unwrap();
+      <MP as ModPCSEngineTrait<E>>::commit(&ck_eval, &[eval_b], &blind_eval, false).unwrap();
 
     let mut transcript_p = <E as Engine>::TE::new(b"smoke");
     let arg = <MP as ModPCSEngineTrait<E>>::prove(

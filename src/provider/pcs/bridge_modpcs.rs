@@ -25,11 +25,13 @@ use crate::{
   errors::SpartanError,
   provider::{T256DynPrimeEngine, T256HyraxEngine, pcs::hyrax_pc::HyraxPCS, pt256::t256},
   traits::{
+    PrimeFieldExt,
     mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
     pcs::PCSEngineTrait,
   },
 };
 use ff::PrimeField;
+use num_bigint::BigUint;
 
 /// Underlying standard PCS: Hyrax over T256.
 type Hyrax = HyraxPCS<T256HyraxEngine>;
@@ -58,6 +60,16 @@ fn dyn_to_scalar(d: &DynPrime<4>) -> Result<t256::Scalar, SpartanError> {
 
 fn dyn_vec_to_scalars(v: &[DynPrime<4>]) -> Result<Vec<t256::Scalar>, SpartanError> {
   v.iter().map(dyn_to_scalar).collect()
+}
+
+/// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
+/// for inputs that fit in the scalar field, otherwise reduces uniformly.
+/// Same convention as `TrivialModPCS` — Phase 3 will swap this for limb-
+/// split + range-checked commitments.
+fn biguint_to_t256_scalar(v: &BigUint) -> t256::Scalar {
+  let mut bytes = v.to_bytes_le();
+  bytes.resize(64, 0);
+  <t256::Scalar as PrimeFieldExt>::from_uniform(&bytes)
 }
 
 /// Mod-PCS for `T256DynPrimeEngine`, delegating to Hyrax-over-T256.
@@ -91,14 +103,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for BridgeModPCS {
 
   fn commit(
     ck: &Self::CommitmentKey,
-    v: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    v: &[BigUint],
     r: &Self::Blind,
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError> {
-    // NOTE: `v` carries bounded-integer-valued DynPrime entries. Under
-    // numlimb = 1 each is a single limb that fits in the curve scalar, so
-    // we just cast and commit. (Phase 3: limb-split + range-check here.)
-    let v_fq = dyn_vec_to_scalars(v)?;
+    // NOTE: `v` carries bounded-integer-valued BigUint entries. Under
+    // numlimb = 1 each fits in the curve scalar, so we just cast and
+    // commit. (Phase 3: limb-split + range-check here.)
+    let v_fq: Vec<t256::Scalar> = v.iter().map(biguint_to_t256_scalar).collect();
     Hyrax::commit(ck, &v_fq, r, is_small)
   }
 
@@ -111,13 +123,13 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for BridgeModPCS {
     ck_eval: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
     comm: &Self::Commitment,
-    poly: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
+    poly: &[BigUint],
     blind: &Self::Blind,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
     comm_eval: &Self::Commitment,
     blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
-    let poly_fq = dyn_vec_to_scalars(poly)?;
+    let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_t256_scalar).collect();
     let point_fq = dyn_vec_to_scalars(point)?;
     // The shared (DynPrime) transcript is a `ByteTranscript`, which is
     // exactly what `Hyrax::prove` now accepts — no fork/reinterpret.
@@ -191,11 +203,15 @@ mod tests {
     // Oracle evaluation in DynPrime.
     let eval = MultilinearPolynomial::new(poly.clone(), params).evaluate(&point);
 
+    // BigUint views for the commit/prove calls — Mod-PCS commits integers.
+    let to_bu = |x: &DP| num_bigint::BigUint::from_bytes_le(&x.to_le_bytes());
+    let poly_bu: Vec<BigUint> = poly.iter().map(to_bu).collect();
+
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly_bu, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
     let comm_eval =
-      <MP as ModPCSEngineTrait<ME>>::commit(&ck_eval, &[eval], &blind_eval, false).unwrap();
+      <MP as ModPCSEngineTrait<ME>>::commit(&ck_eval, &[to_bu(&eval)], &blind_eval, false).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"smoke", params);
     let arg = <MP as ModPCSEngineTrait<ME>>::prove(
@@ -203,7 +219,7 @@ mod tests {
       &ck_eval,
       &mut pt,
       &comm,
-      &poly,
+      &poly_bu,
       &blind,
       &point,
       &comm_eval,

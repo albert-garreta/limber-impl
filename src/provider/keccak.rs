@@ -91,6 +91,18 @@ impl<E: SumcheckEngine> ByteTranscript for Keccak256Transcript<E> {
   }
 }
 
+impl<E: SumcheckEngine> Keccak256Transcript<E> {
+  /// Swap the typed-`squeeze` reduction context mid-flow. Used by the
+  /// Phase-2 driver: bootstrap the transcript with placeholder params,
+  /// absorb commitments, derive the runtime prime `p` from `squeeze_bytes`,
+  /// then `set_params` to the freshly-derived `p` so subsequent typed
+  /// squeezes reduce into `Z_p`. The byte chain is unaffected — only the
+  /// reduction target for `squeeze<F>` changes.
+  pub fn set_params(&mut self, params: <E::Scalar as SumcheckField>::Params) {
+    self.params = params;
+  }
+}
+
 impl<E: SumcheckEngine> TranscriptEngineTrait<E> for Keccak256Transcript<E> {
   fn new_with_params(label: &'static [u8], params: <E::Scalar as SumcheckField>::Params) -> Self {
     let keccak_instance = Keccak256::new();

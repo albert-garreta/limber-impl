@@ -1,10 +1,26 @@
 //! Phase-2 Integer Mod-R1CS SNARK driver, generic over `M: ModEngine`.
 //!
-//! Mirrors `crate::imod_spartan` but the sumcheck arithmetic runs over
-//! `M::Scalar` (a `SumcheckField` — e.g. `DynPrime<4>`), and the PCS is
-//! `M::ModPCS`. The `p = q` shortcut (and the absence of limb-splitting)
-//! lives inside the Mod-PCS impl, not here: this driver is the same Spartan
-//! protocol with the dynamic-prime substitutions applied.
+//! Mirrors `crate::imod_spartan` but the shape, witness, and matrix
+//! entries are integer-valued (`BigUint`), the prime `p` over which the
+//! sumcheck runs is sampled from the transcript via Fiat-Shamir (Miller-
+//! Rabin rejection sampling, see `M::sample_params`), and the SNARK
+//! verifies the IntMod-R1CS relation `Az ∘ Bz = Cz + m ∘ q` mod that
+//! sampled `p`. The Mod-PCS commits integer polynomials and opens at
+//! `Z_p` points returning `Z_p` evals — the `p ≠ q` reconciliation is
+//! the Mod-PCS's responsibility (Phase-3 IntEval); the Phase-2 driver
+//! treats it as a black-box contract.
+//!
+//! Flow:
+//!   1. Bootstrap transcript with `M::bootstrap_params()` (placeholder).
+//!   2. Byte-absorb the vk digest, two integer-poly commitments, and the
+//!      public IO `x` (`BigUint` LE bytes).
+//!   3. `params = M::sample_params(transcript)` derives `p` from squeeze
+//!      bytes; `transcript.set_params(params)` switches typed-squeeze
+//!      reductions into `Z_p`.
+//!   4. Reduce shape/witness/IO `BigUint`s to `M::Scalar` mod `p`.
+//!   5. Run outer + inner sumchecks in `Z_p`.
+//!   6. Open `w` and `q` at `Z_p` points via `M::ModPCS::prove`, passing
+//!      the original `BigUint` polynomials (integer view).
 //!
 //! Single witness segment; no shared/precommitted/rest split; no limb
 //! decomposition; no range checks; no BDDT first-round optimization.
@@ -14,6 +30,7 @@ use crate::{
   imod_r1cs_modp::{IntModR1CSInstanceModp, IntModR1CSShapeModp, IntModR1CSWitnessModp},
   math::Math,
   polys_modp::{eq::EqPolynomial, multilinear::MultilinearPolynomial},
+  provider::keccak::Keccak256Transcript,
   start_span,
   sumcheck_modp::SumcheckProof,
   traits::{
@@ -21,6 +38,7 @@ use crate::{
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
+use num_bigint::BigUint;
 use rayon::prelude::*;
 use tracing::info;
 
@@ -31,6 +49,28 @@ type ModCK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::CommitmentKey;
 type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
 type ModBlind<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Blind;
 type ModEvalArg<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::EvaluationArgument;
+
+/// Convert a `BigUint` integer into an `M::Scalar` value by reducing
+/// modulo the runtime modulus carried in `params`.
+fn biguint_to_scalar<M: ModEngine>(v: &BigUint, params: &MParams<M>) -> MScalar<M> {
+  MScalar::<M>::from_bytes_reduce(params, &v.to_bytes_le())
+}
+
+fn biguint_vec_to_scalars<M: ModEngine>(v: &[BigUint], params: &MParams<M>) -> Vec<MScalar<M>> {
+  v.iter()
+    .map(|b| biguint_to_scalar::<M>(b, params))
+    .collect()
+}
+
+fn biguint_matrix_to_scalars<M: ModEngine>(
+  entries: &[(usize, usize, BigUint)],
+  params: &MParams<M>,
+) -> Vec<(usize, usize, MScalar<M>)> {
+  entries
+    .iter()
+    .map(|(i, j, v)| (*i, *j, biguint_to_scalar::<M>(v, params)))
+    .collect()
+}
 
 /// Prover key.
 #[derive(Clone)]
@@ -66,7 +106,7 @@ impl<M: ModEngine> IntModSpartanModpVerifierKey<M> {
 }
 
 /// Phase-2 IntMod-R1CS SNARK proof. Serialization is deferred — the
-/// dynamic-prime types (`DynPrime`, `MParams`) aren't `Serialize` yet.
+/// dynamic-prime types (`M::Scalar`, `Params`) aren't `Serialize` yet.
 #[derive(Clone, Debug)]
 pub struct IntModSpartanModpSNARK<M: ModEngine> {
   // outer sumcheck
@@ -86,7 +126,10 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
   eval_arg_q: ModEvalArg<M>,
 }
 
-impl<M: ModEngine> IntModSpartanModpSNARK<M> {
+impl<M> IntModSpartanModpSNARK<M>
+where
+  M: ModEngine<TE = Keccak256Transcript<M>>,
+{
   /// Setup: derive prover and verifier keys from the shape.
   pub fn setup(
     shape: IntModR1CSShapeModp<M>,
@@ -125,16 +168,23 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     W: &IntModR1CSWitnessModp<M>,
   ) -> Result<Self, SpartanError> {
     let (_prove_span, prove_t) = start_span!("imod_spartan_modp_prove");
-    let params = pk.shape.params.clone();
-    let mut transcript = <M::TE as TranscriptEngineTrait<M>>::new_with_params(
-      b"IntModSpartanModpSNARK",
-      params.clone(),
-    );
 
+    // 1. Bootstrap transcript with placeholder params.
+    let mut transcript =
+      Keccak256Transcript::<M>::new_with_params(b"IntModSpartanModpSNARK", M::bootstrap_params());
+
+    // 2. Byte-absorb pre-`p` data. Public IO is `BigUint`, not a
+    //    `TranscriptReprTrait` type, so absorb its LE bytes directly.
     transcript.absorb_bytes(b"vk", &pk.vk_digest);
     transcript.absorb(b"comm_w", &U.comm_w);
     transcript.absorb(b"comm_q", &U.comm_q);
-    transcript.absorb(b"x", &U.x.as_slice());
+    for xi in &U.x {
+      transcript.absorb_bytes(b"x", &xi.to_bytes_le());
+    }
+
+    // 3. Sample `p` from the transcript and switch typed-squeeze context.
+    let params = M::sample_params(&mut transcript);
+    transcript.set_params(params.clone());
 
     let shape = &pk.shape;
     let num_vars = shape.num_vars;
@@ -142,20 +192,27 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     let num_rounds_x = num_cons.log_2();
     let num_rounds_y = num_vars.log_2() + 1;
 
-    let zero = <MScalar<M> as SumcheckField>::zero(&params);
-    let one = <MScalar<M> as SumcheckField>::one(&params);
+    let zero = MScalar::<M>::zero(&params);
+    let one = MScalar::<M>::one(&params);
+
+    // 4. Reduce shape/witness/IO from BigUint to M::Scalar mod p.
+    let mods_p = biguint_vec_to_scalars::<M>(&shape.mods, &params);
+    let w_p = biguint_vec_to_scalars::<M>(&W.w, &params);
+    let q_p = biguint_vec_to_scalars::<M>(&W.q, &params);
+    let x_p = biguint_vec_to_scalars::<M>(&U.x, &params);
+    let a_p = biguint_matrix_to_scalars::<M>(&shape.A, &params);
+    let b_p = biguint_matrix_to_scalars::<M>(&shape.B, &params);
+    let c_p = biguint_matrix_to_scalars::<M>(&shape.C, &params);
 
     // z = (W, 1, X), padded to 2*num_vars for the MLE.
     let mut z = Vec::with_capacity(2 * num_vars);
-    z.extend_from_slice(&W.w);
+    z.extend_from_slice(&w_p);
     z.push(one);
-    z.extend_from_slice(&U.x);
+    z.extend_from_slice(&x_p);
     z.resize(2 * num_vars, zero);
 
     let z_for_spmv = &z[..num_vars + 1 + shape.num_io];
-    let (az, bz, cz) = shape.multiply_vec(z_for_spmv)?;
-    let m: Vec<MScalar<M>> = shape.mods.clone();
-    let q_for_open = W.q.clone();
+    let (az, bz, cz) = spmv::<M>(&a_p, &b_p, &c_p, z_for_spmv, num_cons, &params);
 
     // Outer sumcheck: sum_i eq(i, tau) · (Az·Bz − Cz − M·Q) = 0.
     let tau: Vec<MScalar<M>> = (0..num_rounds_x)
@@ -165,8 +222,8 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     let mut poly_az = MultilinearPolynomial::new(az, params.clone());
     let mut poly_bz = MultilinearPolynomial::new(bz, params.clone());
     let mut poly_cz = MultilinearPolynomial::new(cz, params.clone());
-    let mut poly_m = MultilinearPolynomial::new(m, params.clone());
-    let mut poly_q = MultilinearPolynomial::new(W.q.clone(), params.clone());
+    let mut poly_m = MultilinearPolynomial::new(mods_p, params.clone());
+    let mut poly_q = MultilinearPolynomial::new(q_p.clone(), params.clone());
 
     let (_so_span, so_t) = start_span!("imod_modp_outer_sumcheck");
     let (sc_outer, r_x, outer_claims) = SumcheckProof::<M>::prove_cubic_with_five_inputs(
@@ -194,7 +251,16 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     let claim_inner = v_a + r * v_b + r * r * v_c;
 
     let eq_rx = EqPolynomial::<MScalar<M>>::evals_from_points(&r_x, &params);
-    let abc = bind_abc::<M>(shape, &eq_rx, &r);
+    let abc = bind_abc::<M>(
+      &a_p,
+      &b_p,
+      &c_p,
+      num_vars,
+      shape.num_io,
+      &eq_rx,
+      &r,
+      &params,
+    );
 
     debug_assert_eq!(abc.len(), 2 * num_vars);
     debug_assert_eq!(z.len(), 2 * num_vars);
@@ -215,15 +281,18 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     // Recover eval_W from eval_Z via Z = (W, 1, X, …):
     //   Z(r_y) = (1 - r_y[0]) · W(r_y[1..]) + r_y[0] · pub(r_y[1..]).
     let eval_z = poly_z[0];
-    let eval_x = eval_public_at::<M>(num_rounds_y - 1, &U.x, &r_y[1..], &params);
+    let eval_x = eval_public_at::<M>(num_rounds_y - 1, &x_p, &r_y[1..], &params);
     let one_minus_r0 = one - r_y[0];
     let inv = one_minus_r0.invert().ok_or(SpartanError::DivisionByZero)?;
     let eval_w = (eval_z - r_y[0] * eval_x) * inv;
 
-    // Mod-PCS open W at r_y[1..].
+    // Mod-PCS open W at r_y[1..]. Mod-PCS commits/opens integers — pass
+    // the original BigUint witness and the Z_p eval reduced into a
+    // BigUint in [0, p).
+    let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
     let blind_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
     let comm_eval_w =
-      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&pk.ck_s, &[eval_w], &blind_eval_w, false)?;
+      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&pk.ck_s, &[eval_w_bu], &blind_eval_w, false)?;
     let eval_arg_w = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
       &pk.ck,
       &pk.ck_s,
@@ -237,15 +306,16 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     )?;
 
     // Mod-PCS open Q at r_x.
+    let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
     let blind_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
     let comm_eval_q =
-      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&pk.ck_s, &[v_q], &blind_eval_q, false)?;
+      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&pk.ck_s, &[v_q_bu], &blind_eval_q, false)?;
     let eval_arg_q = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
       &pk.ck,
       &pk.ck_s,
       &mut transcript,
       &U.comm_q,
-      &q_for_open,
+      &W.q,
       &W.r_q,
       &r_x,
       &comm_eval_q,
@@ -276,16 +346,22 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     U: &IntModR1CSInstanceModp<M>,
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("imod_spartan_modp_verify");
-    let params = vk.shape.params.clone();
-    let mut transcript = <M::TE as TranscriptEngineTrait<M>>::new_with_params(
-      b"IntModSpartanModpSNARK",
-      params.clone(),
-    );
 
+    // 1. Bootstrap transcript identically to prove().
+    let mut transcript =
+      Keccak256Transcript::<M>::new_with_params(b"IntModSpartanModpSNARK", M::bootstrap_params());
+
+    // 2. Byte-absorb pre-`p` data identically to prove().
     transcript.absorb_bytes(b"vk", &vk.digest);
     transcript.absorb(b"comm_w", &U.comm_w);
     transcript.absorb(b"comm_q", &U.comm_q);
-    transcript.absorb(b"x", &U.x.as_slice());
+    for xi in &U.x {
+      transcript.absorb_bytes(b"x", &xi.to_bytes_le());
+    }
+
+    // 3. Re-sample `p` from the same byte stream → identical params.
+    let params = M::sample_params(&mut transcript);
+    transcript.set_params(params.clone());
 
     let shape = &vk.shape;
     let num_vars = shape.num_vars;
@@ -293,8 +369,15 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     let num_rounds_x = num_cons.log_2();
     let num_rounds_y = num_vars.log_2() + 1;
 
-    let zero = <MScalar<M> as SumcheckField>::zero(&params);
-    let one = <MScalar<M> as SumcheckField>::one(&params);
+    let zero = MScalar::<M>::zero(&params);
+    let one = MScalar::<M>::one(&params);
+
+    // 4. Reduce shape/IO from BigUint to M::Scalar mod p.
+    let mods_p = biguint_vec_to_scalars::<M>(&shape.mods, &params);
+    let x_p = biguint_vec_to_scalars::<M>(&U.x, &params);
+    let a_p = biguint_matrix_to_scalars::<M>(&shape.A, &params);
+    let b_p = biguint_matrix_to_scalars::<M>(&shape.B, &params);
+    let c_p = biguint_matrix_to_scalars::<M>(&shape.C, &params);
 
     // Outer SC verification.
     let tau: Vec<MScalar<M>> = (0..num_rounds_x)
@@ -307,7 +390,7 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
         .verify(zero, num_rounds_x, 3, &params, &mut transcript)?;
 
     // v_m matches the public mods MLE at r_x.
-    let v_m_expected = dense_evaluate::<M>(&shape.mods, &r_x, &params);
+    let v_m_expected = dense_evaluate::<M>(&mods_p, &r_x, &params);
     if v_m_expected != self.v_m {
       return Err(SpartanError::InvalidSumcheckProof);
     }
@@ -334,13 +417,13 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
         .verify(claim_inner, num_rounds_y, 2, &params, &mut transcript)?;
 
     // Reconstruct eval_Z from eval_W and public IO.
-    let eval_x = eval_public_at::<M>(num_rounds_y - 1, &U.x, &r_y[1..], &params);
+    let eval_x = eval_public_at::<M>(num_rounds_y - 1, &x_p, &r_y[1..], &params);
     let eval_z = (one - r_y[0]) * self.eval_w + r_y[0] * eval_x;
 
     // Evaluate A, B, C MLEs at (r_x, r_y) via full eq tables.
     let t_x = EqPolynomial::<MScalar<M>>::evals_from_points(&r_x, &params);
     let t_y = EqPolynomial::<MScalar<M>>::evals_from_points(&r_y, &params);
-    let (eval_a, eval_b, eval_c) = evaluate_matrices::<M>(shape, &t_x, &t_y, &params);
+    let (eval_a, eval_b, eval_c) = evaluate_matrices::<M>(&a_p, &b_p, &c_p, &t_x, &t_y, &params);
 
     let inner_final_expected = (eval_a + r * eval_b + r * r * eval_c) * eval_z;
     if claim_inner_final != inner_final_expected {
@@ -348,9 +431,10 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     }
 
     // Mod-PCS verification for W at r_y[1..].
+    let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
     let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
       &vk.ck_s,
-      &[self.eval_w],
+      &[eval_w_bu],
       &self.blind_eval_w,
       false,
     )?;
@@ -365,12 +449,9 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
     )?;
 
     // Mod-PCS verification for Q at r_x.
-    let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
-      &vk.ck_s,
-      &[self.v_q],
-      &self.blind_eval_q,
-      false,
-    )?;
+    let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
+    let comm_eval_q =
+      <ModPCS<M> as ModPCSEngineTrait<M>>::commit(&vk.ck_s, &[v_q_bu], &self.blind_eval_q, false)?;
     <ModPCS<M> as ModPCSEngineTrait<M>>::verify(
       &vk.vk_ee,
       &vk.ck_s,
@@ -387,46 +468,74 @@ impl<M: ModEngine> IntModSpartanModpSNARK<M> {
 }
 
 // ---------------------------------------------------------------------------
-// helpers
+// helpers (operate on pre-reduced M::Scalar matrices)
+
+fn spmv<M: ModEngine>(
+  a: &[(usize, usize, MScalar<M>)],
+  b: &[(usize, usize, MScalar<M>)],
+  c: &[(usize, usize, MScalar<M>)],
+  z: &[MScalar<M>],
+  num_cons: usize,
+  params: &MParams<M>,
+) -> (Vec<MScalar<M>>, Vec<MScalar<M>>, Vec<MScalar<M>>) {
+  let zero = MScalar::<M>::zero(params);
+  let multiply = |entries: &[(usize, usize, MScalar<M>)]| -> Vec<MScalar<M>> {
+    let mut out = vec![zero; num_cons];
+    for (i, j, v) in entries {
+      out[*i] += *v * z[*j];
+    }
+    out
+  };
+  let (az, (bz, cz)) = rayon::join(
+    || multiply(a),
+    || rayon::join(|| multiply(b), || multiply(c)),
+  );
+  (az, bz, cz)
+}
 
 /// ABC[y] = sum_i eq_rx[i] · (A[i,y] + r·B[i,y] + r²·C[i,y]),
 /// right-padded to length 2·num_vars to match the inner-SC layout.
 fn bind_abc<M: ModEngine>(
-  shape: &IntModR1CSShapeModp<M>,
+  a: &[(usize, usize, MScalar<M>)],
+  b: &[(usize, usize, MScalar<M>)],
+  c: &[(usize, usize, MScalar<M>)],
+  num_vars: usize,
+  num_io: usize,
   eq_rx: &[MScalar<M>],
   r: &MScalar<M>,
+  params: &MParams<M>,
 ) -> Vec<MScalar<M>> {
-  let zero = <MScalar<M> as SumcheckField>::zero(&shape.params);
-  let num_cols = shape.num_vars + 1 + shape.num_io;
+  let zero = MScalar::<M>::zero(params);
+  let num_cols = num_vars + 1 + num_io;
   let mut abc = vec![zero; num_cols];
   let r_sq = *r * *r;
 
-  for (i, j, val) in &shape.A {
+  for (i, j, val) in a {
     abc[*j] += eq_rx[*i] * *val;
   }
-  for (i, j, val) in &shape.B {
+  for (i, j, val) in b {
     abc[*j] += *r * eq_rx[*i] * *val;
   }
-  for (i, j, val) in &shape.C {
+  for (i, j, val) in c {
     abc[*j] += r_sq * eq_rx[*i] * *val;
   }
-  abc.resize(2 * shape.num_vars, zero);
+  abc.resize(2 * num_vars, zero);
   abc
 }
 
 /// Multilinear extension of the public side `(1, x, 0, …, 0)` evaluated at `r`.
 fn eval_public_at<M: ModEngine>(
   num_vars_pub: usize,
-  x: &[MScalar<M>],
+  x_p: &[MScalar<M>],
   r: &[MScalar<M>],
   params: &MParams<M>,
 ) -> MScalar<M> {
   debug_assert_eq!(r.len(), num_vars_pub);
-  let zero = <MScalar<M> as SumcheckField>::zero(params);
-  let one = <MScalar<M> as SumcheckField>::one(params);
+  let zero = MScalar::<M>::zero(params);
+  let one = MScalar::<M>::one(params);
   let mut pub_vec = Vec::with_capacity(1 << num_vars_pub);
   pub_vec.push(one);
-  pub_vec.extend_from_slice(x);
+  pub_vec.extend_from_slice(x_p);
   pub_vec.resize(1 << num_vars_pub, zero);
   dense_evaluate::<M>(&pub_vec, r, params)
 }
@@ -437,7 +546,7 @@ fn dense_evaluate<M: ModEngine>(
   r: &[MScalar<M>],
   params: &MParams<M>,
 ) -> MScalar<M> {
-  let zero = <MScalar<M> as SumcheckField>::zero(params);
+  let zero = MScalar::<M>::zero(params);
   let chis = EqPolynomial::<MScalar<M>>::evals_from_points(r, params);
   debug_assert_eq!(chis.len(), z.len());
   chis
@@ -449,21 +558,23 @@ fn dense_evaluate<M: ModEngine>(
 
 /// Evaluate A, B, C MLEs at (r_x, r_y) via precomputed eq-tables.
 fn evaluate_matrices<M: ModEngine>(
-  shape: &IntModR1CSShapeModp<M>,
+  a: &[(usize, usize, MScalar<M>)],
+  b: &[(usize, usize, MScalar<M>)],
+  c: &[(usize, usize, MScalar<M>)],
   t_x: &[MScalar<M>],
   t_y: &[MScalar<M>],
   params: &MParams<M>,
 ) -> (MScalar<M>, MScalar<M>, MScalar<M>) {
-  let zero = <MScalar<M> as SumcheckField>::zero(params);
-  let eval_one = |entries: &Vec<(usize, usize, MScalar<M>)>| -> MScalar<M> {
+  let zero = MScalar::<M>::zero(params);
+  let eval_one = |entries: &[(usize, usize, MScalar<M>)]| -> MScalar<M> {
     entries
       .iter()
       .map(|(i, j, v)| t_x[*i] * t_y[*j] * *v)
       .fold(zero, |a, b| a + b)
   };
   let (eval_a, (eval_b, eval_c)) = rayon::join(
-    || eval_one(&shape.A),
-    || rayon::join(|| eval_one(&shape.B), || eval_one(&shape.C)),
+    || eval_one(a),
+    || rayon::join(|| eval_one(b), || eval_one(c)),
   );
   (eval_a, eval_b, eval_c)
 }
@@ -471,87 +582,87 @@ fn evaluate_matrices<M: ModEngine>(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{
-    dyn_prime::DynPrime,
-    provider::{T256DynPrimeEngine, pcs::bridge_modpcs::t256_scalar_params},
-  };
+  use crate::provider::T256DynPrimeEngine;
 
   type ME = T256DynPrimeEngine;
-  type DP = DynPrime<4>;
 
-  /// Toy: prove `a · b ≡ c (mod N)` over the dynamic prime (p = q = T256
-  /// scalar prime). One real row + one padding row to make num_cons a power
-  /// of two. Witness layout w = [a, b, c, 0].
+  /// Toy: prove `a · b ≡ c (mod N)` over an arbitrary verifier-sampled
+  /// prime `p`. Witness layout `w = [a, b, c, 0]`. One real row + one
+  /// padding row to make `num_cons` a power of two.
   fn build_toy(
     a: u64,
     b: u64,
     c: u64,
     n: u64,
     q: u64,
-  ) -> (
-    IntModR1CSShapeModp<ME>,
-    Vec<DP>,
-    Vec<DP>,
-    crypto_bigint::modular::FixedMontyParams<4>,
-  ) {
-    let params = t256_scalar_params();
+  ) -> (IntModR1CSShapeModp<ME>, Vec<BigUint>, Vec<BigUint>) {
     let num_cons = 2usize;
     let num_vars = 4usize;
     let num_io = 0usize;
-    let one = DP::one(&params);
+    let one = BigUint::from(1u32);
+    let zero = BigUint::from(0u32);
 
-    let mat_a = vec![(0, 0, one)];
-    let mat_b = vec![(0, 1, one)];
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
     let mat_c = vec![(0, 2, one)];
-    let mods = vec![DP::from_u64(&params, n), DP::zero(&params)];
+    let mods = vec![BigUint::from(n), zero.clone()];
 
-    let shape = IntModR1CSShapeModp::<ME>::new(
-      num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods, params,
-    )
-    .unwrap();
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+        .unwrap();
 
     let w = vec![
-      DP::from_u64(&params, a),
-      DP::from_u64(&params, b),
-      DP::from_u64(&params, c),
-      DP::zero(&params),
+      BigUint::from(a),
+      BigUint::from(b),
+      BigUint::from(c),
+      zero.clone(),
     ];
-    let q_vec = vec![DP::from_u64(&params, q), DP::zero(&params)];
-    (shape, w, q_vec, params)
+    let q_vec = vec![BigUint::from(q), zero];
+    (shape, w, q_vec)
   }
 
+  /// End-to-end: 3 · 5 ≡ 1 (mod 14) under a transcript-sampled prime `p`
+  /// that is *not* the curve scalar prime. Validates the dual-field
+  /// driver flow against the trivial Mod-PCS stub.
   #[test]
   fn imod_modp_toy_roundtrip() {
-    // 3 · 5 = 15 = 1 + 14 · 1
-    let (shape, w, q, _params) = build_toy(3, 5, 1, 14, 1);
-
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
     let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
-
     let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
     shape.is_sat(&pk.ck, &U, &W).unwrap();
-
     let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
     proof.verify(&vk, &U).unwrap();
   }
 
-  /// Wrong quotient must be rejected by `is_sat`.
+  /// `is_sat` rejects an inconsistent witness (wrong quotient).
   #[test]
   fn imod_modp_bad_witness_rejected() {
-    let (shape, w, _, params) = build_toy(3, 5, 1, 14, 1);
-    let bad_q = vec![DP::zero(&params), DP::zero(&params)];
+    let (shape, w, _) = build_toy(3, 5, 1, 14, 1);
+    let bad_q = vec![BigUint::from(0u32), BigUint::from(0u32)];
     let (pk, _vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
     let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, bad_q, vec![]).unwrap();
     assert!(shape.is_sat(&pk.ck, &U, &W).is_err());
   }
 
-  /// Tampering with v_q must cause verify to reject.
+  /// Tampering with `v_q` breaks transcript binding inside the SNARK
+  /// driver (independent of Mod-PCS soundness).
   #[test]
   fn imod_modp_verify_rejects_tampering() {
-    let (shape, w, q, params) = build_toy(3, 5, 1, 14, 1);
+    let (shape, w, q) = build_toy(3, 5, 1, 14, 1);
     let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
     let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
     let mut proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
-    proof.v_q += DP::one(&params);
+    // The sampled p is engine-dependent; use M::Scalar::one() against the
+    // tampered v_q by re-running the same sampling deterministically.
+    let mut t = Keccak256Transcript::<ME>::new_with_params(
+      b"IntModSpartanModpSNARK",
+      <ME as ModEngine>::bootstrap_params(),
+    );
+    t.absorb_bytes(b"vk", &pk.vk_digest);
+    t.absorb(b"comm_w", &U.comm_w);
+    t.absorb(b"comm_q", &U.comm_q);
+    let params = <ME as ModEngine>::sample_params(&mut t);
+    proof.v_q += MScalar::<ME>::one(&params);
     assert!(proof.verify(&vk, &U).is_err());
   }
 }
