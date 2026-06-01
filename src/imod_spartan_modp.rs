@@ -719,6 +719,50 @@ mod tests {
     proof.verify(&vk, &U).unwrap();
   }
 
+  /// End-to-end SNARK roundtrip that triggers the IntEval partial-eval
+  /// iteration path (step C) on the W open. With `num_vars = 256`, the
+  /// Mod-PCS opens W at a point of length `log_2(256) = 8 > k = 7`
+  /// (default `IntEvalParams`), so `t = 1` partial-eval iteration runs
+  /// per small prime. The Q open at length 1 still uses the step-B
+  /// path (no iteration). Both must agree end-to-end through the
+  /// SNARK protocol.
+  ///
+  /// The smallest available SNARK trigger for step C — `num_vars = 128`
+  /// gives `point.len = 7 = k`, exactly at the no-iteration boundary,
+  /// so we go one power of two above to be sure.
+  #[test]
+  fn imod_modp_snark_with_inteval_iteration() {
+    let one = BigUint::from(1u32);
+    let zero = BigUint::from(0u32);
+    let num_cons = 2usize;
+    let num_vars = 256usize; // log_2(256) = 8 > default k = 7
+    let num_io = 0usize;
+
+    // One real row: 3·5 ≡ 1 (mod 14), q₀ = 1. Layout: w[0..3] = [3, 5, 1],
+    // rest zero (253 trailing zeros).
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one)];
+    let mods = vec![BigUint::from(14u32), zero.clone()];
+
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+        .unwrap();
+
+    let mut w: Vec<BigUint> = vec![zero.clone(); num_vars];
+    w[0] = BigUint::from(3u32);
+    w[1] = BigUint::from(5u32);
+    w[2] = BigUint::from(1u32);
+    let q: Vec<BigUint> = vec![BigUint::from(1u32), zero];
+
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &U, &W).unwrap();
+
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
+    proof.verify(&vk, &U).unwrap();
+  }
+
   /// Public IO: a tiny circuit `w₀ · w₁ ≡ x₀ (mod 14)` with `x₀ = 1` as
   /// public input. Exercises the `eval_public_at` path that the
   /// zero-IO toy doesn't touch.

@@ -191,11 +191,11 @@ size; promote into a phase plan when picked up.
 
 ### Tests
 
-- **Two-row + public-IO tests use very small dimensions.** num_vars=8 with
-  k=7 is just over the partial-eval boundary, but the IntEval default
-  config never *reaches* iteration. The SNARK driver tests don't exercise
-  step C at all (only direct IntEvalModPCS tests do). **Fix:** add a SNARK
-  test with a larger circuit OR with explicit small-k IntEval params. Small.
+- **Two-row + public-IO tests use very small dimensions.** num_vars=8
+  exercises the n ≤ k IntEval path only. ~~Step C is not reached~~ —
+  resolved by `imod_modp_snark_with_inteval_iteration` (num_vars=256,
+  triggers t=1 on the W open). Still no SNARK test with t > 1 (would
+  need num_vars >= 2^14 with default k=7); add when relevant.
 
 - **No differential test between Phase 1 and Phase 2.** When p=q is forced
   on Phase 2, the two should give equivalent results on the same toy
