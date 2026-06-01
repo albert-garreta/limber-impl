@@ -89,9 +89,117 @@ size; promote into a phase plan when picked up.
   Something like `b"IntModSpartanSNARK-v1"` so future protocol revisions
   don't risk transcript collision. Trivial.
 
-## Phase 2 follow-ups (will accumulate here as we work through it)
+## Phase 2 follow-ups (retroactively backfilled 2026-06-01)
 
-(none yet)
+### Performance
+
+- **`IntModR1CSShapeModp` matrices are raw COO `Vec<(usize, usize, BigUint)>`.**
+  We couldn't reuse `r1cs::SparseMatrix<F: PrimeField>` because `BigUint`
+  isn't `PrimeField`. The COO storage means `multiply_vec`, `bind_abc`, and
+  `evaluate_matrices` walk every entry linearly per call instead of using
+  CSR row offsets. Cost grows linearly in `nnz(A) + nnz(B) + nnz(C)`. For
+  the toy tests (a handful of entries) it doesn't matter; for any
+  realistic SNARK this is a measurable regression vs Phase 1.
+  **Fix:** parameterize `SparseMatrix` over a general scalar type, or
+  introduce a `SparseMatrixModp<M>` variant with CSR over `BigUint`. Medium.
+
+- **Matrix reduction `BigUint → DynPrime` isn't cached.** Every `prove` /
+  `verify` reduces shape matrices/mods from `BigUint` → `DynPrime` mod the
+  newly-sampled `p`. For repeated proving over the same shape (the typical
+  case at the application layer), this is wasted work. The reduction depends
+  on `p` which is per-session, so it can't be precomputed at setup. But it
+  could be cached *per `prove` call* across the multiple uses (`mods_p`,
+  `a_p`, `b_p`, `c_p`) — which we mostly already do, but the helper
+  `biguint_to_scalar::<M>(v, params)` is called per element on three
+  matrices and three vectors with no batch parallelism. **Fix:** rayon-
+  parallelize the reduction loops.
+
+- **`eval_public_at` builds the full eq-table even for `num_io = 0`.**
+  Inherited from Phase 1 — same `SparsePolynomial::evaluate` swap applies.
+  See Phase-1 follow-up of the same name.
+
+- **Sumcheck over `DynPrime<4>` is ~3-5× slower than over `t256::Scalar`.**
+  `crypto_bigint::FixedMontyForm` doesn't have the ASM optimizations
+  halo2curves uses for the static-modulus path. Each `*` `+` `-` goes
+  through generic Montgomery reduction. This is the dominant Phase-2 perf
+  hit. **Fix:** wait for crypto-bigint to add ASM (issue open upstream), or
+  hand-write the Montgomery routines for the common widths.
+
+- **No bench for Phase 2.** `benches/imod_spartan.rs` still targets the
+  Phase-1 driver. Per the perf-target memory, we should re-benchmark imod
+  vs plain Spartan on shape-matched configs whenever the protocol changes —
+  Phase 2 changed it. **Fix:** clone `imod_spartan` bench → `imod_spartan_modp`
+  bench. Run it. Add results to a perf log.
+
+### Correctness boundaries
+
+- **Verifier cross-vk panic.** Documented in the `imod_modp_digest_binds_matrices`
+  test: verifying a Phase-1-style proof under a wrong vk panics inside
+  `crypto-bigint::FixedMontyForm` because the proof's `DynPrime` values
+  carry `params_p1` and the verifier reduces shape data with `params_p2`.
+  Functionally rejection but ungraceful. **Fix:** wrap the param check
+  earlier and return `SpartanError::InvalidSumcheckProof` instead of
+  panicking. Small.
+
+- **`DynPrime<4>::from_bytes_reduce` truncates to 32 bytes.** Anything
+  wider than 256 bits silently loses its top bytes. For our toy witnesses
+  (≤ 64-bit) we're fine, but if `T_f` ever exceeds 256 bits we'd be
+  silently producing wrong reductions. **Fix:** iterative chunk-wise reduction (or a
+  wider intermediate `Uint`). Medium.
+
+- **`prove_with_iter` doesn't bind `p_i` into the iteration commits.** See
+  the same item in Phase 3 follow-ups — applies to step C only, but it's
+  rooted in Phase 2's transcript design (the prime indices aren't labelled).
+
+### Code hygiene
+
+- **Phase-1 `imod_spartan` is no longer the canonical path** but it's still
+  in tree (with `_modp` parallel module). Once Phase 3 stabilizes, decide:
+  delete Phase 1, or keep it as a reference for `p = q` mode. See the
+  `project_phase2_parallel_sumcheck` memory — option B → A migration was
+  planned with differential testing; we haven't done either.
+
+- **`bootstrap_params` placeholder.** The Phase-2 driver constructs the
+  transcript with `M::bootstrap_params()` (modulus = 3 for `T256DynPrimeEngine`),
+  a placeholder never used arithmetically. Wart from `Keccak256Transcript`
+  needing *some* `Params` at construction. **Fix:** split `Keccak256Transcript`
+  into a byte-only mode + a typed-squeeze mode; bootstrap only needs the
+  byte-only mode. Medium.
+
+- **`set_params` is a `Keccak256Transcript`-inherent method, not on the
+  trait.** The Phase-2 driver consequently uses `where M: ModEngine<TE =
+  Keccak256Transcript<M>>`, tying it to the specific transcript impl. **Fix:**
+  promote `set_params` to a method on the trait (with a default no-op for
+  static-field cases). Small.
+
+- **`bootstrap_params` + `sample_params` are explicit-impl-required** on
+  every `ModEngine`, no default. Static-field engines must spell out `()`
+  trivially. **Fix:** restore a default impl gated on `Params: Default`
+  (currently dropped to avoid bound-rippling). Small.
+
+- **Proof / shape not `Serialize`.** `IntModSpartanModpSNARK` and
+  `IntModR1CSShapeModp` aren't `Serialize`/`Deserialize`. Was OK during
+  prototype but blocks any real "save proof to disk" usage. `BigUint`
+  already impls `Serialize`; the blockers are the `M::Scalar` and
+  `<M::Scalar as SumcheckField>::Params` types in the proof struct.
+  **Fix:** add `Serialize` impls. Medium (need to think about whether
+  `Params` is part of the proof or recoverable from public data).
+
+- **`SumcheckField::Params` requires `'static`** which is a leak of
+  implementation detail — `FixedMontyParams` happens to be `'static` but
+  the bound shouldn't be there structurally. Probably can drop. Trivial.
+
+### Tests
+
+- **Two-row + public-IO tests use very small dimensions.** num_vars=8 with
+  k=7 is just over the partial-eval boundary, but the IntEval default
+  config never *reaches* iteration. The SNARK driver tests don't exercise
+  step C at all (only direct IntEvalModPCS tests do). **Fix:** add a SNARK
+  test with a larger circuit OR with explicit small-k IntEval params. Small.
+
+- **No differential test between Phase 1 and Phase 2.** When p=q is forced
+  on Phase 2, the two should give equivalent results on the same toy
+  circuits. We haven't checked. **Fix:** write a differential test. Small.
 
 ## Phase 3 follow-ups (identified during step A–C implementation, 2026-06-01)
 
