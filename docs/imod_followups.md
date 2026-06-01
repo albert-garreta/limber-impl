@@ -302,6 +302,36 @@ size; promote into a phase plan when picked up.
 
 ### Param derivation
 
+- **`IntEvalParams` defaults are baked into `IntEvalModPCS::setup` and
+  the SNARK driver has no way to override them.** The trait-level setup
+  uses `(DEFAULT_LOG_T_F = 32, DEFAULT_K = 7)` for any call. Three
+  concrete problems with this:
+
+  1. **`T_f = 2^32` is a silent correctness boundary.** `commit` accepts
+     any `BigUint` via `from_uniform`; nothing enforces `|v| < 2^32`.
+     If an application uses wider witness values, the soundness analysis
+     (which assumes `|T_f| < 2^32` for the Partial Eval Norm Bound) breaks
+     silently. This intersects with the deferred range-check work but is
+     also a documentation / API-contract issue.
+
+  2. **`k = 7` is a tuning knob, not a security parameter.** The paper's
+     table 4.4 shows multiple valid `(k, log_P, s)` configs per shape with
+     different "extra commit cost ratios" — picking `k` is a trade-off the
+     application should be able to make. We currently pick `k = ⌈log λ⌉`
+     and that's that.
+
+  3. **No application path to set params.** `IntEvalModPCS::setup_with_params`
+     exists for the explicit-override case, but the SNARK driver
+     (`IntModSpartanModpSNARK::setup`) doesn't expose it — it calls the
+     shape's `commitment_key()` which calls the trait `setup` with the
+     hardcoded defaults. An application that wants `T_f = 2^64` has no
+     clean path through the existing SNARK API.
+
+  **Fix:** extend `IntModSpartanModpSNARK::setup` (and the shape's
+  `commitment_key()`) to accept an optional `IntEvalParams` (or a more
+  abstract `ModPCSConfig`-style struct) and thread it down. Application-
+  layer `setup_with_params` then composes naturally. Medium.
+
 - **`IntEvalParams::derive` picks the smallest valid k from `k_start = log λ`
   upward.** This isn't always the optimal choice — sometimes a *larger* k
   gives fewer iterations and better commitment cost (per the table in §4.4).
@@ -314,9 +344,6 @@ size; promote into a phase plan when picked up.
   valid-per-the-script configs). **Fix:** port the script's formula.
 
 ### Code hygiene
-
-- **`TrivialIntModPCS` and `BridgeModPCS` are now dead code.** Kept as
-  reference. After Phase 3 is stable, delete.
 
 - **The IntEval impl is concrete to `T256DynPrimeEngine`.** No abstraction
   over which underlying F-PCS to use. Once we have multiple `ModEngine`s,
