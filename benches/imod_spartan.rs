@@ -76,7 +76,10 @@ fn make_shape_and_witness(
 
 fn imod_spartan_benches(c: &mut Criterion) {
   // (num_cons, num_vars) — num_vars = next power-of-two ≥ 4·num_cons.
+  // Smallest config matches `benches/imod_spartan_modp.rs` for direct
+  // p=q vs p≠q comparison; larger ones are Phase-1's historical sizes.
   let configs: &[(usize, usize)] = &[
+    (1usize << 6, 1usize << 8),
     (1usize << 10, 1usize << 12),
     (1usize << 12, 1usize << 14),
     (1usize << 14, 1usize << 16),

@@ -205,6 +205,25 @@ size; promote into a phase plan when picked up.
 
 ### Performance / structure
 
+- **Phase-2 prover is ~10× slower than Phase-1 at comparable shape.**
+  Initial bench numbers from `benches/imod_spartan_modp.rs` (2026-06-01,
+  Apple Silicon, default features):
+  - At `(num_cons=2^6, num_vars=2^8)`: P1 prove 7.2ms, P2 prove 73ms; P1
+    verify 6.7ms, P2 verify 73ms. Setup is comparable (~18ms each).
+  - At `(num_cons=2^8, num_vars=2^10)`: P2 prove 136ms, P2 verify 132ms.
+  - Scaling from `2^6→2^8` constraints: P2 prove 1.86×, sub-linear.
+
+  Dominant Phase-2 costs from inspection (not yet attributed by profile):
+  DynPrime arithmetic in the sumcheck (~3-5× per op vs t256::Scalar), s
+  rejection-sampled small primes per Mod-PCS open (Miller-Rabin is
+  measurable), and step-C identity opens (3 Hyrax opens per iteration per
+  prime). All three are addressed elsewhere in this list.
+
+  **Per [[feedback_imod_perf_target]], we want imod within a small
+  constant factor of *plain* Spartan**, not just within a small factor of
+  Phase-1 imod. Need to bench plain Spartan at the same shape and report
+  the full P0/P1/P2 ratio.
+
 - **`IntEvalEvalArg` is huge under default params.** Step C produces, per
   prove call: `s` chains × `t` iterations × 2 polynomial Hyrax commits, plus
   `s × (3t + 1)` Hyrax openings (each carries `f_y`, `blind_eval`, and a

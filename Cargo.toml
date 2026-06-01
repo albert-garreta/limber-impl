@@ -76,6 +76,10 @@ name = "imod_spartan"
 harness = false
 
 [[bench]]
+name = "imod_spartan_modp"
+harness = false
+
+[[bench]]
 name = "spartan_synthetic"
 harness = false
 
