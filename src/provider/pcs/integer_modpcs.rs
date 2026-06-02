@@ -731,7 +731,7 @@ fn shift_b(params: &IntEvalParams) -> BigUint {
 fn integer_partial_evaluate_top_k(poly: &[BigInt], r_lower: &[BigUint]) -> Vec<BigInt> {
   let k = r_lower.len();
   let two_k = 1usize << k;
-  assert!(poly.len() % two_k == 0);
+  assert!(poly.len().is_multiple_of(two_k));
   let new_size = poly.len() / two_k;
 
   let r_int: Vec<BigInt> = r_lower.iter().map(|x| BigInt::from(x.clone())).collect();

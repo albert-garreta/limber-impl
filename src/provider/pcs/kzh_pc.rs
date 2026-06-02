@@ -265,7 +265,7 @@ where
   }
 
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError> {
-    if width == 0 || n % width != 0 {
+    if width == 0 || !n.is_multiple_of(width) {
       return Err(SpartanError::InvalidCommitmentLength {
         reason: format!("KZH commitment shape: width {width} must divide n {n}"),
       });

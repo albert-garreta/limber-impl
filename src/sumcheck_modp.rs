@@ -193,9 +193,7 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
 
     for _ in 0..num_rounds {
       let n = poly_A.len() / 2;
-      let (peq, pa, pb, pc, pm, pq) = (
-        &poly_eq, &*poly_A, &*poly_B, &*poly_C, &*poly_M, &*poly_Q,
-      );
+      let (peq, pa, pb, pc, pm, pq) = (&poly_eq, &*poly_A, &*poly_B, &*poly_C, &*poly_M, &*poly_Q);
 
       // Evaluate the round polynomial at X ∈ {0, 1, 2, 3}, summing the
       // per-hypercube-point contributions in parallel.
