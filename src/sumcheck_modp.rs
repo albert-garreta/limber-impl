@@ -29,6 +29,7 @@ use crate::{
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
+use rayon::prelude::*;
 
 /// A sumcheck proof — the per-round compressed univariate polynomials.
 #[derive(Clone, Debug)]
@@ -114,23 +115,27 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
 
     for _ in 0..num_rounds {
       let n = poly_A.len() / 2;
-      let mut eval_0 = zero;
-      let mut eval_1 = zero;
-      let mut eval_2 = zero;
+      let (pa, pb) = (&*poly_A, &*poly_B);
 
-      for i in 0..n {
-        let a0 = poly_A[i];
-        let a1 = poly_A[n + i];
-        let b0 = poly_B[i];
-        let b1 = poly_B[n + i];
+      // Evaluate the round polynomial at X ∈ {0, 1, 2}, summing the per-
+      // hypercube-point contributions in parallel (the DynPrime field ops
+      // dominate, so this is the prover's hottest loop).
+      let (eval_0, eval_1, eval_2) = (0..n)
+        .into_par_iter()
+        .map(|i| {
+          let a0 = pa[i];
+          let a1 = pa[n + i];
+          let b0 = pb[i];
+          let b1 = pb[n + i];
 
-        eval_0 += a0 * b0;
-        eval_1 += a1 * b1;
-
-        let a2 = two * a1 - a0;
-        let b2 = two * b1 - b0;
-        eval_2 += a2 * b2;
-      }
+          let a2 = two * a1 - a0;
+          let b2 = two * b1 - b0;
+          (a0 * b0, a1 * b1, a2 * b2)
+        })
+        .reduce(
+          || (zero, zero, zero),
+          |(x0, x1, x2), (y0, y1, y2)| (x0 + y0, x1 + y1, x2 + y2),
+        );
 
       debug_assert_eq!(eval_0 + eval_1, running_claim);
 
@@ -188,43 +193,52 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
 
     for _ in 0..num_rounds {
       let n = poly_A.len() / 2;
-      let mut eval_0 = zero;
-      let mut eval_1 = zero;
-      let mut eval_2 = zero;
-      let mut eval_3 = zero;
+      let (peq, pa, pb, pc, pm, pq) = (
+        &poly_eq, &*poly_A, &*poly_B, &*poly_C, &*poly_M, &*poly_Q,
+      );
 
-      for i in 0..n {
-        let eq0 = poly_eq[i];
-        let eq1 = poly_eq[n + i];
-        let a0 = poly_A[i];
-        let a1 = poly_A[n + i];
-        let b0 = poly_B[i];
-        let b1 = poly_B[n + i];
-        let c0 = poly_C[i];
-        let c1 = poly_C[n + i];
-        let m0 = poly_M[i];
-        let m1 = poly_M[n + i];
-        let q0 = poly_Q[i];
-        let q1 = poly_Q[n + i];
+      // Evaluate the round polynomial at X ∈ {0, 1, 2, 3}, summing the
+      // per-hypercube-point contributions in parallel.
+      let (eval_0, eval_1, eval_2, eval_3) = (0..n)
+        .into_par_iter()
+        .map(|i| {
+          let eq0 = peq[i];
+          let eq1 = peq[n + i];
+          let a0 = pa[i];
+          let a1 = pa[n + i];
+          let b0 = pb[i];
+          let b1 = pb[n + i];
+          let c0 = pc[i];
+          let c1 = pc[n + i];
+          let m0 = pm[i];
+          let m1 = pm[n + i];
+          let q0 = pq[i];
+          let q1 = pq[n + i];
 
-        let eq2 = two * eq1 - eq0;
-        let eq3 = three * eq1 - two * eq0;
-        let a2 = two * a1 - a0;
-        let a3 = three * a1 - two * a0;
-        let b2 = two * b1 - b0;
-        let b3 = three * b1 - two * b0;
-        let c2 = two * c1 - c0;
-        let c3 = three * c1 - two * c0;
-        let m2 = two * m1 - m0;
-        let m3 = three * m1 - two * m0;
-        let q2 = two * q1 - q0;
-        let q3 = three * q1 - two * q0;
+          let eq2 = two * eq1 - eq0;
+          let eq3 = three * eq1 - two * eq0;
+          let a2 = two * a1 - a0;
+          let a3 = three * a1 - two * a0;
+          let b2 = two * b1 - b0;
+          let b3 = three * b1 - two * b0;
+          let c2 = two * c1 - c0;
+          let c3 = three * c1 - two * c0;
+          let m2 = two * m1 - m0;
+          let m3 = three * m1 - two * m0;
+          let q2 = two * q1 - q0;
+          let q3 = three * q1 - two * q0;
 
-        eval_0 += eq0 * (a0 * b0 - c0 - m0 * q0);
-        eval_1 += eq1 * (a1 * b1 - c1 - m1 * q1);
-        eval_2 += eq2 * (a2 * b2 - c2 - m2 * q2);
-        eval_3 += eq3 * (a3 * b3 - c3 - m3 * q3);
-      }
+          (
+            eq0 * (a0 * b0 - c0 - m0 * q0),
+            eq1 * (a1 * b1 - c1 - m1 * q1),
+            eq2 * (a2 * b2 - c2 - m2 * q2),
+            eq3 * (a3 * b3 - c3 - m3 * q3),
+          )
+        })
+        .reduce(
+          || (zero, zero, zero, zero),
+          |(x0, x1, x2, x3), (y0, y1, y2, y3)| (x0 + y0, x1 + y1, x2 + y2, x3 + y3),
+        );
 
       debug_assert_eq!(eval_0 + eval_1, running_claim);
 

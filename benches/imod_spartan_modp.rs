@@ -22,6 +22,7 @@ use spartan2::{
   provider::T256DynPrimeEngine,
 };
 use std::time::Duration;
+use tracing_subscriber::EnvFilter;
 
 type M = T256DynPrimeEngine;
 
@@ -85,6 +86,27 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
     (1usize << 8, 1usize << 10),  // point.len=10 → t=1
     (1usize << 10, 1usize << 12), // point.len=12 → t=1
   ];
+
+  // Per-part timing breakdown, gated entirely on `RUST_LOG` so a plain
+  // `cargo bench` installs no global subscriber and runs no extra work.
+  // With `RUST_LOG=info` we install a fmt subscriber and run one
+  // setup/prove/verify per config, printing the section spans
+  // (imod_pcs_chain_openings, imod_pcs_rc_ab, …) so you can see where
+  // prove/verify time goes without criterion's iteration noise.
+  if std::env::var_os("RUST_LOG").is_some() {
+    let _ = tracing_subscriber::fmt()
+      .with_target(false)
+      .with_env_filter(EnvFilter::from_default_env())
+      .try_init();
+    for &(num_cons, num_vars) in configs {
+      let (shape, w, q) = make_shape_and_witness(num_cons, num_vars);
+      let (pk, vk) = IntModSpartanModpSNARK::<M>::setup(shape.clone()).unwrap();
+      let (witness, instance) =
+        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+      let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+      proof.verify(&vk, &instance).unwrap();
+    }
+  }
 
   let mut g = c.benchmark_group("imod_spartan_modp");
   g.sample_size(10);

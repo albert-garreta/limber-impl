@@ -35,6 +35,7 @@ use crate::{
     T256DynPrimeEngine, T256HyraxEngine, keccak::Keccak256Transcript, pcs::hyrax_pc::HyraxPCS,
     pt256::t256,
   },
+  start_span,
   traits::{
     PrimeFieldExt,
     mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
@@ -47,7 +48,9 @@ use ff::{Field, PrimeField};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Zero};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 /// Underlying standard PCS: Hyrax over T256.
 type Hyrax = HyraxPCS<T256HyraxEngine>;
@@ -498,16 +501,21 @@ fn scalar_to_balanced_int(s: &t256::Scalar) -> BigInt {
 /// once via `(q - 1) + 1` from `-Scalar::ONE`'s representation; cheap
 /// enough to recompute per call since it's just byte arithmetic.
 fn t256_q() -> BigUint {
-  let q_minus_1 = (-<t256::Scalar as Field>::ONE).to_repr();
-  let mut bytes = q_minus_1.as_ref().to_vec();
-  let mut carry = 1u8;
-  for b in bytes.iter_mut() {
-    let (v, c) = b.overflowing_add(carry);
-    *b = v;
-    carry = u8::from(c);
-  }
-  debug_assert_eq!(carry, 0);
-  BigUint::from_bytes_le(&bytes)
+  // `q` is a compile-time constant of the curve; compute it once and
+  // hand out clones (this is called per `shift_b`, i.e. per range check).
+  static Q: once_cell::sync::Lazy<BigUint> = once_cell::sync::Lazy::new(|| {
+    let q_minus_1 = (-<t256::Scalar as Field>::ONE).to_repr();
+    let mut bytes = q_minus_1.as_ref().to_vec();
+    let mut carry = 1u8;
+    for b in bytes.iter_mut() {
+      let (v, c) = b.overflowing_add(carry);
+      *b = v;
+      carry = u8::from(c);
+    }
+    debug_assert_eq!(carry, 0);
+    BigUint::from_bytes_le(&bytes)
+  });
+  Q.clone()
 }
 
 /// Canonical integer in `[0, p)` from a `DynPrime<4>` value.
@@ -599,11 +607,10 @@ fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
 /// `b`-th bit of `values[i]`. Used as the witness polynomial of the
 /// batched range-check sumcheck (step D5).
 fn bit_decompose_polynomial(values: &[BigUint], num_bits: usize) -> Vec<u8> {
-  let mut out = Vec::with_capacity(values.len() * num_bits);
-  for v in values {
-    out.extend(bit_decompose_value(v, num_bits));
-  }
-  out
+  values
+    .par_iter()
+    .flat_map_iter(|v| bit_decompose_value(v, num_bits).into_iter())
+    .collect()
 }
 
 /// Split a single `BigUint` value `v ∈ [0, 2^log_t_f)` into `numlimb`
@@ -672,16 +679,18 @@ fn limb_split_polynomial(poly: &[BigUint], log_t: usize, log_t_f: usize) -> Vec<
   let numlimb = numlimb(log_t_f, log_t);
   let numlimb_var = numlimb_var(numlimb);
   let stride = 1usize << numlimb_var;
-  let mut out = vec![BigUint::zero(); poly.len() * stride];
-  for (x, v) in poly.iter().enumerate() {
-    let limbs = split_value_into_limbs(v, log_t, numlimb);
-    for (k, limb) in limbs.into_iter().enumerate() {
-      out[x * stride + k] = limb;
-    }
-    // Slots [numlimb..stride) stay zero (padding when `numlimb` isn't a
-    // power of two).
-  }
-  out
+  // Each coefficient expands to `stride` contiguous slots: its `numlimb`
+  // limbs followed by zero padding. Order is preserved across the
+  // parallel map, so the `x · stride + k` layout is identical to the
+  // sequential version.
+  poly
+    .par_iter()
+    .flat_map_iter(|v| {
+      let mut limbs = split_value_into_limbs(v, log_t, numlimb);
+      limbs.resize(stride, BigUint::zero());
+      limbs.into_iter()
+    })
+    .collect()
 }
 
 /// Truncated (toward-zero) divmod. Returns `(q, r)` with `q · d + r = g`
@@ -722,7 +731,7 @@ fn shift_b(params: &IntEvalParams) -> BigUint {
 fn integer_partial_evaluate_top_k(poly: &[BigInt], r_lower: &[BigUint]) -> Vec<BigInt> {
   let k = r_lower.len();
   let two_k = 1usize << k;
-  assert!(poly.len().is_multiple_of(two_k));
+  assert!(poly.len() % two_k == 0);
   let new_size = poly.len() / two_k;
 
   let r_int: Vec<BigInt> = r_lower.iter().map(|x| BigInt::from(x.clone())).collect();
@@ -743,13 +752,16 @@ fn integer_partial_evaluate_top_k(poly: &[BigInt], r_lower: &[BigUint]) -> Vec<B
     })
     .collect();
 
-  let mut result = vec![BigInt::zero(); new_size];
-  for (x, slot) in result.iter_mut().enumerate().take(new_size) {
-    for (y, chi_y) in chi_table.iter().enumerate().take(two_k) {
-      *slot += &poly[x * two_k + y] * chi_y;
-    }
-  }
-  result
+  (0..new_size)
+    .into_par_iter()
+    .map(|x| {
+      let mut slot = BigInt::zero();
+      for (y, chi_y) in chi_table.iter().enumerate().take(two_k) {
+        slot += &poly[x * two_k + y] * chi_y;
+      }
+      slot
+    })
+    .collect()
 }
 
 /// Compute the signed integer MLE evaluation `sum_k chi_int(k, point) ·
@@ -986,6 +998,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     _comm_eval: &Self::Commitment,
     _blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
+    let (_prove_span, prove_t) = start_span!("integer_modpcs_prove");
     let params = &ck.params;
     let monty = point
       .first()
@@ -994,6 +1007,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         reason: "IntegerModPCS::prove: empty point".to_string(),
       })?;
 
+    let (_red_span, red_t) = start_span!("imod_pcs_reduction");
     // 0. Limb-split f → f_limb. For numlimb=1 this is a literal pass-
     //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
     //    coefficients (and 2^numlimb_var slots per original coefficient,
@@ -1094,11 +1108,20 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let with_iter = num_vars > params.k;
     let poly = f_limb.as_slice();
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
+    info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_pcs_reduction");
 
     // 4. Phase 1: per prime, sample p_i, run all t iterations (if any),
     //    committing a_j_shifted / b_j_shifted and absorbing into the
     //    transcript. We stash the per-chain prover state needed to
     //    generate openings in phase 2.
+    let (_p1_span, p1_t) = start_span!("imod_pcs_chain_phase1");
+    // Lift `poly` to BigInt once; each iterating chain clones it as its
+    // `a_0`. Only the `with_iter` path consumes it.
+    let poly_bigint: Vec<BigInt> = if with_iter {
+      poly.par_iter().map(|x| BigInt::from(x.clone())).collect()
+    } else {
+      Vec::new()
+    };
     let mut chain_states: Vec<ChainProverState> = Vec::with_capacity(params.s);
     for _ in 0..params.s {
       let p_i = sample_small_prime(transcript, params.log_p)?;
@@ -1115,8 +1138,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         let n = num_vars;
         let k = params.k;
 
-        // a_prev starts as the input polynomial.
-        let mut a_prev_int: Vec<BigInt> = poly.iter().map(|x| BigInt::from(x.clone())).collect();
+        // a_prev starts as the input polynomial (lifted once above).
+        let mut a_prev_int: Vec<BigInt> = poly_bigint.clone();
 
         for j in 1..=t {
           let lo = n - j * k;
@@ -1124,13 +1147,18 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           let r_lower = &r_i_int[lo..hi];
 
           let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
-          let mut a_j_int = Vec::with_capacity(g_j_int.len());
-          let mut b_j_int = Vec::with_capacity(g_j_int.len());
-          for g in &g_j_int {
-            let (b, a) = truncated_divmod(g, &p_i);
-            a_j_int.push(a);
-            b_j_int.push(b);
-          }
+          // Toward-zero divmod of every coefficient by p_i: `q · p_i + r = g`,
+          // `(b, a) = (q, r)` — see `truncated_divmod`. `d_big` is hoisted
+          // once per iteration instead of rebuilt per element.
+          let d_big = BigInt::from(p_i.clone());
+          let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = g_j_int
+            .par_iter()
+            .map(|g| {
+              let q = g / &d_big;
+              let r = g - &q * &d_big;
+              (q, r)
+            })
+            .unzip();
 
           let s_a = BigInt::from(shift_a(params));
           let s_b = BigInt::from(shift_b(params));
@@ -1173,6 +1201,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
       chain_states.push(state);
     }
+    info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
     // 5. Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
     let gamma_fq: Vec<t256::Scalar> = if with_iter {
@@ -1192,6 +1221,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     //    rather than consuming — D5.3 / D5.4 need to re-walk it after
     //    phase 2 to run deferred range checks on each iter's shifted
     //    polynomials.
+    let (_open_span, open_t) = start_span!("imod_pcs_chain_openings");
     let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
     for state in &chain_states {
       let r_i_int = &state.r_i_int;
@@ -1299,7 +1329,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         final_open,
       });
     }
+    info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_openings");
 
+    let (_rcf_span, rcf_t) = start_span!("imod_pcs_rc_flimb");
     // Phase-3 step D5.2: batch range-check argument for `f_limb`. Runs
     // entirely in t256::Scalar inside a sub-transcript seeded from the
     // parent — the F-side opening of `bit_poly` and the F-side sumcheck
@@ -1316,7 +1348,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       },
       transcript,
     )?);
+    info!(elapsed_ms = %rcf_t.elapsed().as_millis(), "imod_pcs_rc_flimb");
 
+    let (_rcab_span, rcab_t) = start_span!("imod_pcs_rc_ab");
     // Phase-3 step D5.3 / D5.4: deferred range checks on a_j_shifted
     // (bound `2P`, log_bound = log_p + 1) and b_j_shifted (bound `2q/P`,
     // log_bound = LOG_Q - log_p + 1) for every chain iteration.
@@ -1352,6 +1386,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         chains[chain_idx].iterations[iter_idx].b_range_check = Some(b_rc);
       }
     }
+    info!(elapsed_ms = %rcab_t.elapsed().as_millis(), "imod_pcs_rc_ab");
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
 
     Ok(IntEvalArgument {
       reduction_round_polys,
@@ -1371,6 +1407,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     _comm_eval: &Self::Commitment,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
+    let (_verify_span, verify_t) = start_span!("integer_modpcs_verify");
     let params = &vk.params;
     let monty = point
       .first()
@@ -1379,6 +1416,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         reason: "IntegerModPCS::verify: empty point".to_string(),
       })?;
 
+    let (_vred_span, vred_t) = start_span!("imod_pcs_verify_reduction");
     if arg.chains.len() != params.s {
       return Err(SpartanError::InvalidSumcheckProof);
     }
@@ -1460,7 +1498,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let n = num_vars;
     let k = params.k;
     let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
+    info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction");
 
+    let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
     // 3. Phase 1: per chain, re-sample p_i, then for each iteration
     //    consume comm_a_shifted / comm_b_shifted from the arg and absorb
     //    them identically.
@@ -1602,7 +1642,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         return Err(SpartanError::InvalidSumcheckProof);
       }
     }
+    info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
 
+    let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
     // Phase-3 step D5.2: batch range check on f_limb.
     if let Some(rc) = &arg.f_limb_range_check {
       let n_values = 1usize << (point.len() + params.numlimb_var);
@@ -1650,6 +1692,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         }
       }
     }
+    info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
+    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify");
 
     Ok(())
   }

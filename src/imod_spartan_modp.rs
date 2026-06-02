@@ -57,7 +57,7 @@ fn biguint_to_scalar<M: ModEngine>(v: &BigUint, params: &MParams<M>) -> MScalar<
 }
 
 fn biguint_vec_to_scalars<M: ModEngine>(v: &[BigUint], params: &MParams<M>) -> Vec<MScalar<M>> {
-  v.iter()
+  v.par_iter()
     .map(|b| biguint_to_scalar::<M>(b, params))
     .collect()
 }
@@ -67,7 +67,7 @@ fn biguint_matrix_to_scalars<M: ModEngine>(
   params: &MParams<M>,
 ) -> Vec<(usize, usize, MScalar<M>)> {
   entries
-    .iter()
+    .par_iter()
     .map(|(i, j, v)| (*i, *j, biguint_to_scalar::<M>(v, params)))
     .collect()
 }
@@ -196,6 +196,7 @@ where
     let one = MScalar::<M>::one(&params);
 
     // 4. Reduce shape/witness/IO from BigUint to M::Scalar mod p.
+    let (_red_span, red_t) = start_span!("imod_modp_reduce");
     let mods_p = biguint_vec_to_scalars::<M>(&shape.mods, &params);
     let w_p = biguint_vec_to_scalars::<M>(&W.w, &params);
     let q_p = biguint_vec_to_scalars::<M>(&W.q, &params);
@@ -203,6 +204,7 @@ where
     let a_p = biguint_matrix_to_scalars::<M>(&shape.A, &params);
     let b_p = biguint_matrix_to_scalars::<M>(&shape.B, &params);
     let c_p = biguint_matrix_to_scalars::<M>(&shape.C, &params);
+    info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_modp_reduce");
 
     // z = (W, 1, X), padded to 2*num_vars for the MLE.
     let mut z = Vec::with_capacity(2 * num_vars);
@@ -289,6 +291,7 @@ where
     // Mod-PCS open W at r_y[1..]. Mod-PCS commits/opens integers — pass
     // the original BigUint witness and the Z_p eval reduced into a
     // BigUint in [0, p).
+    let (_wopen_span, wopen_t) = start_span!("imod_modp_w_open");
     let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
     let blind_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
     let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
@@ -309,8 +312,10 @@ where
       &comm_eval_w,
       &blind_eval_w,
     )?;
+    info!(elapsed_ms = %wopen_t.elapsed().as_millis(), "imod_modp_w_open");
 
     // Mod-PCS open Q at r_x.
+    let (_qopen_span, qopen_t) = start_span!("imod_modp_q_open");
     let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
     let blind_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
     let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
@@ -331,6 +336,7 @@ where
       &comm_eval_q,
       &blind_eval_q,
     )?;
+    info!(elapsed_ms = %qopen_t.elapsed().as_millis(), "imod_modp_q_open");
 
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "imod_spartan_modp_prove");
     Ok(Self {
@@ -441,6 +447,7 @@ where
     }
 
     // Mod-PCS verification for W at r_y[1..].
+    let (_wver_span, wver_t) = start_span!("imod_modp_w_verify");
     let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
     let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
       &vk.ck_s,
@@ -458,8 +465,10 @@ where
       &comm_eval_w,
       &self.eval_arg_w,
     )?;
+    info!(elapsed_ms = %wver_t.elapsed().as_millis(), "imod_modp_w_verify");
 
     // Mod-PCS verification for Q at r_x.
+    let (_qver_span, qver_t) = start_span!("imod_modp_q_verify");
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
     let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
       &vk.ck_s,
@@ -477,6 +486,7 @@ where
       &comm_eval_q,
       &self.eval_arg_q,
     )?;
+    info!(elapsed_ms = %qver_t.elapsed().as_millis(), "imod_modp_q_verify");
 
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "imod_spartan_modp_verify");
     Ok(())
