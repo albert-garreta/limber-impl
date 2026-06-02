@@ -234,6 +234,27 @@ size; promote into a phase plan when picked up.
   match plain Spartan within ~5-10% (the P1 vs plain delta at `2^6`
   was only ~20% on verify).
 
+  **Refresh after Phase-3 step D5 (2026-06-02):** range checks add
+  3-4× over Phase-2 (per-iter `a_j` + `b_j` bit-decomposition zerocheck
+  + value-reconstruction sumcheck + 3 Hyrax openings each, plus the
+  f_limb range check):
+
+  | n_cons | Setup (P3) | Prove (P2 → P3) | Verify (P2 → P3) | P3/P0 prove | P3/P0 verify |
+  |--------|------------|------------------|-------------------|-------------|---------------|
+  | 2^6    | 18 ms      | 75 → 285 ms      | 76 → 254 ms       | 40×         | 46×           |
+  | 2^8    | 18 ms      | 138 → 632 ms     | 136 → 535 ms      | 81×         | 96×           |
+  | 2^10   | 18 ms      | 223 → 863 ms     | 168 → 621 ms      | 67×         | 100×          |
+
+  The b_j range check is the worst offender per range-check call:
+  bound `2q/P` ≈ `2^227` so the bit polynomial has ~256 padded bits
+  per coefficient. f_limb's range check is the next largest (32-bit
+  bound, but the polynomial itself has the most coefficients).
+
+  Recovery path: stacking all three categories into one combined
+  zerocheck (paper's `rbatchrange^{s·t}^2`) — see the "stack
+  everything" followup in Phase-3 step D's section below. Expected
+  to recover most of the 3-4× when implemented.
+
   Likely Phase-2 cost attribution (rough estimates, not yet profiled):
   - **Step-C Hyrax openings dominate.** Per Mod-PCS open with n > k:
     `s` final-remainder opens + `s × t × 3` identity-check opens.
