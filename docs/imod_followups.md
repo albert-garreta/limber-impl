@@ -234,11 +234,17 @@ size; promote into a phase plan when picked up.
   match plain Spartan within ~5-10% (the P1 vs plain delta at `2^6`
   was only ~20% on verify).
 
-  Dominant Phase-2 costs (not yet attributed by profile): DynPrime
-  arithmetic in the sumcheck (~3-5× per op vs t256::Scalar), `s`
-  rejection-sampled small primes per Mod-PCS open (Miller-Rabin is
-  measurable), and step-C identity opens (3 Hyrax opens per iteration per
-  prime). All three are addressed elsewhere in this list.
+  Likely Phase-2 cost attribution (rough estimates, not yet profiled):
+  - **Step-C Hyrax openings dominate.** Per Mod-PCS open with n > k:
+    `s` final-remainder opens + `s × t × 3` identity-check opens.
+    For `(2^10, 2^12)` with `s=9, t=1`: 36 Hyrax opens per Mod-PCS
+    prove × 2 Mod-PCS proves per SNARK = ~72 opens at ~3-5ms each →
+    ~200-360ms. Matches observed 223ms prove time.
+  - **DynPrime arithmetic in the sumcheck** (~3-5× per op vs the
+    static `t256::Scalar`). Probably the second-largest contributor.
+  - **Miller-Rabin prime sampling: small.** ~88 × 30µs for the big
+    `p`, ~18 × 21 × 1µs for the small primes, total ~3ms (1-4% of
+    prove). Not a perf priority.
 
   Caveat on the comparison: P1/P2 imod synthetic shape has 3 nnz/row
   (one per matrix); plain Spartan's bellpepper-synthesized multiplication
