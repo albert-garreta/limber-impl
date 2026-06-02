@@ -116,7 +116,10 @@ impl IntEvalParams {
     k: usize,
     num_vars: usize,
   ) -> Result<Self, SpartanError> {
-    let log_n = ceil_log2(num_vars.max(1));
+    let nl_pre = numlimb(log_t_f, log_t);
+    let nlv_pre = numlimb_var(nl_pre);
+    let num_vars_total = num_vars + nlv_pre;
+    let log_n = ceil_log2(num_vars_total.max(1));
     let log_lambda = ceil_log2(LAMBDA);
 
     // Find max log_p satisfying Partial Evaluation Norm Bound:
@@ -202,9 +205,13 @@ impl IntEvalParams {
 
   /// Check all four bounds from §4.4. Each is evaluated in log-space to
   /// avoid overflow; the comparisons match the paper's inequalities
-  /// after taking `log_2` of both sides.
+  /// after taking `log_2` of both sides. `num_vars` is the *original*
+  /// polynomial variable count — the limb-split polynomial has
+  /// `num_vars + numlimb_var` variables, and that's what enters the
+  /// soundness bounds.
   pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
-    let log_n = ceil_log2(num_vars.max(1));
+    let num_vars_total = num_vars + self.numlimb_var;
+    let log_n = ceil_log2(num_vars_total.max(1));
     let log_lambda = ceil_log2(LAMBDA);
 
     // Limb-decomposition self-consistency: `numlimb` and `numlimb_var`
@@ -748,7 +755,19 @@ impl IntegerModPCS {
   > {
     let num_vars = ceil_log2(n.max(1));
     params.validate(num_vars)?;
-    let (inner_ck, inner_vk) = Hyrax::setup(label, n, width);
+    // Hyrax CK must be sized for the *limb-split* polynomial: the
+    // input poly has `n` coefficients, but after limb-splitting each
+    // coefficient becomes `2^numlimb_var` slots. For numlimb_var=0
+    // (no-limb-split) this is `n` unchanged.
+    let inflated_n =
+      n.checked_shl(params.numlimb_var as u32)
+        .ok_or(SpartanError::InvalidInputLength {
+          reason: format!(
+            "n={n} * 2^numlimb_var={} overflows usize",
+            params.numlimb_var
+          ),
+        })?;
+    let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
     Ok((
       IntegerModCommitmentKey {
         inner: inner_ck,
@@ -784,7 +803,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       "default IntEvalParams derivation must satisfy the paper's bounds; \
          override with `setup_with_params` to use tighter parameters",
     );
-    let (inner_ck, inner_vk) = Hyrax::setup(label, n, width);
+    let inflated_n = n
+      .checked_shl(params.numlimb_var as u32)
+      .expect("n * 2^numlimb_var overflows usize");
+    let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
     (
       IntegerModCommitmentKey {
         inner: inner_ck,
@@ -889,8 +911,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // Partial-eval f_limb at the original `point` in Z_p, leaving the
     // last numlimb_var variables free. Bind the top variables (= the
     // original n_vars) one at a time.
-    let mut mle =
-      crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
+    let mut mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
     for r_i in point {
       mle.bind_poly_var_top(r_i);
     }
@@ -903,8 +924,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &eval.to_bytes_le(),
     );
 
-    let mut poly_lhs =
-      crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
+    let mut poly_lhs = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
     let mut poly_rhs =
       crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_at_int_r, monty);
     let (red_sc, r_k, final_claims) =
@@ -1235,8 +1255,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // Compute limb(r_k) by MLE-evaluating the public limb weight
     // polynomial at the sumcheck challenges.
     let limb_p = build_limb_weight_dynprime(params, &monty);
-    let mut limb_mle =
-      crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
+    let mut limb_mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
     for r in &r_k {
       limb_mle.bind_poly_var_top(r);
     }
@@ -1953,6 +1972,82 @@ mod tests {
     .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
+    )
+    .unwrap();
+  }
+
+  /// Step D4 end-to-end: real limb-splitting (`log_T < log_T_f` → `numlimb
+  /// = 2`, `numlimb_var = 1`). Each polynomial coefficient is split into
+  /// two 4-bit limbs; the F-PCS commits a polynomial of `2 · n = 32`
+  /// slots. The reduction sumcheck runs one round and binds `r_k` of
+  /// length 1; the IntEval body operates on `f_limb` at the extended
+  /// point `(int_r, int_r_k)`.
+  #[test]
+  fn prove_verify_roundtrips_with_limb_split() {
+    let num_vars = 4usize;
+    let n = 1usize << num_vars;
+
+    // log_T = 4 < log_T_f = 8 → numlimb = 2, numlimb_var = 1.
+    // k = 2 keeps soundness derivation feasible at this small λ-style
+    // setup. Coefficients < 2^8 fit in two 4-bit limbs.
+    let limb_params = IntEvalParams::derive(8, 4, 2, num_vars).expect("valid derived params");
+    assert_eq!(limb_params.numlimb, 2);
+    assert_eq!(limb_params.numlimb_var, 1);
+
+    let (ck, vk) =
+      IntegerModPCS::setup_with_params(b"limb-split-test", n, 256, limb_params).unwrap();
+    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
+
+    let dyn_params = small_dyn_params();
+    // Coefficients in [0, 2^8). The integer eval can grow large but
+    // mod p reduces to a clean Z_p value.
+    let poly: Vec<BigUint> = (0..n)
+      .map(|i| BigUint::from((i * 13 + 1) as u32 & 0xff))
+      .collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 2) % 37))
+      .collect();
+
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v = integer_mle_evaluate(&poly, &int_point);
+    let p = BigUint::from(37u32);
+    let eval = int_v
+      .mod_floor(&BigInt::from(p.clone()))
+      .to_biguint()
+      .unwrap();
+
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"limb-split", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &ck_eval,
+      &mut pt,
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+      &comm_eval,
+      &blind_eval,
+    )
+    .unwrap();
+    // The reduction sumcheck ran one round → one entry in
+    // reduction_round_polys.
+    assert_eq!(arg.reduction_round_polys.len(), 1);
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"limb-split", dyn_params);
     <MP as ModPCSEngineTrait<ME>>::verify(
       &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
     )
