@@ -252,18 +252,57 @@ size; promote into a phase plan when picked up.
   apples-to-apples; constraint count is the meaningful axis until we
   shape-match more carefully.
 
+- **Cross-cutting opportunity: batching at every layer.** Right now we
+  do nothing in batches — every commitment, every sumcheck, every
+  Hyrax opening goes through its own protocol invocation. This is a
+  large fraction of the Phase-2 overhead. Batching opportunities, in
+  order of (estimated) impact:
+
+  - **Batched Hyrax openings (biggest win).** Per Phase-2 SNARK we do
+    ~72 separate `Hyrax::prove` / `Hyrax::verify` round-trips (see the
+    cost attribution above). Many of them are at the *same point* on
+    *different commitments* (e.g. in step C, `a_{j-1}`, `a_j`, `b_j`
+    are all opened at γ-related points), or at *different points* on
+    the *same commitment* (the `s` final-remainder opens of `a_t`,
+    one per prime). Both forms admit standard batching via random
+    linear combinations of the eval claims, reducing `O(s × t)` opens
+    to `O(s + t)` or even `O(1)` per oracle. Per-prime work is
+    embarrassingly parallel too. Combined: probably ~5× prove speedup.
+
+  - **Batched polynomial commitments.** The SNARK does separate Hyrax
+    commits to `w` and `q`; IntEval step C does separate commits to
+    `a_j` and `b_j` per iteration. A multi-row Hyrax commit (laying
+    polynomials side by side and committing once) saves redundant
+    setup work and amortizes MSM. Modest perf win, bigger proof-size
+    win.
+
+  - **Batched sumchecks.** The outer cubic SC and inner quadratic SC
+    run sequentially. Standard SNARK practice: run multiple
+    independent sumcheck instances in parallel via RLC of the running
+    claims. Less straightforward when the integrands have different
+    degree (cubic vs quadratic) — usually you reduce both to a single
+    common-degree sumcheck via a degree-lifting step. Plain Spartan
+    already does some of this; we don't. Worth a small writeup of
+    what's available before implementing.
+
+  - **Batched range checks (Phase-3 step D when it lands).** The
+    paper's IntEval needs range checks on every `a_j` and `b_j` (s × t
+    pairs). The paper batches them via a single `rbatchrange{s × t}^2`
+    argument; we should match that. Affects Phase-3 step D's design
+    rather than current code.
+
+  Most of these change the *protocol structure* rather than just hot-
+  path inlining, so they need to land carefully against the IntEval
+  paper's soundness analysis. Worth doing once Phase 3 step D is in
+  place; doing them piecemeal before D risks rework.
+
 - **`IntEvalEvalArg` is huge under default params.** Step C produces, per
   prove call: `s` chains × `t` iterations × 2 polynomial Hyrax commits, plus
   `s × (3t + 1)` Hyrax openings (each carries `f_y`, `blind_eval`, and a
-  Hyrax eval-argument). For default params (s≈10, t depends on n/k), this
-  grows fast. **Fix candidates:**
-  - Batched Hyrax openings: a single multi-point open per oracle instead of
-    one Hyrax::prove per (i, j, oracle).
-  - Re-randomize across primes: many of the openings are at the same γ-prefix
-    but on different oracles — a single random-linear-combination open could
-    replace 3 of them per iteration.
-  - Compact the BigInt `int_v_prime` serialization (currently sign byte +
-    8-byte LE length + LE magnitude; could be tighter).
+  Hyrax eval-argument). The batching items above also shrink the proof
+  size. Plus a minor item: compact the `BigInt int_v_prime` serialization
+  (currently sign byte + 8-byte LE length + LE magnitude; could be
+  tighter).
 
 - **Per-`p_i` matrix-style work is not parallelized.** The `s` chains are
   embarrassingly parallel — each is independent until γ is sampled. **Fix:**
