@@ -770,9 +770,29 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     r: &Self::Blind,
     is_small: bool,
   ) -> Result<Self::Commitment, SpartanError> {
-    // TODO Phase 3 step D: range-check |v[i]| < B_f before committing.
-    // For now, cast directly. Soundness relies on the bound being met.
-    let v_fq: Vec<t256::Scalar> = v.iter().map(biguint_to_scalar).collect();
+    // Limb-split the integer-valued polynomial: each coefficient
+    // becomes `numlimb` limbs each in `[0, T)`. For `numlimb = 1`
+    // (no-limb-split mode) this returns `v` unchanged. The underlying
+    // F PCS commits the limb polynomial, which has `numlimb * v.len()`
+    // (or `2^numlimb_var * v.len()` after padding) coefficients.
+    //
+    // Stopgap: size-1 commits are *eval-value* commits issued by the
+    // SNARK driver (e.g. `comm_eval_w`) to satisfy the trait's
+    // `comm_eval` slot — which `IntEvalModPCS::prove`/`verify` actually
+    // ignore. The single value may be any F element, not bounded by
+    // `T_f`. Skip limb-splitting in this case so a 128-bit Z_p eval
+    // doesn't trip the bound check. Proper fix: drop `comm_eval` /
+    // `blind_eval` from the trait (unused by IntEvalModPCS). Tracked
+    // in followups.
+    //
+    // TODO Phase 3 step D5: per-limb range check `|limb| < T`.
+    let params = &ck.params;
+    let v_limbs = if v.len() == 1 {
+      v.to_vec()
+    } else {
+      limb_split_polynomial(v, params.log_t, params.log_t_f)
+    };
+    let v_fq: Vec<t256::Scalar> = v_limbs.iter().map(biguint_to_scalar).collect();
     let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, is_small)?;
     Ok(IntEvalCommitment { inner })
   }

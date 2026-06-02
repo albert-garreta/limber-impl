@@ -331,11 +331,56 @@ size; promote into a phase plan when picked up.
 
 ### Correctness boundaries / TODOs
 
-- **Range check on commit is not implemented.** Phase-3 step D. Without it,
-  IntEvalModPCS soundness depends on the application enforcing the witness
-  bound. The non-negative witness assumption + the `T_f` parameter define
-  the bound; we need a sumcheck-based bit-decomposition or lookup argument
-  to enforce it.
+- **`comm_eval` / `blind_eval` are dead weight on the Mod-PCS trait
+  surface for `IntEvalModPCS`.** The `prove`/`verify` bodies ignore
+  them (`_comm_eval`, `_blind_eval`). The SNARK driver creates them
+  anyway via `M::ModPCS::commit(&ck_s, &[eval_value], …)`, which has
+  two awkward consequences:
+
+  - The "eval value" can be any F element (a Z_p eval ~128 bits) but
+    `Mod-PCS::commit` is supposed to commit *integer-bounded* values
+    (`< T_f`). Step D2 added a `v.len() == 1` stopgap that skips
+    limb-splitting for single-value commits so the assertion doesn't
+    trip; the stopgap muddies the semantic of `commit` ("polynomial of
+    bounded integers" or "single field element").
+  - We pay a Hyrax commit (one MSM) per opening for a value that
+    isn't actually verified through the trait's `comm_eval` channel.
+
+  **Fix:** drop `comm_eval` and `blind_eval` from the `prove`/`verify`
+  trait surface (or move them behind a non-default associated type so
+  hash-based / non-Pedersen Mod-PCS impls don't have to fake them).
+  Ripples through `TrivialModPCS` (which does use them via the
+  underlying `E::PCS::prove`) and the SNARK driver. Once dropped, the
+  `v.len() == 1` stopgap in `commit` goes away. Medium.
+
+- **Limb-splitting + range check on limbs not implemented (Phase-3 step
+  D).** Without limb-splitting we're stuck at `T = T_f` (the bound on
+  polynomial coefficients equals the bound on each "limb"), which keeps
+  the Partial Eval Norm Bound `2^k · P^k · max(T, P) ≤ (q-P)/2`
+  reachable only for small `T_f`. To soundly support large-norm
+  polynomials we need both pieces from the paper §4.1–4.2 together:
+
+  1. **Limb-split commit.** Split integer `f` with bound `T_f` into a
+     polynomial `f_limb` of size `2^(num_vars + numlimb_var)` where
+     each slot holds a limb in `[0, T)` and `numlimb = ⌈log_T(T_f)⌉`.
+     Commit `f_limb` via the underlying F PCS.
+  2. **Reduction sumcheck at eval.** The Mod-PCS eval protocol gains
+     a sumcheck that reduces an eval claim about `f` to an eval claim
+     about `f_limb`: `sum_{k ∈ {0,1}^numlimb_var} limb(k) · f_limb
+     (int_r, k) ≡_p int_y`, where `limb` is the public weight vector
+     `[1, T, T^2, …, T^{numlimb-1}]`.
+  3. **Batch range check on limbs.** Each committed limb must satisfy
+     `|limb| < T`; the paper batches all `s × t` limbs across all chains
+     into one `rbatchrange{s·t}^2` argument. Without this the limb-
+     split protocol is still unsound (prover can put arbitrary values
+     in limbs).
+
+  Step D split into 5 sub-tasks: D1 (numlimb derivation + LimbSplit
+  helper), D2 (commit refactor, numlimb=1 no-op), D3 (reduction
+  sumcheck, numlimb=1 no-op), D4 (enable numlimb > 1 + tests), D5
+  (batch range check argument). D5 is the algorithmically heaviest;
+  worth doing the range-check batching together with the broader
+  batching cross-cutting refactor (see Performance / structure above).
 
 - **`prove_with_iter` chain commitments aren't bound to `p_i`.** The
   transcript absorbs `comm_a_shifted` / `comm_b_shifted` but not the prime
