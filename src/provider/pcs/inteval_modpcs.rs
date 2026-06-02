@@ -428,6 +428,68 @@ fn extract_p(point: &[crate::dyn_prime::DynPrime<4>]) -> Result<BigUint, Spartan
   Ok(BigUint::from_bytes_le(bytes.as_slice()))
 }
 
+/// Number of limbs needed to represent any value bounded by `T_f`
+/// using limbs each bounded by `T`: `numlimb = ⌈log_T(T_f)⌉ = ⌈log_t_f
+/// / log_t⌉`. Returns `1` for the no-limb-split degenerate case
+/// (`log_t == log_t_f`).
+pub fn numlimb(log_t_f: usize, log_t: usize) -> usize {
+  assert!(log_t > 0, "log_t must be positive");
+  log_t_f.div_ceil(log_t).max(1)
+}
+
+/// Bit-width of the limb index — `⌈log_2 numlimb⌉`. `0` if
+/// `numlimb == 1` (no extra polynomial variables needed).
+pub fn numlimb_var(numlimb: usize) -> usize {
+  ceil_log2(numlimb.max(1))
+}
+
+/// Split a single `BigUint` value `v ∈ [0, 2^log_t_f)` into `numlimb`
+/// limbs each in `[0, 2^log_t)`, base-`T` little-endian: `v = sum_i
+/// T^i · limbs[i]`. Asserts `v < 2^(numlimb · log_t)`; values that
+/// exceed the declared bound `T_f` are caller errors (Phase 3 step D5
+/// adds the soundness-grade range check).
+fn split_value_into_limbs(v: &BigUint, log_t: usize, numlimb: usize) -> Vec<BigUint> {
+  let t = BigUint::one() << log_t;
+  let mut out = Vec::with_capacity(numlimb);
+  let mut rem = v.clone();
+  for _ in 0..numlimb {
+    let (q, r) = (&rem / &t, &rem % &t);
+    out.push(r);
+    rem = q;
+  }
+  debug_assert!(
+    rem.is_zero(),
+    "value 0x{:x} exceeds bound 2^{}",
+    v,
+    numlimb * log_t
+  );
+  out
+}
+
+/// Limb-split a multilinear polynomial. Input `poly` has length `2^n`;
+/// output has length `2^n · 2^numlimb_var` where `numlimb_var =
+/// ⌈log_2 numlimb⌉`. Layout: `f_limb[x · 2^numlimb_var + k]` is the
+/// `k`-th limb of `f[x]` for `k < numlimb`, else `0`. The original
+/// `n` variables occupy the top bits of the combined index, limb
+/// variables the bottom bits — matches `EqPolynomial::evals_from_points`'s
+/// convention so the limb-reduction sumcheck (step D3) treats the
+/// limb dimension as the *last* variables.
+fn limb_split_polynomial(poly: &[BigUint], log_t: usize, log_t_f: usize) -> Vec<BigUint> {
+  let numlimb = numlimb(log_t_f, log_t);
+  let numlimb_var = numlimb_var(numlimb);
+  let stride = 1usize << numlimb_var;
+  let mut out = vec![BigUint::zero(); poly.len() * stride];
+  for (x, v) in poly.iter().enumerate() {
+    let limbs = split_value_into_limbs(v, log_t, numlimb);
+    for (k, limb) in limbs.into_iter().enumerate() {
+      out[x * stride + k] = limb;
+    }
+    // Slots [numlimb..stride) stay zero (padding when `numlimb` isn't a
+    // power of two).
+  }
+  out
+}
+
 /// Truncated (toward-zero) divmod. Returns `(q, r)` with `q · d + r = g`
 /// and `sign(r) = sign(g)` (or `r = 0`); `|r| < d`. Used by IntEval's
 /// partial-evaluation decomposition for *symmetric* remainder/quotient,
@@ -1270,6 +1332,94 @@ mod tests {
         p.log_t_f, p.k, num_vars, p.log_p, p.s
       );
     }
+  }
+
+  /// `numlimb` / `numlimb_var` sanity. Standard cases plus boundary.
+  #[test]
+  fn numlimb_basic() {
+    assert_eq!(numlimb(32, 32), 1);
+    assert_eq!(numlimb_var(1), 0);
+    assert_eq!(numlimb(32, 16), 2);
+    assert_eq!(numlimb_var(2), 1);
+    assert_eq!(numlimb(32, 8), 4);
+    assert_eq!(numlimb_var(4), 2);
+    assert_eq!(numlimb(32, 12), 3); // ceil(32/12) = 3
+    assert_eq!(numlimb_var(3), 2); // ceil(log_2 3) = 2 → pad to 4 slots
+    assert_eq!(numlimb(33, 16), 3); // log_t_f not divisible by log_t
+  }
+
+  /// `split_value_into_limbs` is invertible: reconstruct from limbs.
+  #[test]
+  fn split_value_round_trips() {
+    let log_t = 8usize;
+    let t = BigUint::one() << log_t;
+    for (v, log_t_f) in [
+      (BigUint::from(0u32), 32),
+      (BigUint::from(1u32), 32),
+      (BigUint::from(0xdeadbeefu32), 32),
+      (BigUint::from(0xffffu32), 16),
+      (BigUint::from(0xffu32), 8),
+      (BigUint::from(0xffff_ffff_ffff_ffffu64), 64),
+    ] {
+      let nl = numlimb(log_t_f, log_t);
+      let limbs = split_value_into_limbs(&v, log_t, nl);
+      assert_eq!(limbs.len(), nl);
+      for limb in &limbs {
+        assert!(limb < &t, "limb 0x{:x} exceeds 2^{}", limb, log_t);
+      }
+      // Reconstruct: sum_i T^i · limbs[i].
+      let mut acc = BigUint::zero();
+      for limb in limbs.iter().rev() {
+        acc = &acc * &t + limb;
+      }
+      assert_eq!(acc, v);
+    }
+  }
+
+  /// `limb_split_polynomial` no-op when `log_t == log_t_f` (numlimb=1).
+  /// In that case the output equals the input (only one limb, no
+  /// padding since `numlimb_var = 0` → stride = 1).
+  #[test]
+  fn limb_split_no_op_when_log_t_eq_log_t_f() {
+    let poly: Vec<BigUint> = (0..8u32).map(BigUint::from).collect();
+    let out = limb_split_polynomial(&poly, 32, 32);
+    assert_eq!(out, poly);
+  }
+
+  /// `limb_split_polynomial` with `numlimb = 2` (T = 2^8, T_f = 2^16):
+  /// each coefficient becomes two limbs `(low, high)`, laid out in
+  /// adjacent slots. Recoverable by `low + 256 · high == original`.
+  #[test]
+  fn limb_split_pairs_of_limbs() {
+    let poly = vec![
+      BigUint::from(0x0000u32),
+      BigUint::from(0x00ffu32),
+      BigUint::from(0xff00u32),
+      BigUint::from(0xabcdu32),
+    ];
+    let out = limb_split_polynomial(&poly, 8, 16);
+    assert_eq!(out.len(), 8); // 4 · 2 slots
+
+    for (x, orig) in poly.iter().enumerate() {
+      let lo = &out[x * 2];
+      let hi = &out[x * 2 + 1];
+      let reconstructed = lo + BigUint::from(256u32) * hi;
+      assert_eq!(&reconstructed, orig, "slot {x}");
+    }
+  }
+
+  /// `limb_split_polynomial` with non-power-of-two `numlimb`: pad
+  /// the missing slots with zero.
+  #[test]
+  fn limb_split_pads_to_power_of_two() {
+    let poly = vec![BigUint::from(0x0afbcu32)]; // 20 bits
+    let out = limb_split_polynomial(&poly, 8, 20); // numlimb = 3, stride = 4
+    assert_eq!(out.len(), 4);
+    // 0x0afbc = 0xbc + 0xaf · 256 + 0x00 · 65536.
+    assert_eq!(out[0], BigUint::from(0xbcu32));
+    assert_eq!(out[1], BigUint::from(0xafu32));
+    assert_eq!(out[2], BigUint::from(0x00u32)); // top limb (within numlimb)
+    assert_eq!(out[3], BigUint::from(0u32)); // padding slot
   }
 
   /// Truncated divmod gives symmetric `(q, r)`: `divmod(-g) = (-q, -r)`.
