@@ -514,6 +514,37 @@ fn split_value_into_limbs(v: &BigUint, log_t: usize, numlimb: usize) -> Vec<BigU
   out
 }
 
+/// Build the public limb-weight polynomial `limb` as a `DynPrime<4>`
+/// MLE of size `2^numlimb_var`: `limb[k] = T^k` for `k < numlimb`, else
+/// `0` (padding when `numlimb` isn't a power of two). Used by the
+/// Phase-3 step D3 reduction sumcheck integrand
+/// `sum_k limb(k) · f_limb(int_r, k)`.
+fn build_limb_weight_dynprime(
+  params: &IntEvalParams,
+  monty: &crypto_bigint::modular::FixedMontyParams<4>,
+) -> Vec<crate::dyn_prime::DynPrime<4>> {
+  let stride = 1usize << params.numlimb_var;
+  let t = BigUint::one() << params.log_t;
+  let mut out = Vec::with_capacity(stride);
+  let mut pow = BigUint::one();
+  for k in 0..stride {
+    if k < params.numlimb {
+      out.push(
+        <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+          monty,
+          &pow.to_bytes_le(),
+        ),
+      );
+      pow = &pow * &t;
+    } else {
+      out.push(<crate::dyn_prime::DynPrime<4> as SumcheckField>::zero(
+        monty,
+      ));
+    }
+  }
+  out
+}
+
 /// Limb-split a multilinear polynomial. Input `poly` has length `2^n`;
 /// output has length `2^n · 2^numlimb_var` where `numlimb_var =
 /// ⌈log_2 numlimb⌉`. Layout: `f_limb[x · 2^numlimb_var + k]` is the
@@ -826,28 +857,114 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     _blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let params = &ck.params;
-    let num_vars = point.len();
-    let with_iter = num_vars > params.k;
+    let monty = point
+      .first()
+      .map(|p| *p.params())
+      .ok_or(SpartanError::InternalError {
+        reason: "IntegerModPCS::prove: empty point".to_string(),
+      })?;
 
-    // 1. int_v' = f(int_r) over Z.
+    // 0. Limb-split f → f_limb. For numlimb=1 this is a literal pass-
+    //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
+    //    coefficients (and 2^numlimb_var slots per original coefficient,
+    //    padded with zero if numlimb isn't a power of two).
+    let f_limb = limb_split_polynomial(poly, params.log_t, params.log_t_f);
+
+    // 1. Reduction sumcheck (Phase-3 step D3): reduce the eval claim
+    //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
+    //    point `(int_r, r_k)` where `r_k` are the sumcheck challenges.
+    //    Integrand: `limb(k) · f_limb(int_r, k)`, summed over k ∈
+    //    {0,1}^numlimb_var. For numlimb_var = 0 the sumcheck has zero
+    //    rounds, returns `r_k = []`, and the recovered eval equals
+    //    the input `eval` directly (limb(empty) = T^0 = 1).
+    let f_limb_p: Vec<crate::dyn_prime::DynPrime<4>> = f_limb
+      .iter()
+      .map(|b| {
+        <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+          &monty,
+          &b.to_bytes_le(),
+        )
+      })
+      .collect();
+    // Partial-eval f_limb at the original `point` in Z_p, leaving the
+    // last numlimb_var variables free. Bind the top variables (= the
+    // original n_vars) one at a time.
+    let mut mle =
+      crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
+    for r_i in point {
+      mle.bind_poly_var_top(r_i);
+    }
+    let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<4>> = mle.into_vec();
+    debug_assert_eq!(f_limb_at_int_r.len(), 1 << params.numlimb_var);
+
+    let limb_p = build_limb_weight_dynprime(params, &monty);
+    let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+      &monty,
+      &eval.to_bytes_le(),
+    );
+
+    let mut poly_lhs =
+      crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
+    let mut poly_rhs =
+      crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_at_int_r, monty);
+    let (red_sc, r_k, final_claims) =
+      crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine>::prove_quad(
+        &eval_p,
+        params.numlimb_var,
+        &mut poly_lhs,
+        &mut poly_rhs,
+        transcript,
+      )?;
+    // `final_claims = [limb(r_k), f_limb(int_r, r_k)]`. The integer-side
+    // IntEval will prove `int_v' ≡ f_limb(int_r, r_k) (mod p)`, so the
+    // "eval claim" handed to the IntEval body is the second component.
+    let f_eval_p = final_claims[1];
+
+    // 2. Extend the integer point with r_k (canonical < p integers).
     let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
-    let int_v_prime = integer_mle_evaluate(poly, &int_point);
+    let r_k_int: Vec<BigUint> = r_k.iter().map(dyn_to_biguint).collect();
+    let int_point_ext: Vec<BigUint> = int_point.iter().chain(r_k_int.iter()).cloned().collect();
 
-    // 2. Sanity: eval ≡ int_v' (mod p).
+    // 3. int_v' = f_limb at the extended point, over Z.
+    let int_v_prime = integer_mle_evaluate(&f_limb, &int_point_ext);
+
+    // 4. Sanity: f_eval_p ≡ int_v' (mod p). For numlimb_var=0, f_eval_p
+    //    == eval and this matches the pre-D3 check.
     let p = extract_p(point)?;
     let int_v_mod_p_u = int_v_prime
       .mod_floor(&BigInt::from(p.clone()))
       .to_biguint()
       .expect("mod_floor by a positive divisor is non-negative");
-    if &int_v_mod_p_u != eval {
+    let f_eval_bu = BigUint::from_bytes_le(&f_eval_p.to_le_bytes());
+    if int_v_mod_p_u != f_eval_bu {
       return Err(SpartanError::InternalError {
-        reason: "IntegerModPCS::prove: eval ≠ int_v' mod p (prover bug)".to_string(),
+        reason: "IntegerModPCS::prove: f_limb(ext_point) ≠ int_v' mod p (prover bug)".to_string(),
       });
     }
 
-    // 3. Bind int_v' into the transcript.
+    // 5. Bind int_v' into the transcript.
     absorb_bigint(transcript, &int_v_prime);
 
+    // Extract round polys from the reduction sumcheck as a Serde-
+    // friendly BigUint payload for the verifier.
+    let reduction_round_polys: Vec<Vec<BigUint>> = red_sc
+      .compressed_polys
+      .iter()
+      .map(|cp| {
+        cp.coeffs_except_linear_term
+          .iter()
+          .map(dyn_to_biguint)
+          .collect()
+      })
+      .collect();
+
+    // From here on the chain prover operates on `f_limb` over the
+    // extended point. For numlimb_var=0 these match the pre-D3 `poly`
+    // / `point` exactly.
+    let int_point = int_point_ext;
+    let num_vars = point.len() + params.numlimb_var;
+    let with_iter = num_vars > params.k;
+    let poly = f_limb.as_slice();
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
 
     // 4. Phase 1: per prime, sample p_i, run all t iterations (if any),
@@ -1052,7 +1169,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     }
 
     Ok(IntEvalArgument {
-      reduction_round_polys: Vec::new(), // populated by step D3
+      reduction_round_polys,
       int_v_prime,
       chains,
     })
@@ -1069,31 +1186,95 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
     let params = &vk.params;
-    let num_vars = point.len();
-    let with_iter = num_vars > params.k;
-    let n = num_vars;
-    let k = params.k;
-    let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
+    let monty = point
+      .first()
+      .map(|p| *p.params())
+      .ok_or(SpartanError::InternalError {
+        reason: "IntegerModPCS::verify: empty point".to_string(),
+      })?;
 
     if arg.chains.len() != params.s {
       return Err(SpartanError::InvalidSumcheckProof);
     }
+    if arg.reduction_round_polys.len() != params.numlimb_var {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
 
-    // 1. eval ≡ int_v' (mod p).
+    // 1. Reduction sumcheck (Phase-3 step D3). Reconstruct the
+    //    SumcheckProof from the round polys carried by `arg`, run
+    //    `verify` with initial claim `eval` (the original Z_p eval
+    //    claim) and `numlimb_var` rounds. For `numlimb_var = 0` this
+    //    is a 0-round sumcheck: final_claim = eval, r_k = [].
+    let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+      &monty,
+      &eval.to_bytes_le(),
+    );
+    let red_sc_polys: Vec<
+      crate::polys_modp::univariate::CompressedUniPoly<crate::dyn_prime::DynPrime<4>>,
+    > = arg
+      .reduction_round_polys
+      .iter()
+      .map(|coeffs| crate::polys_modp::univariate::CompressedUniPoly {
+        coeffs_except_linear_term: coeffs
+          .iter()
+          .map(|b| {
+            <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+              &monty,
+              &b.to_bytes_le(),
+            )
+          })
+          .collect(),
+      })
+      .collect();
+    let red_sc = crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine> {
+      compressed_polys: red_sc_polys,
+    };
+    let (red_final_claim, r_k) =
+      red_sc.verify(eval_p, params.numlimb_var, 2, &monty, transcript)?;
+
+    // Compute limb(r_k) by MLE-evaluating the public limb weight
+    // polynomial at the sumcheck challenges.
+    let limb_p = build_limb_weight_dynprime(params, &monty);
+    let mut limb_mle =
+      crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
+    for r in &r_k {
+      limb_mle.bind_poly_var_top(r);
+    }
+    let limb_at_r_k = limb_mle.into_vec()[0];
+    let limb_inv = <crate::dyn_prime::DynPrime<4> as SumcheckField>::invert(&limb_at_r_k)
+      .ok_or(SpartanError::InvalidSumcheckProof)?;
+    let f_eval_p = red_final_claim * limb_inv;
+
+    // 2. Check int_v' ≡ f_eval_p (mod p).
     let p = extract_p(point)?;
     let int_v_mod_p_u = arg
       .int_v_prime
       .mod_floor(&BigInt::from(p.clone()))
       .to_biguint()
       .ok_or(SpartanError::InvalidSumcheckProof)?;
-    if &int_v_mod_p_u != eval {
+    let f_eval_bu = BigUint::from_bytes_le(&f_eval_p.to_le_bytes());
+    if int_v_mod_p_u != f_eval_bu {
       return Err(SpartanError::InvalidSumcheckProof);
     }
 
-    // 2. Re-derive transcript binding identically to the prover.
+    // 3. Bind int_v' into the transcript.
     absorb_bigint(transcript, &arg.int_v_prime);
 
-    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    // 4. Extend the integer point with r_k for the IntEval chain
+    //    verification.
+    let int_point_orig: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let r_k_int: Vec<BigUint> = r_k.iter().map(dyn_to_biguint).collect();
+    let int_point: Vec<BigUint> = int_point_orig
+      .iter()
+      .chain(r_k_int.iter())
+      .cloned()
+      .collect();
+
+    let num_vars = point.len() + params.numlimb_var;
+    let with_iter = num_vars > params.k;
+    let n = num_vars;
+    let k = params.k;
+    let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
 
     // 3. Phase 1: per chain, re-sample p_i, then for each iteration
     //    consume comm_a_shifted / comm_b_shifted from the arg and absorb
