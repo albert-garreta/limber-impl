@@ -3,7 +3,7 @@
 //! verify} on synthetic Integer-Mod-R1CS instances of varying size.
 //!
 //! Mirror of `benches/imod_spartan.rs` but parameterized over the Phase-2
-//! driver (T256DynPrimeEngine + IntEvalModPCS). Each constraint is one
+//! driver (T256DynPrimeEngine + IntegerModPCS). Each constraint is one
 //! independent modular multiplication `a · b = c + N · q`.
 //!
 //! Run with:

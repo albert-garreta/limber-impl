@@ -296,7 +296,7 @@ size; promote into a phase plan when picked up.
   paper's soundness analysis. Worth doing once Phase 3 step D is in
   place; doing them piecemeal before D risks rework.
 
-- **`IntEvalEvalArg` is huge under default params.** Step C produces, per
+- **`IntEvalArgument` is huge under default params.** Step C produces, per
   prove call: `s` chains × `t` iterations × 2 polynomial Hyrax commits, plus
   `s × (3t + 1)` Hyrax openings (each carries `f_y`, `blind_eval`, and a
   Hyrax eval-argument). The batching items above also shrink the proof
@@ -306,7 +306,7 @@ size; promote into a phase plan when picked up.
 
 - **Per-`p_i` matrix-style work is not parallelized.** The `s` chains are
   embarrassingly parallel — each is independent until γ is sampled. **Fix:**
-  rayon-parallelize the per-chain phase 1 loop in `IntEvalModPCS::prove`.
+  rayon-parallelize the per-chain phase 1 loop in `IntegerModPCS::prove`.
   Same for verify. Probably ~3-5× speedup on prove for default `s = 10`.
 
 - **`mle_evaluate_fq` walks the full eq-table every call.** Each γ-prefix
@@ -332,7 +332,7 @@ size; promote into a phase plan when picked up.
 ### Correctness boundaries / TODOs
 
 - **`comm_eval` / `blind_eval` are dead weight on the Mod-PCS trait
-  surface for `IntEvalModPCS`.** The `prove`/`verify` bodies ignore
+  surface for `IntegerModPCS`.** The `prove`/`verify` bodies ignore
   them (`_comm_eval`, `_blind_eval`). The SNARK driver creates them
   anyway via `M::ModPCS::commit(&ck_s, &[eval_value], …)`, which has
   two awkward consequences:
@@ -402,7 +402,7 @@ size; promote into a phase plan when picked up.
 
 ### Param derivation
 
-- **`IntEvalParams` defaults are baked into `IntEvalModPCS::setup` and
+- **`IntEvalParams` defaults are baked into `IntegerModPCS::setup` and
   the SNARK driver has no way to override them.** The trait-level setup
   uses `(DEFAULT_LOG_T_F = 32, DEFAULT_K = 7)` for any call. Three
   concrete problems with this:
@@ -420,7 +420,7 @@ size; promote into a phase plan when picked up.
      application should be able to make. We currently pick `k = ⌈log λ⌉`
      and that's that.
 
-  3. **No application path to set params.** `IntEvalModPCS::setup_with_params`
+  3. **No application path to set params.** `IntegerModPCS::setup_with_params`
      exists for the explicit-override case, but the SNARK driver
      (`IntModSpartanModpSNARK::setup`) doesn't expose it — it calls the
      shape's `commitment_key()` which calls the trait `setup` with the
@@ -449,7 +449,7 @@ size; promote into a phase plan when picked up.
   over which underlying F-PCS to use. Once we have multiple `ModEngine`s,
   consider generalizing — but probably not before then.
 
-- **No serialization tests for `IntEvalEvalArg`.** The struct includes
+- **No serialization tests for `IntEvalArgument`.** The struct includes
   `BigInt` (Sign + magnitude) and `Vec<HyraxCommitment>` etc; nothing
   exercises that the bincode roundtrip works. Add a smoke test.
 

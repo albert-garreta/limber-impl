@@ -14,7 +14,7 @@
 //   - step D: batch range check.
 #![allow(dead_code)]
 
-//! `IntEvalModPCS`: sound Mod-PCS for `T256DynPrimeEngine`, wrapping
+//! `IntegerModPCS`: sound Mod-PCS for `T256DynPrimeEngine`, wrapping
 //! Hyrax-over-T256 as the underlying F PCS. Implements the paper's
 //! IntEval protocol for integer polynomial evaluation at `Z_p` points.
 //!
@@ -309,14 +309,14 @@ fn ceil_log2(x: usize) -> usize {
 
 /// Mod-PCS commitment key wraps Hyrax's plus the IntEval parameters.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IntEvalCommitmentKey {
+pub struct IntegerModCommitmentKey {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   pub(crate) params: IntEvalParams,
 }
 
 /// Verifier key wraps Hyrax's plus the IntEval parameters.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IntEvalVerifierKey {
+pub struct IntegerModVerifierKey {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
   pub(crate) params: IntEvalParams,
 }
@@ -324,11 +324,11 @@ pub struct IntEvalVerifierKey {
 /// Commitment is just the underlying Hyrax commitment to the F-cast
 /// polynomial. The IntEval protocol runs entirely at eval time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IntEvalCommitment {
+pub struct IntegerModCommitment {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
 }
 
-impl TranscriptReprTrait for IntEvalCommitment {
+impl TranscriptReprTrait for IntegerModCommitment {
   fn to_transcript_bytes(&self) -> Vec<u8> {
     self.inner.to_transcript_bytes()
   }
@@ -336,7 +336,7 @@ impl TranscriptReprTrait for IntEvalCommitment {
 
 /// Blind delegates to Hyrax's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IntEvalBlind {
+pub struct IntegerModBlind {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
 }
 
@@ -385,12 +385,24 @@ pub struct ChainData {
   pub final_open: SmallPrimeOpening,
 }
 
-/// Evaluation argument: the prover-sent integer evaluation `int_v'` and
-/// one per-prime chain.
+/// Evaluation argument: the prover-sent integer evaluation `int_v'`,
+/// the reduction-sumcheck round polynomials (Phase-3 step D3), and one
+/// per-prime chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IntEvalEvalArg {
-  /// `int_v' = f(int_r)` as a signed integer. Negative values come from
-  /// `(1 - r_i)` factors in the multilinear chi.
+pub struct IntEvalArgument {
+  /// Per-round compressed univariate polynomial of the reduction
+  /// sumcheck `sum_k limb(k) · f_limb(int_r, k) ≡_p int_y`. Each inner
+  /// vector is the round poly's coefficients excluding the linear term,
+  /// stored as `BigUint` (canonical representatives mod `p`) so the
+  /// `IntEvalArgument` stays Serde-friendly without dragging
+  /// `SumcheckProof<T256DynPrimeEngine>` through serde plumbing.
+  /// `numlimb_var` entries total; empty when `numlimb_var = 0`
+  /// (no-limb-split mode, the reduction sumcheck is degenerate).
+  pub reduction_round_polys: Vec<Vec<BigUint>>,
+  /// `int_v' = f_limb(int_r, int_r_k)` as a signed integer. Negative
+  /// values come from `(1 - r_i)` factors in the multilinear chi. For
+  /// `numlimb_var = 0` this equals the integer evaluation of `f` at
+  /// `int_r`.
   pub int_v_prime: BigInt,
   /// One per small prime sampled from the transcript. Length matches
   /// `params.s`.
@@ -456,7 +468,7 @@ fn dyn_to_biguint(d: &crate::dyn_prime::DynPrime<4>) -> BigUint {
 /// modulus carried by the first component's `FixedMontyParams<4>`.
 fn extract_p(point: &[crate::dyn_prime::DynPrime<4>]) -> Result<BigUint, SpartanError> {
   let p0 = point.first().ok_or(SpartanError::InternalError {
-    reason: "IntEvalModPCS: point must have at least one component to extract p".to_string(),
+    reason: "IntegerModPCS: point must have at least one component to extract p".to_string(),
   })?;
   let modulus = p0.params().modulus();
   // `modulus` is `&Odd<Uint<4>>`; `.as_ref()` gives the inner `Uint<4>`.
@@ -671,7 +683,7 @@ fn sample_small_prime<T: ByteTranscript>(
 
 /// Sound Mod-PCS for `T256DynPrimeEngine`. See module docs.
 #[derive(Clone)]
-pub struct IntEvalModPCS {
+pub struct IntegerModPCS {
   _phantom: PhantomData<()>,
 }
 
@@ -687,7 +699,7 @@ pub const DEFAULT_LOG_T_F: usize = 32;
 /// the paper's recommended `k = ⌈log λ⌉`.
 pub const DEFAULT_K: usize = 7;
 
-impl IntEvalModPCS {
+impl IntegerModPCS {
   /// Explicit-params setup. Validates the params against `num_vars =
   /// log_2(n)` so caller-supplied configurations can't bypass the
   /// IntEval soundness bounds.
@@ -707,11 +719,11 @@ impl IntEvalModPCS {
     params.validate(num_vars)?;
     let (inner_ck, inner_vk) = Hyrax::setup(label, n, width);
     Ok((
-      IntEvalCommitmentKey {
+      IntegerModCommitmentKey {
         inner: inner_ck,
         params: params.clone(),
       },
-      IntEvalVerifierKey {
+      IntegerModVerifierKey {
         inner: inner_vk,
         params,
       },
@@ -719,12 +731,12 @@ impl IntEvalModPCS {
   }
 }
 
-impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
-  type CommitmentKey = IntEvalCommitmentKey;
-  type VerifierKey = IntEvalVerifierKey;
-  type Commitment = IntEvalCommitment;
-  type Blind = IntEvalBlind;
-  type EvaluationArgument = IntEvalEvalArg;
+impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
+  type CommitmentKey = IntegerModCommitmentKey;
+  type VerifierKey = IntegerModVerifierKey;
+  type Commitment = IntegerModCommitment;
+  type Blind = IntegerModBlind;
+  type EvaluationArgument = IntEvalArgument;
 
   /// Trait-driven setup: derive `IntEvalParams` from the application
   /// defaults `(DEFAULT_LAMBDA, DEFAULT_LOG_T_F)` and the polynomial
@@ -743,11 +755,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     );
     let (inner_ck, inner_vk) = Hyrax::setup(label, n, width);
     (
-      IntEvalCommitmentKey {
+      IntegerModCommitmentKey {
         inner: inner_ck,
         params: params.clone(),
       },
-      IntEvalVerifierKey {
+      IntegerModVerifierKey {
         inner: inner_vk,
         params,
       },
@@ -759,7 +771,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
   }
 
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
-    IntEvalBlind {
+    IntegerModBlind {
       inner: Hyrax::blind(&ck.inner, n),
     }
   }
@@ -778,11 +790,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     //
     // Stopgap: size-1 commits are *eval-value* commits issued by the
     // SNARK driver (e.g. `comm_eval_w`) to satisfy the trait's
-    // `comm_eval` slot — which `IntEvalModPCS::prove`/`verify` actually
+    // `comm_eval` slot — which `IntegerModPCS::prove`/`verify` actually
     // ignore. The single value may be any F element, not bounded by
     // `T_f`. Skip limb-splitting in this case so a 128-bit Z_p eval
     // doesn't trip the bound check. Proper fix: drop `comm_eval` /
-    // `blind_eval` from the trait (unused by IntEvalModPCS). Tracked
+    // `blind_eval` from the trait (unused by IntegerModPCS). Tracked
     // in followups.
     //
     // TODO Phase 3 step D5: per-limb range check `|limb| < T`.
@@ -794,7 +806,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
     };
     let v_fq: Vec<t256::Scalar> = v_limbs.iter().map(biguint_to_scalar).collect();
     let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, is_small)?;
-    Ok(IntEvalCommitment { inner })
+    Ok(IntegerModCommitment { inner })
   }
 
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError> {
@@ -829,7 +841,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
       .expect("mod_floor by a positive divisor is non-negative");
     if &int_v_mod_p_u != eval {
       return Err(SpartanError::InternalError {
-        reason: "IntEvalModPCS::prove: eval ≠ int_v' mod p (prover bug)".to_string(),
+        reason: "IntegerModPCS::prove: eval ≠ int_v' mod p (prover bug)".to_string(),
       });
     }
 
@@ -1039,7 +1051,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntEvalModPCS {
       });
     }
 
-    Ok(IntEvalEvalArg {
+    Ok(IntEvalArgument {
+      reduction_round_polys: Vec::new(), // populated by step D3
       int_v_prime,
       chains,
     })
@@ -1342,7 +1355,7 @@ mod tests {
   use crate::traits::transcript::TranscriptEngineTrait;
 
   type ME = T256DynPrimeEngine;
-  type MP = IntEvalModPCS;
+  type MP = IntegerModPCS;
   type DP = DynPrime<4>;
 
   /// Setup + commit round-trip: an IntEval-committed polynomial commits
@@ -1565,7 +1578,7 @@ mod tests {
   fn setup_with_params_round_trips_overrides() {
     let n = 16usize;
     let p = IntEvalParams::derive_no_limb_split(DEFAULT_LOG_T_F, DEFAULT_K, ceil_log2(n)).unwrap();
-    let (_ck, _vk) = IntEvalModPCS::setup_with_params(b"override", n, 256, p).unwrap();
+    let (_ck, _vk) = IntegerModPCS::setup_with_params(b"override", n, 256, p).unwrap();
 
     // Bad params: zero `s` makes soundness_1 fail trivially.
     let bad = IntEvalParams {
@@ -1577,7 +1590,7 @@ mod tests {
       numlimb: 1,
       numlimb_var: 0,
     };
-    let err = IntEvalModPCS::setup_with_params(b"override", n, 256, bad).unwrap_err();
+    let err = IntegerModPCS::setup_with_params(b"override", n, 256, bad).unwrap_err();
     assert!(matches!(err, SpartanError::InvalidInputLength { .. }));
   }
 
@@ -1715,7 +1728,7 @@ mod tests {
     // `derive` picks the largest valid log_p and the smallest s.
     let small_params =
       IntEvalParams::derive_no_limb_split(8, 2, num_vars).expect("valid derived params");
-    let (ck, vk) = IntEvalModPCS::setup_with_params(b"inteval-iter", n, 256, small_params).unwrap();
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"inteval-iter", n, 256, small_params).unwrap();
     let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();

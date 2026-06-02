@@ -141,9 +141,9 @@ impl SumcheckEngine for T256DynPrimeEngine {
 }
 
 impl ModEngine for T256DynPrimeEngine {
-  // Phase-3 step B: sound IntEvalModPCS (small-prime fingerprinting +
+  // Phase-3 step B: sound IntegerModPCS (small-prime fingerprinting +
   // Hyrax-T256 underneath).
-  type ModPCS = crate::provider::pcs::inteval_modpcs::IntEvalModPCS;
+  type ModPCS = crate::provider::pcs::integer_modpcs::IntegerModPCS;
 
   /// Bootstrap params: smallest valid odd-modulus `FixedMontyParams<4>`
   /// (modulus = 3). Used only for transcript construction before the
