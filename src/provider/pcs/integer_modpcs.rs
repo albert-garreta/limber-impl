@@ -498,6 +498,70 @@ pub fn numlimb_var(numlimb: usize) -> usize {
   ceil_log2(numlimb.max(1))
 }
 
+/// Decompose a `BigUint` value `v ∈ [0, 2^num_bits)` into its
+/// little-endian bit representation. Output `bits[i] ∈ {0, 1}` with
+/// `v = sum_i 2^i · bits[i]`. Asserts `v < 2^num_bits`; values that
+/// exceed the bound are caller errors. Used by the Phase-3 step D5
+/// batch range-check arguments to prove `value < 2^num_bits` via a
+/// sumcheck on bit constraints + value reconstruction.
+fn bit_decompose_value(v: &BigUint, num_bits: usize) -> Vec<u8> {
+  let mut out = Vec::with_capacity(num_bits);
+  let bytes = v.to_bytes_le();
+  for i in 0..num_bits {
+    let byte_idx = i / 8;
+    let bit_in_byte = i % 8;
+    let bit = if byte_idx < bytes.len() {
+      (bytes[byte_idx] >> bit_in_byte) & 1
+    } else {
+      0
+    };
+    out.push(bit);
+  }
+  debug_assert!(
+    bit_decompose_check_no_overflow(&bytes, num_bits),
+    "value 0x{:x} exceeds bound 2^{}",
+    v,
+    num_bits
+  );
+  out
+}
+
+/// Helper for `bit_decompose_value`'s debug_assert: checks that the
+/// LE `bytes` representation has zero bits above `num_bits`.
+fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
+  let cutoff_byte = num_bits / 8;
+  let cutoff_bit = num_bits % 8;
+  for (i, b) in bytes.iter().enumerate() {
+    match i.cmp(&cutoff_byte) {
+      std::cmp::Ordering::Less => {}
+      std::cmp::Ordering::Equal => {
+        if cutoff_bit < 8 && (*b >> cutoff_bit) != 0 {
+          return false;
+        }
+      }
+      std::cmp::Ordering::Greater => {
+        if *b != 0 {
+          return false;
+        }
+      }
+    }
+  }
+  true
+}
+
+/// Flatten a batch of values into a single bit polynomial of length
+/// `values.len() * num_bits`, with each value's bits stored
+/// contiguously in little-endian order: `bits[i * num_bits + b]` is the
+/// `b`-th bit of `values[i]`. Used as the witness polynomial of the
+/// batched range-check sumcheck (step D5).
+fn bit_decompose_polynomial(values: &[BigUint], num_bits: usize) -> Vec<u8> {
+  let mut out = Vec::with_capacity(values.len() * num_bits);
+  for v in values {
+    out.extend(bit_decompose_value(v, num_bits));
+  }
+  out
+}
+
 /// Split a single `BigUint` value `v ∈ [0, 2^log_t_f)` into `numlimb`
 /// limbs each in `[0, 2^log_t)`, base-`T` little-endian: `v = sum_i
 /// T^i · limbs[i]`. Asserts `v < 2^(numlimb · log_t)`; values that
@@ -1632,6 +1696,51 @@ mod tests {
     assert_eq!(numlimb(32, 12), 3); // ceil(32/12) = 3
     assert_eq!(numlimb_var(3), 2); // ceil(log_2 3) = 2 → pad to 4 slots
     assert_eq!(numlimb(33, 16), 3); // log_t_f not divisible by log_t
+  }
+
+  /// `bit_decompose_value` is invertible by `sum_i 2^i · bit[i]`.
+  #[test]
+  fn bit_decompose_round_trips() {
+    for (v, num_bits) in [
+      (BigUint::from(0u32), 8),
+      (BigUint::from(1u32), 1),
+      (BigUint::from(0xffu32), 8),
+      (BigUint::from(0xabcdu32), 16),
+      (BigUint::from(0xdeadbeefu32), 32),
+      (BigUint::from(0xffff_ffff_ffff_ffffu64), 64),
+      (BigUint::from(0x7fff_ffffu32), 31), // odd bit count, top-bit-zero
+    ] {
+      let bits = bit_decompose_value(&v, num_bits);
+      assert_eq!(bits.len(), num_bits);
+      for b in &bits {
+        assert!(*b == 0 || *b == 1);
+      }
+      let mut acc = BigUint::zero();
+      for (i, b) in bits.iter().enumerate() {
+        if *b == 1 {
+          acc += BigUint::one() << i;
+        }
+      }
+      assert_eq!(acc, v, "decomp of 0x{v:x} doesn't round-trip");
+    }
+  }
+
+  /// `bit_decompose_polynomial` lays out `values.len() · num_bits`
+  /// bits contiguously, with value `i`'s bits in slots `[i·num_bits,
+  /// (i+1)·num_bits)`.
+  #[test]
+  fn bit_decompose_polynomial_layout() {
+    let values = vec![
+      BigUint::from(0b1010u32),
+      BigUint::from(0b0011u32),
+      BigUint::from(0b1100u32),
+    ];
+    let bits = bit_decompose_polynomial(&values, 4);
+    assert_eq!(bits.len(), 12);
+    // LE order: value[0] = 0b1010 = bits [0, 1, 0, 1]
+    assert_eq!(&bits[0..4], &[0u8, 1, 0, 1]);
+    assert_eq!(&bits[4..8], &[1u8, 1, 0, 0]);
+    assert_eq!(&bits[8..12], &[0u8, 0, 1, 1]);
   }
 
   /// `split_value_into_limbs` is invertible: reconstruct from limbs.
