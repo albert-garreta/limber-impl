@@ -205,24 +205,34 @@ size; promote into a phase plan when picked up.
 
 ### Performance / structure
 
-- **Phase-2 prover is ~10× plain Spartan at the smallest shape.**
-  Bench numbers (Apple Silicon, default features, 2026-06-01) at
-  `(num_cons=2^6, num_vars=2^8)`:
+- **Phase-2 prover is ~17× plain Spartan at scale (12× verify).**
+  Bench sweep at `n_cons ∈ {2^6, 2^8, 2^10}` with `num_vars = 4·n_cons`
+  rounded up to next power of two (Apple Silicon, default features,
+  2026-06-01):
 
-  |                          | Setup | Prove | Verify |
-  |--------------------------|-------|-------|--------|
-  | Plain Spartan (p=q)      | 18ms  | 7.1ms | 5.5ms  |
-  | Phase-1 imod (p=q)       | 18ms  | 7.2ms | 6.7ms  |
-  | Phase-2 imod (p≠q)       | 18ms  | 73ms  | 73ms   |
+  | n_cons | Setup (P0/P2) | Prove (P0) | Prove (P2) | P2/P0 | Verify (P0) | Verify (P2) | P2/P0 |
+  |--------|---------------|------------|------------|-------|-------------|-------------|-------|
+  | 2^6    | 20 / 18 ms    | 7.1ms      | 75ms       | 10.6× | 5.5ms       | 76ms        | 13.9× |
+  | 2^8    | 19 / 19 ms    | 7.8ms      | 138ms      | 17.7× | 5.6ms       | 136ms       | 24.4× |
+  | 2^10   | 19 / 19 ms    | 12.8ms     | 223ms      | 17.4× | 6.2ms       | 168ms       | 27.0× |
 
-  Phase-1 imod is essentially indistinguishable from plain Spartan
-  (~22% verify overhead from the extra Q-poly opening) — the
-  [[feedback_imod_perf_target]] "small constant factor" is being met for
-  the `p=q` regime.
+  Observations:
+  - Setup is comparable across all three sizes (Hyrax-T256 setup
+    dominates, ~19ms).
+  - Phase-2 prove ratio grew then stabilized (10.6× → 17.7× → 17.4×).
+    The "constant factor" target is roughly 17× at the larger sizes.
+  - Verify ratio still climbing (13.9× → 24× → 27×). Phase-2 verify
+    redoes all `s × t` chain Hyrax verifies; plain-Spartan verify is
+    just two Hyrax::verify calls so it stays nearly flat in this range.
+  - Plain Spartan is sub-linear here (7.1→7.8→12.8); per-constraint
+    cost crosses into linear-scaling territory around `n_cons = 2^10`.
+  - Phase 2 scales roughly linearly (prove grew 1.84× then 1.61× for
+    each 4× witness increase). Ratio likely peaks ~20-25× and stays
+    there.
 
-  Phase-2 imod at `(2^8, 2^10)`: prove 136ms, verify 132ms. Sub-linear
-  scaling from `2^6→2^8` (prove grew 1.86×, ratio to plain Spartan should
-  shrink at larger shapes since IntEval's overhead is more constant).
+  At `(2^10, 2^12)`, Phase-1 imod numbers aren't measured but should
+  match plain Spartan within ~5-10% (the P1 vs plain delta at `2^6`
+  was only ~20% on verify).
 
   Dominant Phase-2 costs (not yet attributed by profile): DynPrime
   arithmetic in the sumcheck (~3-5× per op vs t256::Scalar), `s`
