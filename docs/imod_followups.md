@@ -382,6 +382,58 @@ size; promote into a phase plan when picked up.
   worth doing the range-check batching together with the broader
   batching cross-cutting refactor (see Performance / structure above).
 
+- **D5 followups (recorded 2026-06-02 after D5.2 lands).**
+
+  - **Stack all range checks into one combined argument.** D5.2 ships
+    one batch range check on `f_limb`; D5.3 / D5.4 will add per-iter
+    range checks on `a_j_shifted` and `b_j_shifted`. The paper does
+    *one* batched range check across all of them via a single
+    `rbatchrange^2` argument: stack `f_limb ++ all a_j ++ all b_j`
+    into one bit polynomial and run *one* zerocheck + one
+    value-reconstruction sumcheck across the whole pile. Cuts the
+    number of bit-commit MSMs from `1 + s·t·2` to `1`, and the number
+    of sumchecks from `2·(1 + s·t·2)` to `2`. Requires a uniform bit
+    layout (pad each value to `max(log_T, log(2P), log(2q/P))` bits)
+    and a per-segment weight masking. Probably the single biggest
+    perf win in step D once D5.x lands.
+
+  - **Range check is semantically a commitment obligation but lives
+    eval-side.** The `f_limb < T` check could be in `commit()`
+    (binding `Commitment` to its bound), but that would require
+    seeding the range-check transcript from the commitment bytes,
+    locking the proof into the `Commitment` struct, and blocking the
+    future stacking-with-a_j/b_j optimization above. We chose to
+    keep it in eval-side under `IntEvalArgument` so all three range-
+    check categories share one transcript and can be stacked later.
+    If the paper's commit-binding gets stricter, or if we ever serve
+    commitments without an eval proof attached, revisit.
+
+  - **Range-check sub-transcript runs in `t256::Scalar` (the Hyrax
+    base field).** The bit polynomial is Hyrax-committed, so its
+    openings return `t256::Scalar` values; the sumcheck final claim
+    must be in the same field so the reconstruction `eq(r,τ) · (bit(r)² -
+    bit(r))` matches what the Hyrax opening produces. Concretely the
+    prover spawns a `Keccak256Transcript<T256HyraxEngine>` seeded
+    with bytes from the parent (DynPrime) transcript, runs the whole
+    range-check protocol there, and the parent is unaffected after
+    the seed squeeze. If the parent is changed downstream we must
+    absorb the BatchRangeCheck back into it.
+
+- **`IntegerModPCS` types leak the underlying PCS (Hyrax + T256).**
+  `SmallPrimeOpening`, `IterationOracles`, `BatchRangeCheck`, and the
+  helpers `hyrax_open_at` / `hyrax_verify_open` are all hardcoded to
+  `<Hyrax as PCSEngineTrait<T256HyraxEngine>>::{Commitment, Blind,
+  EvaluationArgument}` and `t256::Scalar`. The `ModPCSEngineTrait`
+  surface itself stays PCS-agnostic (associated types are opaque
+  `Self::Commitment` etc.), but inside `IntegerModPCS` the
+  implementation is Hyrax-only — a future KZH or KZG-backed integer
+  Mod-PCS would need to duplicate most of `integer_modpcs.rs`.
+  D5.2–D5.4 marked their new struct fields `pub(crate)` so the
+  module boundary stays opaque; full genericization is its own
+  refactor (a sweep to `BatchRangeCheck<E, P>`, generic
+  `prove_batch_range_check`, etc.). Worth doing once a second
+  Mod-PCS backend is actually on the roadmap.
+
 - **`prove_with_iter` chain commitments aren't bound to `p_i`.** The
   transcript absorbs `comm_a_shifted` / `comm_b_shifted` but not the prime
   they were computed against. Two chains with the same commits but different
