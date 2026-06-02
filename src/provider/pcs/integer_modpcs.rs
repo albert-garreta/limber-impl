@@ -414,6 +414,42 @@ pub struct IntEvalArgument {
   /// One per small prime sampled from the transcript. Length matches
   /// `params.s`.
   pub chains: Vec<ChainData>,
+  /// Phase-3 step D5.2: batch range-check argument for `f_limb`.
+  /// Proves each coefficient `< 2^log_T` via bit decomposition.
+  /// `None` until D5.2 wires the protocol body — currently a sound
+  /// commit + transcript binding without the bit-validity / value-
+  /// reconstruction sumchecks, so commit-time soundness still relies
+  /// on the application honoring the `T_f` bound.
+  pub f_limb_range_check: Option<BatchRangeCheck>,
+}
+
+/// Batched range-check argument for one polynomial via bit
+/// decomposition. The protocol commits the bit polynomial via Hyrax,
+/// runs two sumchecks (bit-validity + value-reconstruction), and
+/// opens both the bit polynomial and the value polynomial at the
+/// sumcheck final points. See step D5.2 docs for the full protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchRangeCheck {
+  /// Hyrax commitment to the bit polynomial. Size = `N * log_bound`
+  /// bits, where `N` is the number of values being range-checked and
+  /// `log_bound` is the bit-width of the per-value bound.
+  pub bit_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// Bit-validity sumcheck round polynomials (`bit · (1 - bit) = 0`).
+  pub bit_validity_round_polys: Vec<Vec<BigUint>>,
+  /// Value-reconstruction sumcheck round polynomials (`sum_b 2^b ·
+  /// bit(r_v, b) = value(r_v)`).
+  pub value_reconstr_round_polys: Vec<Vec<BigUint>>,
+  /// Opening of the value polynomial at the reconstruction-sumcheck
+  /// challenge `r_v`.
+  pub value_open_at_rv: SmallPrimeOpening,
+  /// Opening of the bit polynomial at the bit-validity sumcheck's
+  /// final challenge point.
+  pub bit_open_validity_final: SmallPrimeOpening,
+  /// Opening of the bit polynomial at `(r_v, r_b)` — the value-
+  /// reconstruction sumcheck's final point combining `r_v` (from the
+  /// reconstruction transcript) and `r_b` (the b-axis sumcheck
+  /// challenges).
+  pub bit_open_reconstr_final: SmallPrimeOpening,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -1256,6 +1292,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       reduction_round_polys,
       int_v_prime,
       chains,
+      f_limb_range_check: None, // populated by D5.2
     })
   }
 
