@@ -89,6 +89,13 @@ pub struct IntEvalParams {
   pub log_t: usize,
   /// Norm bound on the committed polynomial `f` itself, in bits.
   pub log_t_f: usize,
+  /// Number of limbs per polynomial coefficient: `⌈log_t_f / log_t⌉`.
+  /// Setup-fixed and public — both prover and verifier read this from
+  /// the params they share. `1` in no-limb-split mode.
+  pub numlimb: usize,
+  /// Bit-width of the limb index, `⌈log_2 numlimb⌉`. `0` when
+  /// `numlimb = 1` (no extra polynomial variables needed).
+  pub numlimb_var: usize,
 }
 
 /// Security parameter (bits). The protocol targets `2^{-λ}` soundness.
@@ -144,12 +151,15 @@ impl IntEvalParams {
     }
     let s = LAMBDA.div_ceil(denom as usize);
 
+    let nl = numlimb(log_t_f, log_t);
     let p = Self {
       k,
       log_p,
       s,
       log_t,
       log_t_f,
+      numlimb: nl,
+      numlimb_var: numlimb_var(nl),
     };
     p.validate(num_vars)?;
     Ok(p)
@@ -176,12 +186,15 @@ impl IntEvalParams {
     log_t_f: usize,
     num_vars: usize,
   ) -> Result<Self, SpartanError> {
+    let nl = numlimb(log_t_f, log_t);
     let p = Self {
       k,
       log_p,
       s,
       log_t,
       log_t_f,
+      numlimb: nl,
+      numlimb_var: numlimb_var(nl),
     };
     p.validate(num_vars)?;
     Ok(p)
@@ -193,6 +206,29 @@ impl IntEvalParams {
   pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
     let log_n = ceil_log2(num_vars.max(1));
     let log_lambda = ceil_log2(LAMBDA);
+
+    // Limb-decomposition self-consistency: `numlimb` and `numlimb_var`
+    // must match the formulas implied by `(log_t, log_t_f)`. Catches
+    // hand-rolled `IntEvalParams { ... }` literals that get the
+    // relation wrong.
+    let expected_nl = numlimb(self.log_t_f, self.log_t);
+    if self.numlimb != expected_nl {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "IntEvalParams: numlimb = {} does not match ⌈log_T_f / log_T⌉ = ⌈{}/{}⌉ = {}",
+          self.numlimb, self.log_t_f, self.log_t, expected_nl
+        ),
+      });
+    }
+    let expected_nlv = numlimb_var(self.numlimb);
+    if self.numlimb_var != expected_nlv {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "IntEvalParams: numlimb_var = {} does not match ⌈log_2 numlimb⌉ = ⌈log_2 {}⌉ = {}",
+          self.numlimb_var, self.numlimb, expected_nlv
+        ),
+      });
+    }
 
     // Final Evaluation Bound: 2^k * P^(k+1) < q
     //   log: k + (k+1)·log_p < log_q
@@ -1334,6 +1370,23 @@ mod tests {
     }
   }
 
+  /// `validate` catches a hand-rolled `IntEvalParams` literal where
+  /// `numlimb` is inconsistent with `(log_t, log_t_f)`.
+  #[test]
+  fn validate_rejects_bad_numlimb() {
+    let bad = IntEvalParams {
+      k: 7,
+      log_p: 27,
+      s: 10,
+      log_t: 16,
+      log_t_f: 32, // ⌈32/16⌉ = 2
+      numlimb: 1,  // mismatched
+      numlimb_var: 0,
+    };
+    let err = bad.validate(8).unwrap_err();
+    assert!(matches!(err, SpartanError::InvalidInputLength { .. }));
+  }
+
   /// `numlimb` / `numlimb_var` sanity. Standard cases plus boundary.
   #[test]
   fn numlimb_basic() {
@@ -1501,6 +1554,8 @@ mod tests {
       s: 0,
       log_t: 32,
       log_t_f: 32,
+      numlimb: 1,
+      numlimb_var: 0,
     };
     let err = IntEvalModPCS::setup_with_params(b"override", n, 256, bad).unwrap_err();
     assert!(matches!(err, SpartanError::InvalidInputLength { .. }));
