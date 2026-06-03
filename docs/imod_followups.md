@@ -234,26 +234,41 @@ size; promote into a phase plan when picked up.
   match plain Spartan within ~5-10% (the P1 vs plain delta at `2^6`
   was only ~20% on verify).
 
-  **Refresh after Phase-3 step D5 (2026-06-02):** range checks add
-  3-4× over Phase-2 (per-iter `a_j` + `b_j` bit-decomposition zerocheck
-  + value-reconstruction sumcheck + 3 Hyrax openings each, plus the
-  f_limb range check):
+  **Refresh after Phase-3 step D5 + stacking refactor (2026-06-02):**
+  D5 first shipped with `1 + 2·s·t` separate range-check arguments
+  (one per polynomial), which landed prove/verify at ~40-100× plain
+  Spartan. The follow-on commit (`99fc22f`) restructured into
+  `1 + 2t` homogeneous batches — `f_limb`, and per iteration `j` an
+  `a_j` batch (all `s` chains) and a `b_j` batch. Combined with
+  Milestone 1 (`587569c`, parallel hot loops + `t256_q` memoization
+  + hoisted divmod) the prover and verifier each dropped ~50%:
 
-  | n_cons | Setup (P3) | Prove (P2 → P3) | Verify (P2 → P3) | P3/P0 prove | P3/P0 verify |
-  |--------|------------|------------------|-------------------|-------------|---------------|
-  | 2^6    | 18 ms      | 75 → 285 ms      | 76 → 254 ms       | 40×         | 46×           |
-  | 2^8    | 18 ms      | 138 → 632 ms     | 136 → 535 ms      | 81×         | 96×           |
-  | 2^10   | 18 ms      | 223 → 863 ms     | 168 → 621 ms      | 67×         | 100×          |
+  | n_cons | Setup | Prove (separate → batched) | Verify (separate → batched) | P3/P0 prove | P3/P0 verify |
+  |--------|-------|-----------------------------|------------------------------|-------------|---------------|
+  | 2^6    | 18 ms | 285 → 149 ms (-48%)         | 254 → 134 ms (-47%)          | 21×         | 24×           |
+  | 2^8    | 18 ms | 632 → 286 ms (-55%)         | 535 → 242 ms (-55%)          | 37×         | 43×           |
+  | 2^10   | 18 ms | 863 → 429 ms (-50%)         | 621 → 299 ms (-52%)          | 34×         | 48×           |
 
-  The b_j range check is the worst offender per range-check call:
-  bound `2q/P` ≈ `2^227` so the bit polynomial has ~256 padded bits
-  per coefficient. f_limb's range check is the next largest (32-bit
-  bound, but the polynomial itself has the most coefficients).
+  Still well outside the Phase-2 ratio (~17×/~25×), but back inside
+  "ambitious constant factor" territory. The b_j batch is still the
+  worst per-group cost — bound `2q/P` ≈ `2^227`, ~256 padded bits per
+  coefficient — but it now amortizes over all `s` chains via one
+  shared bit commitment and one shared sumcheck per iteration.
 
-  Recovery path: stacking all three categories into one combined
-  zerocheck (paper's `rbatchrange^{s·t}^2`) — see the "stack
-  everything" followup in Phase-3 step D's section below. Expected
-  to recover most of the 3-4× when implemented.
+  Next perf levers worth profiling:
+  - **Batched Hyrax opens inside a `BatchRangeCheck`.** Each batch
+    still does `N` separate Hyrax::prove calls for the value-poly
+    openings at the shared `r_v_within`. Multi-point batched open
+    would collapse them.
+  - **Cross-batch bit-comm sharing.** `a_j` and `b_j` at the same `j`
+    have identical `n_values` but different `log_bound` — could share
+    a single bit commitment with per-segment weight masking, similar
+    to how the in-batch poly stacking works today.
+  - **Bigger jump:** stack the `1 + 2t` batches into a single
+    batched argument across all (bound, size) groups using per-
+    segment weights — closer to the paper's `rbatchrange^{s·t}^2`.
+    Needs a uniform stride = `max(log_T, log_p+1, LOG_Q-log_p+1)`
+    and group-indexed weight masking.
 
   Likely Phase-2 cost attribution (rough estimates, not yet profiled):
   - **Step-C Hyrax openings dominate.** Per Mod-PCS open with n > k:
@@ -306,11 +321,13 @@ size; promote into a phase plan when picked up.
     already does some of this; we don't. Worth a small writeup of
     what's available before implementing.
 
-  - **Batched range checks (Phase-3 step D when it lands).** The
-    paper's IntEval needs range checks on every `a_j` and `b_j` (s × t
-    pairs). The paper batches them via a single `rbatchrange{s × t}^2`
-    argument; we should match that. Affects Phase-3 step D's design
-    rather than current code.
+  - **Batched range checks (Phase-3 step D — partially done as of
+    `99fc22f`).** Range checks on every `a_j` and `b_j` are now
+    bundled per-iteration into homogeneous batches (one batch per
+    `s` chains' `a_j`, one per `b_j`), plus a single batch for
+    `f_limb`. The paper's full `rbatchrange^{s·t}^2` would fuse all
+    `1 + 2t` batches into one global argument; see the D5 section
+    below for the remaining stacking opportunities.
 
   Most of these change the *protocol structure* rather than just hot-
   path inlining, so they need to land carefully against the IntEval
@@ -403,20 +420,30 @@ size; promote into a phase plan when picked up.
   worth doing the range-check batching together with the broader
   batching cross-cutting refactor (see Performance / structure above).
 
-- **D5 followups (recorded 2026-06-02 after D5.2 lands).**
+- **D5 followups (recorded 2026-06-02 after D5.2 lands; updated as
+  follow-on work shipped).**
 
-  - **Stack all range checks into one combined argument.** D5.2 ships
-    one batch range check on `f_limb`; D5.3 / D5.4 will add per-iter
-    range checks on `a_j_shifted` and `b_j_shifted`. The paper does
-    *one* batched range check across all of them via a single
-    `rbatchrange^2` argument: stack `f_limb ++ all a_j ++ all b_j`
-    into one bit polynomial and run *one* zerocheck + one
-    value-reconstruction sumcheck across the whole pile. Cuts the
-    number of bit-commit MSMs from `1 + s·t·2` to `1`, and the number
-    of sumchecks from `2·(1 + s·t·2)` to `2`. Requires a uniform bit
-    layout (pad each value to `max(log_T, log(2P), log(2q/P))` bits)
-    and a per-segment weight masking. Probably the single biggest
-    perf win in step D once D5.x lands.
+  - **(Partially done) Stack range checks into combined arguments.**
+    D5.2/.3/.4 initially shipped `1 + 2·s·t` separate range-check
+    arguments (one per polynomial). `99fc22f` restructured to
+    `1 + 2t` *homogeneous batches*: `f_limb`, then for each iteration
+    `j` an `a_j` batch (all `s` chains) and a `b_j` batch. Each
+    batch is one `BatchRangeCheck` — one bit commitment, one
+    bit-validity zerocheck, one value-reconstruction sumcheck, and
+    `N + 2` Hyrax openings. ~50% perf win (see bench refresh above).
+
+    Remaining stacking opportunities, in increasing scope:
+    1. **Across (a, b) at the same `j`.** Same `n_values`, different
+       `log_bound` — could share a single bit commitment with
+       per-segment weight masking.
+    2. **Across all iterations + f_limb.** Stack the `1 + 2t`
+       batches into one global batched argument with per-group
+       weight masking. Uniform stride =
+       `max(log_T, log_p+1, LOG_Q-log_p+1)`. This is the paper's
+       full `rbatchrange^{s·t}^2`.
+    3. **Batched Hyrax opens** inside each `BatchRangeCheck` — the
+       `N` value-poly openings at `r_v_within` are at the same point;
+       a multi-point batched Hyrax::prove would collapse them.
 
   - **Range check is semantically a commitment obligation but lives
     eval-side.** The `f_limb < T` check could be in `commit()`
