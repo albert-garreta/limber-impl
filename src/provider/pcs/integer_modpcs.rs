@@ -1362,7 +1362,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         let value_comms = chain_states
           .iter()
           .map(|st| {
-            if is_a { &st.iters[j].comm_a_shifted } else { &st.iters[j].comm_b_shifted }
+            if is_a {
+              &st.iters[j].comm_a_shifted
+            } else {
+              &st.iters[j].comm_b_shifted
+            }
           })
           .collect::<Vec<_>>();
         let value_polys_fq = chain_states
@@ -1377,7 +1381,13 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           .collect::<Vec<_>>();
         let value_blinds = chain_states
           .iter()
-          .map(|st| if is_a { &st.iters[j].a_blind } else { &st.iters[j].b_blind })
+          .map(|st| {
+            if is_a {
+              &st.iters[j].a_blind
+            } else {
+              &st.iters[j].b_blind
+            }
+          })
           .collect::<Vec<_>>();
         let values = chain_states
           .iter()
@@ -1695,7 +1705,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           .iter()
           .map(|chain| {
             let it = &chain.iterations[j];
-            if is_a { &it.comm_a_shifted } else { &it.comm_b_shifted }
+            if is_a {
+              &it.comm_a_shifted
+            } else {
+              &it.comm_b_shifted
+            }
           })
           .collect::<Vec<_>>();
         verify_batch_range_check(
@@ -1945,8 +1959,15 @@ fn prove_batch_range_check(
     )?;
 
   // 5. Open bit_poly at r_validity.
-  let bit_open_validity_final =
-    hyrax_open_at(ck, ck_eval, &mut sub, &bit_comm, &bit_poly, &bit_blind, &r_validity)?;
+  let bit_open_validity_final = hyrax_open_at(
+    ck,
+    ck_eval,
+    &mut sub,
+    &bit_comm,
+    &bit_poly,
+    &bit_blind,
+    &r_validity,
+  )?;
 
   // 6. Value-reconstruction. Squeeze r_v over (poly-index ++ within).
   let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
@@ -1980,7 +2001,11 @@ fn prove_batch_range_check(
 
   // Initial claim = V(r_v) = sum_b w[b]·bit_at_rv[b] (uniform weight).
   let weight = range_weight_vector(log_bound, stride);
-  let claim_v: t256::Scalar = weight.iter().zip(bit_at_rv.iter()).map(|(w, b)| *w * *b).sum();
+  let claim_v: t256::Scalar = weight
+    .iter()
+    .zip(bit_at_rv.iter())
+    .map(|(w, b)| *w * *b)
+    .sum();
   let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(weight);
   let mut poly_b2 = crate::polys::multilinear::MultilinearPolynomial::new(bit_at_rv);
   let (value_reconstr_sumcheck, r_b, _claims) =
@@ -1994,8 +2019,9 @@ fn prove_batch_range_check(
 
   // 7. Open bit_poly at (r_v ++ r_b) for the reconstruction final check.
   let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
-  let bit_open_reconstr_final =
-    hyrax_open_at(ck, ck_eval, &mut sub, &bit_comm, &bit_poly, &bit_blind, &combined)?;
+  let bit_open_reconstr_final = hyrax_open_at(
+    ck, ck_eval, &mut sub, &bit_comm, &bit_poly, &bit_blind, &combined,
+  )?;
 
   Ok(BatchRangeCheck {
     bit_comm,
@@ -2639,18 +2665,35 @@ mod tests {
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
     let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval =
-      <MP as ModPCSEngineTrait<ME>>::commit(&ck_eval, std::slice::from_ref(&eval), &blind_eval, false)
-        .unwrap();
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck, &ck_eval, &mut pt, &comm, &poly, &blind, &point, &eval, &comm_eval, &blind_eval,
+      &ck,
+      &ck_eval,
+      &mut pt,
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+      &comm_eval,
+      &blind_eval,
     )
     .unwrap();
 
     // Three groups (f_limb, a_1, b_1) — the config must produce them.
-    assert_eq!(arg.range_checks.len(), 3, "expected f_limb + a_1 + b_1 groups");
+    assert_eq!(
+      arg.range_checks.len(),
+      3,
+      "expected f_limb + a_1 + b_1 groups"
+    );
 
     // Tampering each group's bit opening (in turn) must be rejected
     // (the Hyrax opening check or the bit-validity integrand check fires,
