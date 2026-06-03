@@ -2138,18 +2138,26 @@ fn prove_batch_range_check(
 
   // 1. Stacked bit polynomial. Index `((p·n_values + within)·stride + b)`.
   //    Padding polys (`p ≥ num_polys`) and bits `b ≥ log_bound` stay zero.
+  //    Built in parallel over disjoint `stride`-sized slots (one per value).
   let mut bit_poly: Vec<t256::Scalar> = vec![t256::Scalar::ZERO; n_bits];
-  for (p, vals) in values.iter().enumerate() {
-    for (within, v) in vals.iter().enumerate() {
-      let bits_u8 = bit_decompose_value(v, log_bound);
-      let base = (p * n_values + within) * stride;
-      for (b, &bit) in bits_u8.iter().enumerate() {
+  bit_poly
+    .par_chunks_mut(stride)
+    .enumerate()
+    .for_each(|(gv, chunk)| {
+      let p = gv / n_values;
+      if p >= num_polys {
+        return; // padding poly: all-zero
+      }
+      let within = gv % n_values;
+      for (b, &bit) in bit_decompose_value(&values[p][within], log_bound)
+        .iter()
+        .enumerate()
+      {
         if bit == 1 {
-          bit_poly[base + b] = t256::Scalar::ONE;
+          chunk[b] = t256::Scalar::ONE;
         }
       }
-    }
-  }
+    });
 
   // 2. Commit the stacked bit polynomial.
   let bit_blind = Hyrax::blind(ck, n_bits);
@@ -2163,15 +2171,11 @@ fn prove_batch_range_check(
     .map(|_| sub.squeeze(b"range_tau"))
     .collect::<Result<Vec<_>, _>>()?;
   let mut poly_a = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
-  let mut poly_b = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
-  let mut poly_c = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
   let (bit_validity_sumcheck, r_validity, _claims) =
-    crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_cubic_with_three_inputs(
+    crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_cubic_square(
       &t256::Scalar::ZERO,
       tau,
       &mut poly_a,
-      &mut poly_b,
-      &mut poly_c,
       &mut sub,
     )?;
 

@@ -573,6 +573,63 @@ impl<E: Engine> SumcheckProof<E> {
     ))
   }
 
+  /// Single-input specialization of [`Self::prove_cubic_with_three_inputs`]
+  /// for the integrand `eq(x, τ)·(A(x)² − A(x))` (the bit-validity
+  /// zerocheck `A·(A−1) = 0`). It reuses the exact same per-round
+  /// evaluation by feeding `poly_A` as all three inputs, so the emitted
+  /// round polynomials — and thus the proof and verifier — are *identical*
+  /// to calling `prove_cubic_with_three_inputs(claim, τ, A, A, A)`; it just
+  /// avoids the two redundant polynomial clones and binds `A` once per
+  /// round instead of three times.
+  pub fn prove_cubic_square(
+    claim: &E::Scalar,
+    taus: Vec<E::Scalar>,
+    poly_A: &mut MultilinearPolynomial<E::Scalar>,
+    transcript: &mut E::TE,
+  ) -> Result<(Self, Vec<E::Scalar>, Vec<E::Scalar>), SpartanError> {
+    let mut r: Vec<E::Scalar> = Vec::new();
+    let mut polys: Vec<CompressedUniPoly<E::Scalar>> = Vec::new();
+    let mut claim_per_round = *claim;
+
+    let num_rounds = taus.len();
+    let mut eq_instance = eq_sumcheck::EqSumCheckInstance::<E>::new(taus);
+
+    for _round in 0..num_rounds {
+      let poly = {
+        // Same eval as the 3-input cubic with A=B=C → eq·(A² − A).
+        let (eval_point_0, eval_point_2, eval_point_3) = eq_instance
+          .evaluation_points_cubic_with_three_inputs(poly_A, poly_A, poly_A, claim_per_round);
+        let evals = vec![
+          eval_point_0,
+          claim_per_round - eval_point_0,
+          eval_point_2,
+          eval_point_3,
+        ];
+        UniPoly::from_evals(&evals)?
+      };
+
+      transcript.absorb(b"p", &poly);
+      let r_i = transcript.squeeze(b"c")?;
+      r.push(r_i);
+      polys.push(poly.compress());
+      claim_per_round = poly.evaluate(&r_i);
+
+      // Bind once (vs three times in the 3-input routine) + the eq table.
+      rayon::join(
+        || poly_A.bind_poly_var_top(&r_i),
+        || eq_instance.bound(&r_i),
+      );
+    }
+
+    Ok((
+      SumcheckProof {
+        compressed_polys: polys,
+      },
+      r,
+      vec![poly_A[0]],
+    ))
+  }
+
   /// Outer sumcheck for Integer Mod-R1CS.
   ///
   /// Proves that `sum_i eq(i, tau) * (poly_A(i)*poly_B(i) - poly_C(i) - poly_M(i)*poly_Q(i))` equals `claim`,

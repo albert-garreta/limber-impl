@@ -141,6 +141,20 @@ where
     SpartanError,
   > {
     let (ck, vk_ee) = shape.commitment_key();
+    Ok(Self::assemble_keys(shape, ck, vk_ee))
+  }
+
+  /// Shared tail of `setup` / `setup_with_params`: precompute the
+  /// commitment-key tables, build the size-1 `ck_s`, and assemble the
+  /// prover/verifier keys from a prebuilt `(ck, vk_ee)` pair.
+  pub(crate) fn assemble_keys(
+    shape: IntModR1CSShapeModp<M>,
+    ck: ModCK<M>,
+    vk_ee: ModVK<M>,
+  ) -> (
+    IntModSpartanModpProverKey<M>,
+    IntModSpartanModpVerifierKey<M>,
+  ) {
     <ModPCS<M> as ModPCSEngineTrait<M>>::precompute_ck(&ck);
     let (ck_s, _) = <ModPCS<M> as ModPCSEngineTrait<M>>::setup(b"ck_s_imod_modp", 1, 1);
     <ModPCS<M> as ModPCSEngineTrait<M>>::precompute_ck(&ck_s);
@@ -158,7 +172,7 @@ where
       shape,
       vk_digest: digest,
     };
-    Ok((pk, vk))
+    (pk, vk)
   }
 
   /// Prove satisfaction of the IntMod-R1CS instance.
