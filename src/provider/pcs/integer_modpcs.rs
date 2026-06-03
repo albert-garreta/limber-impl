@@ -373,14 +373,25 @@ pub struct IterationOracles {
   pub comm_a_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
   /// Hyrax commitment to the *shifted* `b_j`.
   pub comm_b_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  /// Opening of `a_{j-1}` at `(γ[0..n-jk], r^(i)[n-jk+1..n-(j-1)k])`.
-  /// For `j=1` this opens the *input* polynomial's commitment, not an
-  /// `IterationOracles` commitment.
-  pub open_a_prev: SmallPrimeOpening,
-  /// Opening of `a_j` at `γ[0..n-jk]`.
-  pub open_a_curr: SmallPrimeOpening,
-  /// Opening of `b_j` at `γ[0..n-jk]`.
-  pub open_b_curr: SmallPrimeOpening,
+  /// Claimed `a_{j-1}(γ_ext)` where `γ_ext = (γ[0..n-jk], r^(i)[n-jk..n-(j-1)k])`.
+  /// Used directly in the identity check.
+  pub a_prev_eval: t256::Scalar,
+  /// Opening binding `a_prev_eval` to the `a_{j-1}` commitment, at
+  /// `γ_ext`. `None` for `j=1`: those open the shared *input* commitment
+  /// at `s` distinct points and are batched across all chains into
+  /// [`IntEvalArgument::a_prev_batch`]. `Some` for `j>1` (chain-specific
+  /// commitment, one point — not batchable across chains).
+  pub open_a_prev: Option<SmallPrimeOpening>,
+  /// Claimed `a_j(γ[0..n-jk])`. Both `a_j` and `b_j` are opened at the
+  /// same point, so instead of two Hyrax opens we send the two scalars
+  /// (used directly in the identity check) plus a single `curr_open` of
+  /// the RLC-folded commitment `comm_a + ρ·comm_b`.
+  pub a_curr_eval: t256::Scalar,
+  /// Claimed `b_j(γ[0..n-jk])`. See [`Self::a_curr_eval`].
+  pub b_curr_eval: t256::Scalar,
+  /// Opening of `comm_a_shifted + ρ·comm_b_shifted` at `γ[0..n-jk]`; its
+  /// evaluation must equal `a_curr_eval + ρ·b_curr_eval` (binds both).
+  pub curr_open: SmallPrimeOpening,
 }
 
 /// Per-prime chain: `t = ⌈(n-k)/k⌉` iterations plus the final-remainder
@@ -425,6 +436,24 @@ pub struct IntEvalArgument {
   /// commitment, one bit-validity zerocheck, and one reconstruction
   /// sumcheck. See [`prove_batch_range_check`].
   pub(crate) range_checks: Vec<BatchRangeCheck>,
+  /// Batched proof for the `j=1` `a_prev` openings: all `s` chains open
+  /// the shared input commitment at distinct points, collapsed into one
+  /// sumcheck + one opening. `None` when there are no iterations (`t=0`).
+  pub(crate) a_prev_batch: Option<APrevBatch>,
+}
+
+/// Multi-point batch evaluation of the input polynomial `f` (commitment
+/// `comm.inner`) at the `s` distinct `j=1` `a_prev` points. Proves
+/// `Σ_c λ^c·f(z_c) = Σ_x f(x)·W(x)` with `W = Σ_c λ^c·eq(z_c,·)` via one
+/// degree-2 sumcheck reducing to a single opening of `f` at the
+/// sumcheck challenge `r`. The claimed `f(z_c)` are the chains'
+/// `iterations[0].a_prev_eval`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct APrevBatch {
+  /// Degree-2 sumcheck on `f(x)·W(x)`, over the Hyrax base field.
+  pub(crate) sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
+  /// Opening of the input commitment `f` at the sumcheck challenge `r`.
+  pub(crate) f_open: SmallPrimeOpening,
 }
 
 /// Batched range-check argument (paper's `rbatchrange`) for a
@@ -1219,6 +1248,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     //    phase 2 to run deferred range checks on each iter's shifted
     //    polynomials.
     let (_open_span, open_t) = start_span!("imod_pcs_chain_openings");
+    // `j=1` a_prev opens all hit the shared input commitment at distinct
+    // points; collect them for the batched multi-point evaluation below.
+    let mut aprev_points: Vec<Vec<t256::Scalar>> = Vec::with_capacity(params.s);
+    let mut aprev_evals: Vec<t256::Scalar> = Vec::with_capacity(params.s);
     let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
     for state in &chain_states {
       let r_i_int = &state.r_i_int;
@@ -1253,40 +1286,68 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           )
         };
 
-        let open_a_prev = hyrax_open_at(
-          &ck.inner,
-          &ck_eval.inner,
-          transcript,
-          &a_prev_comm,
-          &a_prev_poly_fq,
-          &a_prev_blind,
-          &gamma_extended,
+        // a_prev eval (used in the identity check). For j=1 it opens the
+        // shared input commitment → defer binding to the batch (collect
+        // point+eval, no individual open). For j>1 open the chain-specific
+        // commitment directly.
+        let a_prev_eval = mle_evaluate_fq(&a_prev_poly_fq, &gamma_extended);
+        let open_a_prev = if j == 1 {
+          aprev_points.push(gamma_extended.clone());
+          aprev_evals.push(a_prev_eval);
+          None
+        } else {
+          Some(hyrax_open_at(
+            &ck.inner,
+            &ck_eval.inner,
+            transcript,
+            &a_prev_comm,
+            &a_prev_poly_fq,
+            &a_prev_blind,
+            &gamma_extended,
+          )?)
+        };
+        // a_j and b_j are both opened at `gamma_prefix`: send the two
+        // claimed evals + ONE opening of `comm_a + ρ·comm_b`, saving an
+        // IPA per iteration.
+        let a_curr_eval = mle_evaluate_fq(&iter_state.a_shifted_fq, &gamma_prefix);
+        let b_curr_eval = mle_evaluate_fq(&iter_state.b_shifted_fq, &gamma_prefix);
+        let rho = squeeze_curr_rho(transcript, &a_curr_eval, &b_curr_eval)?;
+        let one = t256::Scalar::ONE;
+        let folded_comm = Hyrax::fold_commitments(
+          &[
+            iter_state.comm_a_shifted.clone(),
+            iter_state.comm_b_shifted.clone(),
+          ],
+          &[one, rho],
         )?;
-        let open_a_curr = hyrax_open_at(
-          &ck.inner,
-          &ck_eval.inner,
-          transcript,
-          &iter_state.comm_a_shifted,
-          &iter_state.a_shifted_fq,
-          &iter_state.a_blind,
-          &gamma_prefix,
+        let folded_blind = Hyrax::fold_blinds(
+          &[iter_state.a_blind.clone(), iter_state.b_blind.clone()],
+          &[one, rho],
         )?;
-        let open_b_curr = hyrax_open_at(
+        let folded_poly: Vec<t256::Scalar> = iter_state
+          .a_shifted_fq
+          .iter()
+          .zip(iter_state.b_shifted_fq.iter())
+          .map(|(a, b)| *a + rho * *b)
+          .collect();
+        let curr_open = hyrax_open_at(
           &ck.inner,
           &ck_eval.inner,
           transcript,
-          &iter_state.comm_b_shifted,
-          &iter_state.b_shifted_fq,
-          &iter_state.b_blind,
+          &folded_comm,
+          &folded_poly,
+          &folded_blind,
           &gamma_prefix,
         )?;
 
         iter_oracles.push(IterationOracles {
           comm_a_shifted: iter_state.comm_a_shifted.clone(),
           comm_b_shifted: iter_state.comm_b_shifted.clone(),
+          a_prev_eval,
           open_a_prev,
-          open_a_curr,
-          open_b_curr,
+          a_curr_eval,
+          b_curr_eval,
+          curr_open,
         });
       }
 
@@ -1325,6 +1386,39 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       });
     }
     info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_openings");
+
+    // Batched `j=1` a_prev evaluation: prove all `s` claimed
+    // `f(z_c) = aprev_evals[c]` against the shared input commitment with
+    // one degree-2 sumcheck on `f(x)·W(x)` (W = Σ_c λ^c·eq(z_c,·)) plus a
+    // single opening of `f` at the sumcheck challenge.
+    let (_apb_span, apb_t) = start_span!("imod_pcs_aprev_batch");
+    let a_prev_batch = if with_iter {
+      let mut sub = spawn_aprev_subtranscript(transcript, &comm.inner, &aprev_evals)?;
+      let lambda = sub.squeeze(b"aprev_lambda")?;
+      let (w, claim) = aprev_batch_weight(&aprev_points, &aprev_evals, lambda, poly_fq.len());
+      let mut poly_f = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.clone());
+      let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(w);
+      let (sumcheck, r, _claims) = crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
+        &claim,
+        num_vars,
+        &mut poly_f,
+        &mut poly_w,
+        &mut sub,
+      )?;
+      let f_open = hyrax_open_at(
+        &ck.inner,
+        &ck_eval.inner,
+        &mut sub,
+        &comm.inner,
+        &poly_fq,
+        &blind.inner,
+        &r,
+      )?;
+      Some(APrevBatch { sumcheck, f_open })
+    } else {
+      None
+    };
+    info!(elapsed_ms = %apb_t.elapsed().as_millis(), "imod_pcs_aprev_batch");
 
     // Phase-3 step D5 (stacked `rbatchrange`): one batched range check
     // per `(bound, size)` group, in canonical order `f_limb`, then for
@@ -1425,6 +1519,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       int_v_prime,
       chains,
       range_checks,
+      a_prev_batch,
     })
   }
 
@@ -1570,6 +1665,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let shift_a_fq = biguint_to_scalar(&shift_a(params));
     let shift_b_fq = biguint_to_scalar(&shift_b(params));
 
+    let mut aprev_points: Vec<Vec<t256::Scalar>> = Vec::with_capacity(params.s);
+    let mut aprev_evals: Vec<t256::Scalar> = Vec::with_capacity(params.s);
     for (chain_idx, chain) in arg.chains.iter().enumerate() {
       let (p_i, r_i_int) = &chain_primes[chain_idx];
       let p_i_fq = biguint_to_scalar(p_i);
@@ -1587,47 +1684,63 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           .copied()
           .collect();
 
-        let a_prev_comm = if j == 1 {
-          comm.inner.clone()
+        // a_prev: j=1 opens the shared input commitment → collect for the
+        // batched verification below (no individual open). j>1 opens the
+        // chain-specific commitment directly; check it binds a_prev_eval.
+        if j == 1 {
+          if iter.open_a_prev.is_some() {
+            return Err(SpartanError::InvalidSumcheckProof);
+          }
+          aprev_points.push(gamma_extended.clone());
+          aprev_evals.push(iter.a_prev_eval);
         } else {
-          chain.iterations[jm1 - 1].comm_a_shifted.clone()
-        };
-
-        hyrax_verify_open(
-          &vk.inner,
-          &ck_eval.inner,
-          transcript,
-          &a_prev_comm,
-          &gamma_extended,
-          &iter.open_a_prev,
+          let a_prev_comm = chain.iterations[jm1 - 1].comm_a_shifted.clone();
+          let open = iter
+            .open_a_prev
+            .as_ref()
+            .ok_or(SpartanError::InvalidSumcheckProof)?;
+          hyrax_verify_open(
+            &vk.inner,
+            &ck_eval.inner,
+            transcript,
+            &a_prev_comm,
+            &gamma_extended,
+            open,
+          )?;
+          if open.f_y != iter.a_prev_eval {
+            return Err(SpartanError::InvalidSumcheckProof);
+          }
+        }
+        // Batched a_j/b_j opening at `gamma_prefix`: re-derive ρ from the
+        // claimed evals, fold `comm_a + ρ·comm_b`, verify the single open,
+        // and check its eval equals `a_curr_eval + ρ·b_curr_eval`.
+        let rho = squeeze_curr_rho(transcript, &iter.a_curr_eval, &iter.b_curr_eval)?;
+        let folded_comm = Hyrax::fold_commitments(
+          &[iter.comm_a_shifted.clone(), iter.comm_b_shifted.clone()],
+          &[t256::Scalar::ONE, rho],
         )?;
         hyrax_verify_open(
           &vk.inner,
           &ck_eval.inner,
           transcript,
-          &iter.comm_a_shifted,
+          &folded_comm,
           &gamma_prefix,
-          &iter.open_a_curr,
+          &iter.curr_open,
         )?;
-        hyrax_verify_open(
-          &vk.inner,
-          &ck_eval.inner,
-          transcript,
-          &iter.comm_b_shifted,
-          &gamma_prefix,
-          &iter.open_b_curr,
-        )?;
+        if iter.curr_open.f_y != iter.a_curr_eval + rho * iter.b_curr_eval {
+          return Err(SpartanError::InvalidSumcheckProof);
+        }
 
         // Identity check in F: a_j(γ) + p_i · b_j(γ) ?= a_{j-1}(γ_ext).
         // a_prev for j=1 is the *unshifted* input poly (no subtract);
         // otherwise a_prev_shifted: subtract shift_a.
-        let lhs_a = iter.open_a_curr.f_y - shift_a_fq;
-        let lhs_b = iter.open_b_curr.f_y - shift_b_fq;
+        let lhs_a = iter.a_curr_eval - shift_a_fq;
+        let lhs_b = iter.b_curr_eval - shift_b_fq;
         let lhs = lhs_a + p_i_fq * lhs_b;
         let rhs = if j == 1 {
-          iter.open_a_prev.f_y
+          iter.a_prev_eval
         } else {
-          iter.open_a_prev.f_y - shift_a_fq
+          iter.a_prev_eval - shift_a_fq
         };
         if lhs != rhs {
           return Err(SpartanError::InvalidSumcheckProof);
@@ -1674,6 +1787,47 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       }
     }
     info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
+
+    // Verify the batched `j=1` a_prev evaluation: re-derive λ, reconstruct
+    // the sumcheck claim `Σ_c λ^c·a_prev_eval`, verify the sumcheck + the
+    // single `f` opening, and check `final_claim == f(r)·W(r)` with
+    // `W(r) = Σ_c λ^c·eq(z_c, r)`.
+    let (_vapb_span, vapb_t) = start_span!("imod_pcs_verify_aprev_batch");
+    if with_iter {
+      let batch = arg
+        .a_prev_batch
+        .as_ref()
+        .ok_or(SpartanError::InvalidSumcheckProof)?;
+      let mut sub = spawn_aprev_subtranscript(transcript, &comm.inner, &aprev_evals)?;
+      let lambda = sub.squeeze(b"aprev_lambda")?;
+      let mut claim = t256::Scalar::ZERO;
+      let mut lam_pow = t256::Scalar::ONE;
+      for &y_c in &aprev_evals {
+        claim += lam_pow * y_c;
+        lam_pow *= lambda;
+      }
+      let (final_claim, r) = batch.sumcheck.verify(claim, num_vars, 2, &mut sub)?;
+      hyrax_verify_open(
+        &vk.inner,
+        &ck_eval.inner,
+        &mut sub,
+        &comm.inner,
+        &r,
+        &batch.f_open,
+      )?;
+      let mut w_at_r = t256::Scalar::ZERO;
+      let mut lam_pow = t256::Scalar::ONE;
+      for z_c in &aprev_points {
+        w_at_r += lam_pow * EqPolynomial::<t256::Scalar>::new(z_c.clone()).evaluate(&r);
+        lam_pow *= lambda;
+      }
+      if final_claim != batch.f_open.f_y * w_at_r {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+    } else if arg.a_prev_batch.is_some() {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    info!(elapsed_ms = %vapb_t.elapsed().as_millis(), "imod_pcs_verify_aprev_batch");
 
     let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
     // Phase-3 step D5 (stacked rbatchrange): verify one batched range
@@ -1769,6 +1923,23 @@ struct ChainProverState {
   p_i: BigUint,
   r_i_int: Vec<BigUint>,
   iters: Vec<IterationProverState>,
+}
+
+/// Absorb the two claimed identity-check evals `a_j(γ)`, `b_j(γ)` into
+/// the transcript and squeeze the RLC challenge `ρ`. The same `ρ` folds
+/// `comm_a + ρ·comm_b` so a single opening at `γ` binds both evals (the
+/// folded eval must equal `a_curr_eval + ρ·b_curr_eval`). Sampling `ρ`
+/// after absorbing the evals is what makes the fold binding.
+fn squeeze_curr_rho<T: ByteTranscript>(
+  transcript: &mut T,
+  a_eval: &t256::Scalar,
+  b_eval: &t256::Scalar,
+) -> Result<t256::Scalar, SpartanError> {
+  let mut buf = a_eval.to_repr().as_ref().to_vec();
+  buf.extend_from_slice(b_eval.to_repr().as_ref());
+  transcript.absorb_bytes(b"curr_evals", &buf);
+  let bytes = transcript.squeeze_bytes(b"curr_rho")?;
+  Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
 }
 
 /// Helper: open the Hyrax commitment `comm` at `point` to produce a
@@ -1884,6 +2055,50 @@ fn spawn_range_subtranscript(
     sub.absorb(b"range_value_comm", *vc);
   }
   Ok(sub)
+}
+
+/// Spawn the sub-transcript for the `j=1` `a_prev` batch evaluation,
+/// binding the parent state, the input commitment `f`, and the claimed
+/// evals `f(z_c)`. The RLC challenge `λ` is squeezed from this sub after
+/// the evals are bound. Both prover and verifier reconstruct it identically.
+fn spawn_aprev_subtranscript(
+  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  f_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  evals: &[t256::Scalar],
+) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
+  let seed = parent.squeeze_bytes(b"aprev_seed")?;
+  let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
+    T256HyraxEngine,
+  >>::new_with_params(b"aprev_batch", ());
+  sub.absorb_bytes(b"seed", &seed);
+  sub.absorb(b"aprev_f_comm", f_comm);
+  for e in evals {
+    sub.absorb_bytes(b"aprev_eval", e.to_repr().as_ref());
+  }
+  Ok(sub)
+}
+
+/// Build `W = Σ_c λ^c · eq(z_c, ·)` as length-`n` evals (the public
+/// multi-point batch weight), and the combined claim `Σ_c λ^c · y_c`.
+/// Used by both the prover and verifier of the `a_prev` batch.
+fn aprev_batch_weight(
+  points: &[Vec<t256::Scalar>],
+  evals: &[t256::Scalar],
+  lambda: t256::Scalar,
+  n: usize,
+) -> (Vec<t256::Scalar>, t256::Scalar) {
+  let mut w = vec![t256::Scalar::ZERO; n];
+  let mut claim = t256::Scalar::ZERO;
+  let mut lam_pow = t256::Scalar::ONE;
+  for (z_c, &y_c) in points.iter().zip(evals.iter()) {
+    let eq_c = EqPolynomial::<t256::Scalar>::evals_from_points(z_c);
+    for (wj, &e) in w.iter_mut().zip(eq_c.iter()) {
+      *wj += lam_pow * e;
+    }
+    claim += lam_pow * y_c;
+    lam_pow *= lambda;
+  }
+  (w, claim)
 }
 
 /// Prover side of a homogeneous batch range check (paper `rbatchrange`).
@@ -2646,6 +2861,74 @@ mod tests {
     .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(
+      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
+    )
+    .unwrap();
+  }
+
+  /// Two-iteration roundtrip (`k=2`, `num_vars=6` → `t=2`). Exercises the
+  /// a_prev batch (j=1, batched across chains) *and* the per-iteration
+  /// individual a_prev opens (j=2, chain-specific commitments) together.
+  #[test]
+  fn prove_verify_roundtrips_with_two_iterations() {
+    let num_vars = 6usize;
+    let n = 1usize << num_vars; // 64
+    let small_params =
+      IntEvalParams::derive_no_limb_split(8, 2, num_vars).expect("valid derived params");
+    let (ck, vk) =
+      IntegerModPCS::setup_with_params(b"inteval-iter2", n, 256, small_params).unwrap();
+    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
+
+    let dyn_params = small_dyn_params();
+    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 3 + 5) % 37))
+      .collect();
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let eval = integer_mle_evaluate(&poly, &int_point)
+      .mod_floor(&BigInt::from(37u32))
+      .to_biguint()
+      .unwrap();
+
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
+    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+      &ck_eval,
+      std::slice::from_ref(&eval),
+      &blind_eval,
+      false,
+    )
+    .unwrap();
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+      &ck,
+      &ck_eval,
+      &mut pt,
+      &comm,
+      &poly,
+      &blind,
+      &point,
+      &eval,
+      &comm_eval,
+      &blind_eval,
+    )
+    .unwrap();
+
+    // Confirm we actually exercised t=2 (j=1 batched + j=2 individual).
+    assert_eq!(arg.chains[0].iterations.len(), 2, "expected t=2");
+    assert!(
+      arg.chains[0].iterations[0].open_a_prev.is_none(),
+      "j=1 a_prev is batched"
+    );
+    assert!(
+      arg.chains[0].iterations[1].open_a_prev.is_some(),
+      "j=2 a_prev is individual"
+    );
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
     <MP as ModPCSEngineTrait<ME>>::verify(
       &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
     )
