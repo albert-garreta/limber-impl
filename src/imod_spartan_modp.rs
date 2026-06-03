@@ -183,8 +183,10 @@ where
     }
 
     // 3. Sample `p` from the transcript and switch typed-squeeze context.
+    let (_sp_span, sp_t) = start_span!("imod_modp_sample_p");
     let params = M::sample_params(&mut transcript);
     transcript.set_params(params.clone());
+    info!(elapsed_ms = %sp_t.elapsed().as_millis(), "imod_modp_sample_p");
 
     let shape = &pk.shape;
     let num_vars = shape.num_vars;
@@ -207,6 +209,7 @@ where
     info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_modp_reduce");
 
     // z = (W, 1, X), padded to 2*num_vars for the MLE.
+    let (_spmv_span, spmv_t) = start_span!("imod_modp_spmv");
     let mut z = Vec::with_capacity(2 * num_vars);
     z.extend_from_slice(&w_p);
     z.push(one);
@@ -215,6 +218,7 @@ where
 
     let z_for_spmv = &z[..num_vars + 1 + shape.num_io];
     let (az, bz, cz) = spmv::<M>(&a_p, &b_p, &c_p, z_for_spmv, num_cons, &params);
+    info!(elapsed_ms = %spmv_t.elapsed().as_millis(), "imod_modp_spmv");
 
     // Outer sumcheck: sum_i eq(i, tau) · (Az·Bz − Cz − M·Q) = 0.
     let tau: Vec<MScalar<M>> = (0..num_rounds_x)
@@ -252,6 +256,7 @@ where
     let r = transcript.squeeze(b"r")?;
     let claim_inner = v_a + r * v_b + r * r * v_c;
 
+    let (_isetup_span, isetup_t) = start_span!("imod_modp_inner_setup");
     let eq_rx = EqPolynomial::<MScalar<M>>::evals_from_points(&r_x, &params);
     let abc = bind_abc::<M>(
       &a_p,
@@ -263,6 +268,7 @@ where
       &r,
       &params,
     );
+    info!(elapsed_ms = %isetup_t.elapsed().as_millis(), "imod_modp_inner_setup");
 
     debug_assert_eq!(abc.len(), 2 * num_vars);
     debug_assert_eq!(z.len(), 2 * num_vars);
@@ -282,11 +288,13 @@ where
 
     // Recover eval_W from eval_Z via Z = (W, 1, X, …):
     //   Z(r_y) = (1 - r_y[0]) · W(r_y[1..]) + r_y[0] · pub(r_y[1..]).
+    let (_er_span, er_t) = start_span!("imod_modp_eval_recover");
     let eval_z = poly_z[0];
     let eval_x = eval_public_at::<M>(num_rounds_y - 1, &x_p, &r_y[1..], &params);
     let one_minus_r0 = one - r_y[0];
     let inv = one_minus_r0.invert().ok_or(SpartanError::DivisionByZero)?;
     let eval_w = (eval_z - r_y[0] * eval_x) * inv;
+    info!(elapsed_ms = %er_t.elapsed().as_millis(), "imod_modp_eval_recover");
 
     // Mod-PCS open W at r_y[1..]. Mod-PCS commits/opens integers — pass
     // the original BigUint witness and the Z_p eval reduced into a
@@ -376,8 +384,10 @@ where
     }
 
     // 3. Re-sample `p` from the same byte stream → identical params.
+    let (_sp_span, sp_t) = start_span!("imod_modp_sample_p");
     let params = M::sample_params(&mut transcript);
     transcript.set_params(params.clone());
+    info!(elapsed_ms = %sp_t.elapsed().as_millis(), "imod_modp_sample_p");
 
     let shape = &vk.shape;
     let num_vars = shape.num_vars;
@@ -389,13 +399,16 @@ where
     let one = MScalar::<M>::one(&params);
 
     // 4. Reduce shape/IO from BigUint to M::Scalar mod p.
+    let (_red_span, red_t) = start_span!("imod_modp_reduce");
     let mods_p = biguint_vec_to_scalars::<M>(&shape.mods, &params);
     let x_p = biguint_vec_to_scalars::<M>(&U.x, &params);
     let a_p = biguint_matrix_to_scalars::<M>(&shape.A, &params);
     let b_p = biguint_matrix_to_scalars::<M>(&shape.B, &params);
     let c_p = biguint_matrix_to_scalars::<M>(&shape.C, &params);
+    info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_modp_reduce");
 
     // Outer SC verification.
+    let (_so_span, so_t) = start_span!("imod_modp_outer_sumcheck");
     let tau: Vec<MScalar<M>> = (0..num_rounds_x)
       .map(|_| transcript.squeeze(b"tau"))
       .collect::<Result<Vec<_>, SpartanError>>()?;
@@ -417,6 +430,7 @@ where
     if claim_outer_final != outer_final_expected {
       return Err(SpartanError::InvalidSumcheckProof);
     }
+    info!(elapsed_ms = %so_t.elapsed().as_millis(), "imod_modp_outer_sumcheck");
 
     transcript.absorb(
       b"outer_claims",
@@ -424,6 +438,7 @@ where
     );
 
     // Inner SC verification.
+    let (_si_span, si_t) = start_span!("imod_modp_inner_sumcheck");
     let r = transcript.squeeze(b"r")?;
     let claim_inner = self.v_a + r * self.v_b + r * r * self.v_c;
 
@@ -431,12 +446,14 @@ where
       self
         .sc_inner
         .verify(claim_inner, num_rounds_y, 2, &params, &mut transcript)?;
+    info!(elapsed_ms = %si_t.elapsed().as_millis(), "imod_modp_inner_sumcheck");
 
-    // Reconstruct eval_Z from eval_W and public IO.
+    // Reconstruct eval_Z from eval_W and public IO, then evaluate the
+    // A/B/C MLEs at (r_x, r_y) via full eq tables (the O(2^n) verifier work).
+    let (_em_span, em_t) = start_span!("imod_modp_eval_matrices");
     let eval_x = eval_public_at::<M>(num_rounds_y - 1, &x_p, &r_y[1..], &params);
     let eval_z = (one - r_y[0]) * self.eval_w + r_y[0] * eval_x;
 
-    // Evaluate A, B, C MLEs at (r_x, r_y) via full eq tables.
     let t_x = EqPolynomial::<MScalar<M>>::evals_from_points(&r_x, &params);
     let t_y = EqPolynomial::<MScalar<M>>::evals_from_points(&r_y, &params);
     let (eval_a, eval_b, eval_c) = evaluate_matrices::<M>(&a_p, &b_p, &c_p, &t_x, &t_y, &params);
@@ -445,6 +462,7 @@ where
     if claim_inner_final != inner_final_expected {
       return Err(SpartanError::InvalidSumcheckProof);
     }
+    info!(elapsed_ms = %em_t.elapsed().as_millis(), "imod_modp_eval_matrices");
 
     // Mod-PCS verification for W at r_y[1..].
     let (_wver_span, wver_t) = start_span!("imod_modp_w_verify");
