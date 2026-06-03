@@ -39,7 +39,7 @@ use crate::{
   traits::{
     PrimeFieldExt,
     mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
-    pcs::PCSEngineTrait,
+    pcs::{FoldingEngineTrait, PCSEngineTrait},
     transcript::{ByteTranscript, TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
@@ -445,10 +445,12 @@ pub struct BatchRangeCheck {
   /// Value-reconstruction sumcheck (`sum_b 2^b · bit(r_v, b) = value(r_v)`),
   /// over the Hyrax base field.
   pub(crate) value_reconstr_sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
-  /// Opening of each value polynomial in the batch at the
-  /// reconstruction-sumcheck challenge's within-poly part `r_v_within`.
-  /// One per poly, in the batch's canonical order.
-  pub(crate) value_opens_at_rv: Vec<SmallPrimeOpening>,
+  /// Single opening of the `eq(r_v_poly, ·)`-folded value commitment at
+  /// the within-poly part `r_v_within`. Its evaluation is
+  /// `V(r_v) = Σ_p eq(r_v_poly, p)·value_p(r_v_within)` — one Hyrax open
+  /// for the whole batch (the per-poly commitments are folded
+  /// homomorphically via `fold_commitments`).
+  pub(crate) value_open_at_rv: SmallPrimeOpening,
   /// Opening of the bit polynomial at the bit-validity sumcheck's
   /// final challenge point.
   pub(crate) bit_open_validity_final: SmallPrimeOpening,
@@ -1973,22 +1975,36 @@ fn prove_batch_range_check(
   let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
     .map(|_| sub.squeeze(b"range_rv"))
     .collect::<Result<Vec<_>, _>>()?;
+  let r_v_poly = &r_v[..log_np];
   let r_v_within = &r_v[log_np..];
 
-  // Open each value poly at the shared within-part of r_v (all polys in
-  // the batch share `n_values`, hence the same within-point).
-  let mut value_opens_at_rv = Vec::with_capacity(num_polys);
-  for p in 0..num_polys {
-    value_opens_at_rv.push(hyrax_open_at(
-      ck,
-      ck_eval,
-      &mut sub,
-      value_comms[p],
-      value_polys_fq[p],
-      value_blinds[p],
-      r_v_within,
-    )?);
+  // Fold the `num_polys` value polys/commitments/blinds by the weights
+  // `eq(r_v_poly, p)` so a SINGLE Hyrax open yields
+  // `V(r_v) = Σ_p eq(r_v_poly,p)·value_p(r_v_within)`. All polys share
+  // `n_values`, so they share `r_v_within`; folding is exact by Pedersen
+  // homomorphism. (For `num_polys = 1` the weight is 1 and this is the
+  // plain single-poly open.)
+  let eq_weights = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
+  let w = &eq_weights[..num_polys];
+  let mut combined_poly = vec![t256::Scalar::ZERO; n_values];
+  for (p, poly) in value_polys_fq.iter().enumerate() {
+    for (o, &v) in combined_poly.iter_mut().zip(poly.iter()) {
+      *o += w[p] * v;
+    }
   }
+  let comms_owned: Vec<_> = value_comms.iter().map(|c| (*c).clone()).collect();
+  let blinds_owned: Vec<_> = value_blinds.iter().map(|b| (*b).clone()).collect();
+  let combined_comm = Hyrax::fold_commitments(&comms_owned, w)?;
+  let combined_blind = Hyrax::fold_blinds(&blinds_owned, w)?;
+  let value_open_at_rv = hyrax_open_at(
+    ck,
+    ck_eval,
+    &mut sub,
+    &combined_comm,
+    &combined_poly,
+    &combined_blind,
+    r_v_within,
+  )?;
 
   // Partial-eval bit_poly at r_v over the top (log_np + log_nv) vars,
   // leaving the b-axis (`stride` values).
@@ -2027,7 +2043,7 @@ fn prove_batch_range_check(
     bit_comm,
     bit_validity_sumcheck,
     value_reconstr_sumcheck,
-    value_opens_at_rv,
+    value_open_at_rv,
     bit_open_validity_final,
     bit_open_reconstr_final,
   })
@@ -2046,7 +2062,7 @@ fn verify_batch_range_check(
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
 ) -> Result<(), SpartanError> {
   let num_polys = value_comms.len();
-  if num_polys == 0 || arg.value_opens_at_rv.len() != num_polys {
+  if num_polys == 0 {
     return Err(SpartanError::InvalidSumcheckProof);
   }
   let n_pad = num_polys.next_power_of_two();
@@ -2087,26 +2103,27 @@ fn verify_batch_range_check(
     return Err(SpartanError::InvalidSumcheckProof);
   }
 
-  // 5. Squeeze r_v = (poly-index ++ within); verify each value open at
-  //    the shared within-part and reconstruct V(r_v) = Σ_p eq(r_v_poly,p)·value_p.
+  // 5. Squeeze r_v = (poly-index ++ within), fold the value commitments
+  //    by `eq(r_v_poly, p)` (matching the prover), and verify the single
+  //    folded open. Its evaluation is V(r_v) = Σ_p eq(r_v_poly,p)·value_p.
   let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
     .map(|_| sub.squeeze(b"range_rv"))
     .collect::<Result<Vec<_>, _>>()?;
   let r_v_poly = &r_v[..log_np];
   let r_v_within = &r_v[log_np..];
-  let eq_poly = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
-  let mut value_at_rv = t256::Scalar::ZERO;
-  for (p, vc) in value_comms.iter().enumerate() {
-    hyrax_verify_open(
-      vk,
-      ck_eval,
-      &mut sub,
-      vc,
-      r_v_within,
-      &arg.value_opens_at_rv[p],
-    )?;
-    value_at_rv += eq_poly[p] * arg.value_opens_at_rv[p].f_y;
-  }
+  let eq_weights = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
+  let w = &eq_weights[..num_polys];
+  let comms_owned: Vec<_> = value_comms.iter().map(|c| (*c).clone()).collect();
+  let combined_comm = Hyrax::fold_commitments(&comms_owned, w)?;
+  hyrax_verify_open(
+    vk,
+    ck_eval,
+    &mut sub,
+    &combined_comm,
+    r_v_within,
+    &arg.value_open_at_rv,
+  )?;
+  let value_at_rv = arg.value_open_at_rv.f_y;
 
   // 6. Value-reconstruction sumcheck (claim = V(r_v), degree 2,
   //    log_log_bound rounds).
