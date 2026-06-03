@@ -17,11 +17,13 @@
 
 use crate::{
   errors::SpartanError,
+  start_span,
   traits::mod_engine::{ModEngine, ModPCSEngineTrait},
 };
 use num_bigint::BigUint;
 use num_traits::Zero;
 use rayon::prelude::*;
+use tracing::info;
 
 type ModPCS<M> = <M as ModEngine>::ModPCS;
 type ModCK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::CommitmentKey;
@@ -115,6 +117,16 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       mods,
       _phantom: core::marker::PhantomData,
     })
+  }
+
+  /// Number of witness columns (`|w|`), a power of two.
+  pub fn num_vars(&self) -> usize {
+    self.num_vars
+  }
+
+  /// Number of constraint rows, a power of two.
+  pub fn num_cons(&self) -> usize {
+    self.num_cons
   }
 
   /// Mod-PCS commitment-key setup. Sized to the larger of `num_vars` /
@@ -223,6 +235,31 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
   }
 }
 
+impl IntModR1CSShapeModp<crate::provider::T256DynPrimeEngine> {
+  /// Mod-PCS key setup with explicit IntEval params, overriding the
+  /// default `DEFAULT_LOG_T_F`. Used by callers that commit wide-operand
+  /// witnesses (e.g. MultiSwap's ~2048-bit `mod N` values). Sized to the
+  /// larger of `num_vars` / `num_cons`, matching `commitment_key`.
+  pub fn commitment_key_with_params(
+    &self,
+    params: crate::provider::pcs::integer_modpcs::IntEvalParams,
+  ) -> Result<
+    (
+      ModCK<crate::provider::T256DynPrimeEngine>,
+      ModVK<crate::provider::T256DynPrimeEngine>,
+    ),
+    SpartanError,
+  > {
+    let n = self.num_vars.max(self.num_cons);
+    crate::provider::pcs::integer_modpcs::IntegerModPCS::setup_with_params(
+      b"ck_imod_modp",
+      n,
+      crate::DEFAULT_COMMITMENT_WIDTH,
+      params,
+    )
+  }
+}
+
 impl<M: ModEngine> IntModR1CSWitnessModp<M> {
   /// Commit to integer `(w, q)` and return the witness/instance pair.
   pub fn new(
@@ -237,12 +274,14 @@ impl<M: ModEngine> IntModR1CSWitnessModp<M> {
     }
     let r_w = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_vars);
     let r_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_cons);
+    let (_wq_span, wq_t) = start_span!("imod_modp_wq_commit");
     let (comm_w, comm_q) = rayon::join(
       || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &w, &r_w, false),
       || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &q, &r_q, false),
     );
     let comm_w = comm_w?;
     let comm_q = comm_q?;
+    info!(elapsed_ms = %wq_t.elapsed().as_millis(), "imod_modp_wq_commit");
     Ok((
       Self { w, q, r_w, r_q },
       IntModR1CSInstanceModp { comm_w, comm_q, x },

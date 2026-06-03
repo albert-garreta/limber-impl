@@ -83,6 +83,10 @@ harness = false
 name = "spartan_synthetic"
 harness = false
 
+[[bench]]
+name = "multiswap_modp"
+harness = false
+
 [profile.release]
 debug = 1
 lto = "fat"

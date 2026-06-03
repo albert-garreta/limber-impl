@@ -126,6 +126,26 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
   eval_arg_q: ModEvalArg<M>,
 }
 
+impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
+  /// Setup with explicit IntEval params, so callers can size the
+  /// committed-value norm bound (`log_t_f`) and limb bound (`log_t`) for
+  /// wide operands — e.g. the ~2048-bit `mod N` values in the MultiSwap
+  /// bench, which exceed the default `DEFAULT_LOG_T_F = 32`.
+  pub fn setup_with_params(
+    shape: IntModR1CSShapeModp<crate::provider::T256DynPrimeEngine>,
+    params: crate::provider::pcs::integer_modpcs::IntEvalParams,
+  ) -> Result<
+    (
+      IntModSpartanModpProverKey<crate::provider::T256DynPrimeEngine>,
+      IntModSpartanModpVerifierKey<crate::provider::T256DynPrimeEngine>,
+    ),
+    SpartanError,
+  > {
+    let (ck, vk_ee) = shape.commitment_key_with_params(params)?;
+    Ok(Self::assemble_keys(shape, ck, vk_ee))
+  }
+}
+
 impl<M> IntModSpartanModpSNARK<M>
 where
   M: ModEngine<TE = Keccak256Transcript<M>>,

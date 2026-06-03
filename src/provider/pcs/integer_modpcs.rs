@@ -382,16 +382,14 @@ pub struct IterationOracles {
   /// [`IntEvalArgument::a_prev_batch`]. `Some` for `j>1` (chain-specific
   /// commitment, one point — not batchable across chains).
   pub open_a_prev: Option<SmallPrimeOpening>,
-  /// Claimed `a_j(γ[0..n-jk])`. Both `a_j` and `b_j` are opened at the
-  /// same point, so instead of two Hyrax opens we send the two scalars
-  /// (used directly in the identity check) plus a single `curr_open` of
-  /// the RLC-folded commitment `comm_a + ρ·comm_b`.
+  /// Claimed `a_j(γ[0..n-jk])`. Used directly in the identity check. The
+  /// binding to `comm_a_shifted` is via the per-`ρ` fold
+  /// `comm_a + ρ·comm_b`, and all `s` chains' folds at this (shared) point
+  /// are opened together in one [`IntEvalArgument::curr_batch`] entry — so
+  /// there's no per-iteration opening here.
   pub a_curr_eval: t256::Scalar,
   /// Claimed `b_j(γ[0..n-jk])`. See [`Self::a_curr_eval`].
   pub b_curr_eval: t256::Scalar,
-  /// Opening of `comm_a_shifted + ρ·comm_b_shifted` at `γ[0..n-jk]`; its
-  /// evaluation must equal `a_curr_eval + ρ·b_curr_eval` (binds both).
-  pub curr_open: SmallPrimeOpening,
 }
 
 /// Per-prime chain: `t = ⌈(n-k)/k⌉` iterations plus the final-remainder
@@ -440,6 +438,12 @@ pub struct IntEvalArgument {
   /// the shared input commitment at distinct points, collapsed into one
   /// sumcheck + one opening. `None` when there are no iterations (`t=0`).
   pub(crate) a_prev_batch: Option<APrevBatch>,
+  /// One batched curr-opening per iteration layer `j ∈ [0, t)`. All `s`
+  /// chains' folded commitments `comm_a + ρ_c·comm_b` for layer `j` are
+  /// opened at the *same* point `γ[0..n-(j+1)k]`, so they're combined by a
+  /// per-layer RLC challenge `λ_j` into a single opening whose evaluation
+  /// must equal `Σ_c λ_j^c·(a_curr_eval + ρ_c·b_curr_eval)`.
+  pub(crate) curr_batch: Vec<SmallPrimeOpening>,
 }
 
 /// Multi-point batch evaluation of the input polynomial `f` (commitment
@@ -970,8 +974,15 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   }
 
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+    // `commit` limb-splits an `n`-coefficient polynomial to
+    // `2^numlimb_var · n` coefficients before reaching the inner Hyrax
+    // PCS, so the blind must cover that inflated length. For
+    // `numlimb_var = 0` (no-limb-split) this is `n` unchanged. (Size-1
+    // eval commits use a `ck_eval` with `numlimb_var = 0`, and `commit`
+    // skips splitting for `v.len() == 1`, so they are unaffected.)
+    let inflated = n << ck.params.numlimb_var;
     IntegerModBlind {
-      inner: Hyrax::blind(&ck.inner, n),
+      inner: Hyrax::blind(&ck.inner, inflated),
     }
   }
 
@@ -1148,84 +1159,100 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     } else {
       Vec::new()
     };
-    let mut chain_states: Vec<ChainProverState> = Vec::with_capacity(params.s);
-    for _ in 0..params.s {
-      let p_i = sample_small_prime(transcript, params.log_p)?;
-      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % &p_i).collect();
 
-      let mut state = ChainProverState {
-        p_i: p_i.clone(),
-        r_i_int: r_i_int.clone(),
-        iters: Vec::new(),
-      };
+    // Sample all `s` small primes upfront (paper §4: the verifier sends
+    // `[p_i]_{i=1}^s` in one round, then the prover responds with the chain
+    // oracles). Decoupling the primes from the per-chain commitments makes
+    // the chains independent, so they're built — including the Hyrax
+    // commits — in parallel. The commitments are then absorbed in order,
+    // before γ, so the binding is unchanged.
+    let primes: Vec<BigUint> = (0..params.s)
+      .map(|_| sample_small_prime(transcript, params.log_p))
+      .collect::<Result<Vec<_>, SpartanError>>()?;
 
-      if with_iter {
-        let t = num_vars.saturating_sub(params.k).div_ceil(params.k);
-        let n = num_vars;
-        let k = params.k;
+    let chain_states: Vec<ChainProverState> = primes
+      .par_iter()
+      .map(|p_i| -> Result<ChainProverState, SpartanError> {
+        let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
+        let mut iters = Vec::new();
 
-        // a_prev starts as the input polynomial (lifted once above).
-        let mut a_prev_int: Vec<BigInt> = poly_bigint.clone();
-
-        for j in 1..=t {
-          let lo = n - j * k;
-          let hi = n - (j - 1) * k;
-          let r_lower = &r_i_int[lo..hi];
-
-          let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
-          // Toward-zero divmod of every coefficient by p_i: `q · p_i + r = g`,
-          // `(b, a) = (q, r)` — see `truncated_divmod`. `d_big` is hoisted
-          // once per iteration instead of rebuilt per element.
+        if with_iter {
+          let t = num_vars.saturating_sub(params.k).div_ceil(params.k);
+          let n = num_vars;
+          let k = params.k;
           let d_big = BigInt::from(p_i.clone());
-          let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = g_j_int
-            .par_iter()
-            .map(|g| {
-              let q = g / &d_big;
-              let r = g - &q * &d_big;
-              (q, r)
-            })
-            .unzip();
-
           let s_a = BigInt::from(shift_a(params));
           let s_b = BigInt::from(shift_b(params));
-          let a_j_shifted: Vec<BigUint> = a_j_int
-            .iter()
-            .map(|x| (x + &s_a).to_biguint().expect("shift makes non-negative"))
-            .collect();
-          let b_j_shifted: Vec<BigUint> = b_j_int
-            .iter()
-            .map(|x| (x + &s_b).to_biguint().expect("shift makes non-negative"))
-            .collect();
 
-          let a_j_shifted_fq: Vec<t256::Scalar> =
-            a_j_shifted.iter().map(biguint_to_scalar).collect();
-          let b_j_shifted_fq: Vec<t256::Scalar> =
-            b_j_shifted.iter().map(biguint_to_scalar).collect();
+          // a_prev starts as the input polynomial (lifted once above).
+          let mut a_prev_int: Vec<BigInt> = poly_bigint.clone();
 
-          let a_blind = Hyrax::blind(&ck.inner, a_j_shifted_fq.len());
-          let b_blind = Hyrax::blind(&ck.inner, b_j_shifted_fq.len());
-          let comm_a_shifted = Hyrax::commit(&ck.inner, &a_j_shifted_fq, &a_blind, false)?;
-          let comm_b_shifted = Hyrax::commit(&ck.inner, &b_j_shifted_fq, &b_blind, false)?;
+          for j in 1..=t {
+            let lo = n - j * k;
+            let hi = n - (j - 1) * k;
+            let r_lower = &r_i_int[lo..hi];
 
-          transcript.absorb(b"a_shifted", &comm_a_shifted);
-          transcript.absorb(b"b_shifted", &comm_b_shifted);
+            let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
+            // Toward-zero divmod by p_i: `q·p_i + r = g`, `(b, a) = (q, r)`.
+            // Inner loop kept serial — the per-chain `par_iter` already
+            // saturates the cores.
+            let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = g_j_int
+              .iter()
+              .map(|g| {
+                let q = g / &d_big;
+                let r = g - &q * &d_big;
+                (q, r)
+              })
+              .unzip();
 
-          state.iters.push(IterationProverState {
-            a_shifted: a_j_shifted,
-            a_shifted_fq: a_j_shifted_fq,
-            a_blind: a_blind.clone(),
-            comm_a_shifted: comm_a_shifted.clone(),
-            b_shifted: b_j_shifted,
-            b_shifted_fq: b_j_shifted_fq,
-            b_blind,
-            comm_b_shifted,
-          });
+            let a_j_shifted: Vec<BigUint> = a_j_int
+              .iter()
+              .map(|x| (x + &s_a).to_biguint().expect("shift makes non-negative"))
+              .collect();
+            let b_j_shifted: Vec<BigUint> = b_j_int
+              .iter()
+              .map(|x| (x + &s_b).to_biguint().expect("shift makes non-negative"))
+              .collect();
 
-          a_prev_int = a_j_int;
+            let a_j_shifted_fq: Vec<t256::Scalar> =
+              a_j_shifted.iter().map(biguint_to_scalar).collect();
+            let b_j_shifted_fq: Vec<t256::Scalar> =
+              b_j_shifted.iter().map(biguint_to_scalar).collect();
+
+            let a_blind = Hyrax::blind(&ck.inner, a_j_shifted_fq.len());
+            let b_blind = Hyrax::blind(&ck.inner, b_j_shifted_fq.len());
+            let comm_a_shifted = Hyrax::commit(&ck.inner, &a_j_shifted_fq, &a_blind, false)?;
+            let comm_b_shifted = Hyrax::commit(&ck.inner, &b_j_shifted_fq, &b_blind, false)?;
+
+            iters.push(IterationProverState {
+              a_shifted: a_j_shifted,
+              a_shifted_fq: a_j_shifted_fq,
+              a_blind,
+              comm_a_shifted,
+              b_shifted: b_j_shifted,
+              b_shifted_fq: b_j_shifted_fq,
+              b_blind,
+              comm_b_shifted,
+            });
+
+            a_prev_int = a_j_int;
+          }
         }
-      }
 
-      chain_states.push(state);
+        Ok(ChainProverState {
+          p_i: p_i.clone(),
+          r_i_int,
+          iters,
+        })
+      })
+      .collect::<Result<Vec<_>, SpartanError>>()?;
+
+    // Absorb all chain commitments in transcript order, before γ.
+    for state in &chain_states {
+      for it in &state.iters {
+        transcript.absorb(b"a_shifted", &it.comm_a_shifted);
+        transcript.absorb(b"b_shifted", &it.comm_b_shifted);
+      }
     }
     info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
@@ -1252,6 +1279,18 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // points; collect them for the batched multi-point evaluation below.
     let mut aprev_points: Vec<Vec<t256::Scalar>> = Vec::with_capacity(params.s);
     let mut aprev_evals: Vec<t256::Scalar> = Vec::with_capacity(params.s);
+    // Per-layer folded curr data (one entry per chain), collected for the
+    // same-point batched opening after the loop.
+    let t_layers = if with_iter {
+      num_vars.saturating_sub(params.k).div_ceil(params.k)
+    } else {
+      0
+    };
+    type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+    type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+    let mut curr_comms: Vec<Vec<HC>> = vec![Vec::with_capacity(params.s); t_layers];
+    let mut curr_polys: Vec<Vec<Vec<t256::Scalar>>> = vec![Vec::with_capacity(params.s); t_layers];
+    let mut curr_blinds: Vec<Vec<HB>> = vec![Vec::with_capacity(params.s); t_layers];
     let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
     for state in &chain_states {
       let r_i_int = &state.r_i_int;
@@ -1306,9 +1345,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
             &gamma_extended,
           )?)
         };
-        // a_j and b_j are both opened at `gamma_prefix`: send the two
-        // claimed evals + ONE opening of `comm_a + ρ·comm_b`, saving an
-        // IPA per iteration.
+        // a_j and b_j are both opened at the *shared* point `gamma_prefix`.
+        // Fold them per-chain as `comm_a + ρ·comm_b`, then collect for the
+        // single same-point batched opening of layer `j` below (across all
+        // chains). Send the two evals (used in the identity check).
         let a_curr_eval = mle_evaluate_fq(&iter_state.a_shifted_fq, &gamma_prefix);
         let b_curr_eval = mle_evaluate_fq(&iter_state.b_shifted_fq, &gamma_prefix);
         let rho = squeeze_curr_rho(transcript, &a_curr_eval, &b_curr_eval)?;
@@ -1330,15 +1370,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           .zip(iter_state.b_shifted_fq.iter())
           .map(|(a, b)| *a + rho * *b)
           .collect();
-        let curr_open = hyrax_open_at(
-          &ck.inner,
-          &ck_eval.inner,
-          transcript,
-          &folded_comm,
-          &folded_poly,
-          &folded_blind,
-          &gamma_prefix,
-        )?;
+        curr_comms[jm1].push(folded_comm);
+        curr_polys[jm1].push(folded_poly);
+        curr_blinds[jm1].push(folded_blind);
 
         iter_oracles.push(IterationOracles {
           comm_a_shifted: iter_state.comm_a_shifted.clone(),
@@ -1347,7 +1381,6 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           open_a_prev,
           a_curr_eval,
           b_curr_eval,
-          curr_open,
         });
       }
 
@@ -1386,6 +1419,43 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       });
     }
     info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_openings");
+
+    // Batched curr openings: for each iteration layer `j`, all `s` chains'
+    // folded commitments are at the same point `γ[0..n-(j+1)k]`, so combine
+    // them with a per-layer RLC challenge `λ_j` and open once.
+    let (_cb_span, cb_t) = start_span!("imod_pcs_curr_batch");
+    let mut curr_batch: Vec<SmallPrimeOpening> = Vec::with_capacity(t_layers);
+    for j in 0..t_layers {
+      let prefix_len = num_vars - (j + 1) * params.k;
+      let gamma_prefix = gamma_fq[..prefix_len].to_vec();
+      let lam_bytes = transcript.squeeze_bytes(b"curr_lambda")?;
+      let lambda = <t256::Scalar as PrimeFieldExt>::from_uniform(&lam_bytes);
+      let mut weights = Vec::with_capacity(params.s);
+      let mut pow = t256::Scalar::ONE;
+      for _ in 0..params.s {
+        weights.push(pow);
+        pow *= lambda;
+      }
+      let combined_comm = Hyrax::fold_commitments(&curr_comms[j], &weights)?;
+      let combined_blind = Hyrax::fold_blinds(&curr_blinds[j], &weights)?;
+      let plen = curr_polys[j][0].len();
+      let mut combined_poly = vec![t256::Scalar::ZERO; plen];
+      for (c, poly) in curr_polys[j].iter().enumerate() {
+        for (o, &v) in combined_poly.iter_mut().zip(poly.iter()) {
+          *o += weights[c] * v;
+        }
+      }
+      curr_batch.push(hyrax_open_at(
+        &ck.inner,
+        &ck_eval.inner,
+        transcript,
+        &combined_comm,
+        &combined_poly,
+        &combined_blind,
+        &gamma_prefix,
+      )?);
+    }
+    info!(elapsed_ms = %cb_t.elapsed().as_millis(), "imod_pcs_curr_batch");
 
     // Batched `j=1` a_prev evaluation: prove all `s` claimed
     // `f(z_c) = aprev_evals[c]` against the shared input commitment with
@@ -1520,6 +1590,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       chains,
       range_checks,
       a_prev_batch,
+      curr_batch,
     })
   }
 
@@ -1627,23 +1698,24 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction");
 
     let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
-    // 3. Phase 1: per chain, re-sample p_i, then for each iteration
-    //    consume comm_a_shifted / comm_b_shifted from the arg and absorb
-    //    them identically.
+    // 3. Phase 1: re-sample all `s` primes upfront, then absorb the chain
+    //    commitments in order — mirroring the prover's reordered FS.
+    let primes: Vec<BigUint> = (0..params.s)
+      .map(|_| sample_small_prime(transcript, params.log_p))
+      .collect::<Result<Vec<_>, SpartanError>>()?;
     let mut chain_primes: Vec<(BigUint, Vec<BigUint>)> = Vec::with_capacity(params.s);
-    for chain in &arg.chains {
-      let p_i = sample_small_prime(transcript, params.log_p)?;
-      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % &p_i).collect();
-
+    for (chain, p_i) in arg.chains.iter().zip(primes.iter()) {
       if chain.iterations.len() != t {
         return Err(SpartanError::InvalidSumcheckProof);
       }
+      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
+      chain_primes.push((p_i.clone(), r_i_int));
+    }
+    for chain in &arg.chains {
       for iter in &chain.iterations {
         transcript.absorb(b"a_shifted", &iter.comm_a_shifted);
         transcript.absorb(b"b_shifted", &iter.comm_b_shifted);
       }
-
-      chain_primes.push((p_i, r_i_int));
     }
 
     // 4. Sample γ if iterating, identically to prover.
@@ -1667,6 +1739,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
     let mut aprev_points: Vec<Vec<t256::Scalar>> = Vec::with_capacity(params.s);
     let mut aprev_evals: Vec<t256::Scalar> = Vec::with_capacity(params.s);
+    // Per-layer reconstructed folded commitments + per-chain folded evals
+    // (`a + ρ·b`), for the batched curr-open verification after the loop.
+    type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+    let mut curr_comms: Vec<Vec<HC>> = vec![Vec::with_capacity(params.s); t];
+    let mut curr_evals: Vec<Vec<t256::Scalar>> = vec![Vec::with_capacity(params.s); t];
     for (chain_idx, chain) in arg.chains.iter().enumerate() {
       let (p_i, r_i_int) = &chain_primes[chain_idx];
       let p_i_fq = biguint_to_scalar(p_i);
@@ -1711,25 +1788,16 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
             return Err(SpartanError::InvalidSumcheckProof);
           }
         }
-        // Batched a_j/b_j opening at `gamma_prefix`: re-derive ρ from the
-        // claimed evals, fold `comm_a + ρ·comm_b`, verify the single open,
-        // and check its eval equals `a_curr_eval + ρ·b_curr_eval`.
+        // Batched a_j/b_j opening at `gamma_prefix`: re-derive ρ, reconstruct
+        // the folded commitment `comm_a + ρ·comm_b` and the folded eval, and
+        // collect them for the per-layer batched open verified after the loop.
         let rho = squeeze_curr_rho(transcript, &iter.a_curr_eval, &iter.b_curr_eval)?;
         let folded_comm = Hyrax::fold_commitments(
           &[iter.comm_a_shifted.clone(), iter.comm_b_shifted.clone()],
           &[t256::Scalar::ONE, rho],
         )?;
-        hyrax_verify_open(
-          &vk.inner,
-          &ck_eval.inner,
-          transcript,
-          &folded_comm,
-          &gamma_prefix,
-          &iter.curr_open,
-        )?;
-        if iter.curr_open.f_y != iter.a_curr_eval + rho * iter.b_curr_eval {
-          return Err(SpartanError::InvalidSumcheckProof);
-        }
+        curr_comms[jm1].push(folded_comm);
+        curr_evals[jm1].push(iter.a_curr_eval + rho * iter.b_curr_eval);
 
         // Identity check in F: a_j(γ) + p_i · b_j(γ) ?= a_{j-1}(γ_ext).
         // a_prev for j=1 is the *unshifted* input poly (no subtract);
@@ -1787,6 +1855,44 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       }
     }
     info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
+
+    // Verify the per-layer batched curr openings: re-derive λ_j, fold the
+    // reconstructed commitments with λ_j powers, verify the single open, and
+    // check its eval equals `Σ_c λ_j^c·(a_curr + ρ_c·b_curr)`.
+    let (_vcb_span, vcb_t) = start_span!("imod_pcs_verify_curr_batch");
+    if arg.curr_batch.len() != t {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    for j in 0..t {
+      let prefix_len = n - (j + 1) * k;
+      let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
+      let lam_bytes = transcript.squeeze_bytes(b"curr_lambda")?;
+      let lambda = <t256::Scalar as PrimeFieldExt>::from_uniform(&lam_bytes);
+      let mut weights = Vec::with_capacity(params.s);
+      let mut pow = t256::Scalar::ONE;
+      for _ in 0..params.s {
+        weights.push(pow);
+        pow *= lambda;
+      }
+      let combined_comm = Hyrax::fold_commitments(&curr_comms[j], &weights)?;
+      hyrax_verify_open(
+        &vk.inner,
+        &ck_eval.inner,
+        transcript,
+        &combined_comm,
+        &gamma_prefix,
+        &arg.curr_batch[j],
+      )?;
+      let expected: t256::Scalar = weights
+        .iter()
+        .zip(curr_evals[j].iter())
+        .map(|(w, e)| *w * *e)
+        .sum();
+      if arg.curr_batch[j].f_y != expected {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+    }
+    info!(elapsed_ms = %vcb_t.elapsed().as_millis(), "imod_pcs_verify_curr_batch");
 
     // Verify the batched `j=1` a_prev evaluation: re-derive λ, reconstruct
     // the sumcheck claim `Σ_c λ^c·a_prev_eval`, verify the sumcheck + the
@@ -3101,5 +3207,39 @@ mod tests {
       &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
     )
     .unwrap();
+  }
+
+  /// Regression: limb-split commit when the *inflated* polynomial spans
+  /// multiple Hyrax rows (`width < 2^numlimb_var · n`). `blind` must cover
+  /// the inflated length, not the input length — otherwise `commit`
+  /// indexes past the blind. The masked case from
+  /// `prove_verify_roundtrips_with_limb_split` (where `n < width`, so
+  /// everything fit in one row) did not exercise this.
+  #[test]
+  fn limb_split_commit_spans_multiple_hyrax_rows() {
+    let num_vars = 4usize;
+    let n = 1usize << num_vars; // 16
+    // numlimb = 2, numlimb_var = 1 → inflated length 32.
+    let limb_params = IntEvalParams::derive(8, 4, 2, num_vars).expect("valid derived params");
+    assert_eq!(limb_params.numlimb_var, 1);
+
+    // width = 4 < inflated length 32 → div_ceil(32, 4) = 8 Hyrax rows,
+    // versus div_ceil(16, 4) = 4 rows for the un-inflated blind.
+    let (ck, _vk) =
+      IntegerModPCS::setup_with_params(b"limb-split-rows", n, 4, limb_params).unwrap();
+
+    let poly: Vec<BigUint> = (0..n)
+      .map(|i| BigUint::from((i * 13 + 1) as u32 & 0xff))
+      .collect();
+
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    // The bug manifested as an index-out-of-bounds panic here.
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+
+    // Commit matches a direct Hyrax commit of the limb-split polynomial.
+    let limbs = limb_split_polynomial(&poly, 4, 8);
+    let limbs_fq: Vec<t256::Scalar> = limbs.iter().map(biguint_to_scalar).collect();
+    let direct = Hyrax::commit(&ck.inner, &limbs_fq, &blind.inner, false).unwrap();
+    assert_eq!(comm.inner, direct);
   }
 }
