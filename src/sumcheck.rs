@@ -596,9 +596,22 @@ impl<E: Engine> SumcheckProof<E> {
 
     for _round in 0..num_rounds {
       let poly = {
-        // Same eval as the 3-input cubic with A=B=C → eq·(A² − A).
-        let (eval_point_0, eval_point_2, eval_point_3) = eq_instance
-          .evaluation_points_cubic_with_three_inputs(poly_A, poly_A, poly_A, claim_per_round);
+        // Same eval as the 3-input cubic with A=B=C → eq·(A² − A). At round 0
+        // of a zerocheck (claim = 0) the integrand vanishes on the hypercube,
+        // so t(0) = 0 and only the degree-2 leading term is needed — reuse the
+        // existing round-0 skip (saves ~50% of the largest round). For later
+        // rounds (claim ≠ 0) fall back to the full cubic.
+        let (eval_point_0, eval_point_2, eval_point_3) =
+          if _round == 0 && claim_per_round == E::Scalar::ZERO {
+            eq_instance.evaluation_points_zero_check_round0(poly_A, poly_A)
+          } else {
+            eq_instance.evaluation_points_cubic_with_three_inputs(
+              poly_A,
+              poly_A,
+              poly_A,
+              claim_per_round,
+            )
+          };
         let evals = vec![
           eval_point_0,
           claim_per_round - eval_point_0,
