@@ -76,13 +76,6 @@ impl<E: Engine> HyraxCommitmentKey<E>
 where
   E::GE: DlogGroupExt,
 {
-  /// Number of columns (the Hyrax matrix width) this key commits with.
-  /// A polynomial of `n` coefficients is laid out as `⌈n / num_cols⌉`
-  /// rows of `num_cols` each.
-  pub fn num_cols(&self) -> usize {
-    self.num_cols
-  }
-
   /// Eagerly initialize the h_table for fixed-base scalar multiplication.
   /// Call before cloning to ensure both copies have the precomputed table.
   pub fn ensure_h_table(&self) {
@@ -113,16 +106,6 @@ where
   num_cols: usize,
   ck: Vec<AffineGroupElement<E>>,
   h: E::GE,
-}
-
-impl<E: Engine> HyraxVerifierKey<E>
-where
-  E::GE: DlogGroup,
-{
-  /// Number of columns (the Hyrax matrix width) this key verifies with.
-  pub fn num_cols(&self) -> usize {
-    self.num_cols
-  }
 }
 
 /// Structure that holds commitments
