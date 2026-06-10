@@ -570,6 +570,213 @@ impl<E: Engine> LogUpRangeProof<E> {
   }
 }
 
+/// Evaluation claims a [`LogUpMultiRangeProof`] reduces to: one
+/// `(point, eval)` pair per witness tree (in input order), plus the single
+/// multiplicity claim. Each must be discharged with a PCS opening.
+#[derive(Clone, Debug)]
+pub struct MultiRangeClaims<E: Engine> {
+  /// The (shared) LogUp challenge `r`.
+  pub r: E::Scalar,
+  /// `(ρ_i, w_i(ρ_i))` per witness tree, in input order.
+  pub wit_claims: Vec<(Vec<E::Scalar>, E::Scalar)>,
+  /// Point at which the shared multiplicity MLE must be opened.
+  pub mult_point: Vec<E::Scalar>,
+  /// Claimed `m(mult_point)`.
+  pub mult_eval: E::Scalar,
+}
+
+/// A LogUp-GKR proof that *several* witness vectors are all range-bounded
+/// by `[0, 2^bits)` against ONE shared multiplicity table. The lookup
+/// identity is additive, so each witness gets its own fraction tree
+/// (reduced to an opening of its own commitment) while the table side —
+/// the `2^bits`-leaf tree and the multiplicity commitment — is paid once:
+///
+/// ```text
+///   Σ_b Σ_i 1/(r + w_b[i])  =  Σ_j m_j/(r + j)
+/// ```
+///
+/// The verifier sums the witness root fractions and cross-multiplies
+/// against the table root. Every witness vector must already be a power
+/// of two long (committed polynomials are); the table counts them all.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub struct LogUpMultiRangeProof<E: Engine> {
+  /// Per-witness-tree root fraction `(P_b, Q_b)`.
+  wit_roots: Vec<(E::Scalar, E::Scalar)>,
+  p_rhs_root: E::Scalar,
+  q_rhs_root: E::Scalar,
+  wit_gkrs: Vec<GkrProof<E>>,
+  rhs_gkr: GkrProof<E>,
+}
+
+impl<E: Engine> LogUpMultiRangeProof<E> {
+  /// The shared multiplicity table over all witness vectors:
+  /// `m_j = Σ_b #{i : w_b[i] = j}`. Each witness must be power-of-two
+  /// long (no implicit padding — committed polys already are). Callers
+  /// must commit this table and absorb it *before* the transcript point
+  /// where [`Self::prove`] squeezes the LogUp challenge `r`.
+  pub fn multiplicities(bits: usize, witnesses: &[&[u64]]) -> Result<Vec<u64>, SpartanError> {
+    let table = 1usize << bits;
+    let mut mult = vec![0u64; table];
+    for (b, witness) in witnesses.iter().enumerate() {
+      if witness.is_empty() || !witness.len().is_power_of_two() {
+        return Err(SpartanError::InvalidInputLength {
+          reason: format!(
+            "logup-gkr multi: witness {b} length {} is not a positive power of two",
+            witness.len()
+          ),
+        });
+      }
+      for &w in witness.iter() {
+        let idx = w as usize;
+        if idx >= table {
+          return Err(SpartanError::InvalidInputLength {
+            reason: format!("logup-gkr multi: witness {b} value {w} >= 2^{bits}"),
+          });
+        }
+        mult[idx] += 1;
+      }
+    }
+    Ok(mult)
+  }
+
+  /// Prove that every value of every witness lies in `[0, 2^bits)`.
+  pub fn prove(
+    bits: usize,
+    witnesses: &[&[u64]],
+    transcript: &mut E::TE,
+  ) -> Result<(Self, MultiRangeClaims<E>), SpartanError> {
+    if witnesses.is_empty() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "logup-gkr multi: no witnesses".to_string(),
+      });
+    }
+    let table = 1usize << bits;
+    let mult = Self::multiplicities(bits, witnesses)?;
+
+    transcript.dom_sep(b"logup_multi_range");
+    let r = transcript.squeeze(b"logup_r")?;
+
+    // One fraction tree per witness: leaves (1, r + w_b[i]).
+    let mut wit_roots = Vec::with_capacity(witnesses.len());
+    let mut wit_gkrs = Vec::with_capacity(witnesses.len());
+    let mut wit_claims = Vec::with_capacity(witnesses.len());
+    for witness in witnesses {
+      let p = vec![E::Scalar::ONE; witness.len()];
+      let q: Vec<E::Scalar> = witness.iter().map(|&w| r + E::Scalar::from(w)).collect();
+      let out = gkr_prove::<E>(p, q, transcript)?;
+      wit_roots.push((out.root_p, out.root_q));
+      wit_claims.push((out.leaf_point, out.leaf_q - r));
+      wit_gkrs.push(out.proof);
+    }
+
+    // One shared table tree: leaves (m_j, r + j).
+    let p_rhs: Vec<E::Scalar> = mult.iter().map(|&m| E::Scalar::from(m)).collect();
+    let q_rhs: Vec<E::Scalar> = (0..table).map(|j| r + E::Scalar::from(j as u64)).collect();
+    let rhs = gkr_prove::<E>(p_rhs, q_rhs, transcript)?;
+
+    let claims = MultiRangeClaims {
+      r,
+      wit_claims,
+      mult_point: rhs.leaf_point,
+      mult_eval: rhs.leaf_p,
+    };
+
+    Ok((
+      LogUpMultiRangeProof {
+        wit_roots,
+        p_rhs_root: rhs.root_p,
+        q_rhs_root: rhs.root_q,
+        wit_gkrs,
+        rhs_gkr: rhs.proof,
+      },
+      claims,
+    ))
+  }
+
+  /// Verify against the expected per-witness tree depths (`log2` of each
+  /// committed witness polynomial's length — the caller MUST pin these,
+  /// otherwise a prover could range-check smaller polynomials). Returns
+  /// the [`MultiRangeClaims`] to discharge via PCS openings.
+  pub fn verify(
+    &self,
+    bits: usize,
+    expected_wit_depths: &[usize],
+    transcript: &mut E::TE,
+  ) -> Result<MultiRangeClaims<E>, SpartanError> {
+    if self.wit_gkrs.len() != expected_wit_depths.len()
+      || self.wit_roots.len() != expected_wit_depths.len()
+      || expected_wit_depths.is_empty()
+    {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr multi: witness tree count mismatch".to_string(),
+      });
+    }
+
+    transcript.dom_sep(b"logup_multi_range");
+    let r = transcript.squeeze(b"logup_r")?;
+
+    let mut wit_claims = Vec::with_capacity(self.wit_gkrs.len());
+    for (i, gkr) in self.wit_gkrs.iter().enumerate() {
+      let (root_p, root_q) = self.wit_roots[i];
+      let (point, leaf_p, leaf_q) =
+        gkr_verify::<E>(root_p, root_q, expected_wit_depths[i], gkr, transcript)?;
+      // Witness numerators are all 1.
+      if leaf_p != E::Scalar::ONE {
+        return Err(SpartanError::ProofVerifyError {
+          reason: format!("logup-gkr multi: witness {i} numerator leaf != 1"),
+        });
+      }
+      wit_claims.push((point, leaf_q - r));
+    }
+
+    let (rhs_point, rhs_p, rhs_q) = gkr_verify::<E>(
+      self.p_rhs_root,
+      self.q_rhs_root,
+      bits,
+      &self.rhs_gkr,
+      transcript,
+    )?;
+    // Table denominators are r + idx(j), checked in closed form.
+    if rhs_q != r + idx_mle_eval::<E::Scalar>(&rhs_point) {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr multi: table index leaf mismatch".to_string(),
+      });
+    }
+
+    // Summed LogUp identity: Σ_b P_b/Q_b == P_R/Q_R, via fraction folding
+    // and one cross-product. Reject zero denominators (pole hits).
+    if self.q_rhs_root == E::Scalar::ZERO {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr multi: zero table denominator".to_string(),
+      });
+    }
+    let mut sum_p = E::Scalar::ZERO;
+    let mut sum_q = E::Scalar::ONE;
+    for (i, &(p_b, q_b)) in self.wit_roots.iter().enumerate() {
+      if q_b == E::Scalar::ZERO {
+        return Err(SpartanError::ProofVerifyError {
+          reason: format!("logup-gkr multi: zero denominator in witness {i}"),
+        });
+      }
+      sum_p = sum_p * q_b + p_b * sum_q;
+      sum_q *= q_b;
+    }
+    if sum_p * self.q_rhs_root != self.p_rhs_root * sum_q {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr multi: LogUp identity failed (value out of range)".to_string(),
+      });
+    }
+
+    Ok(MultiRangeClaims {
+      r,
+      wit_claims,
+      mult_point: rhs_point,
+      mult_eval: rhs_p,
+    })
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -684,5 +891,68 @@ mod tests {
     proof.rhs_gkr.layers[last].round_polys[0][2] += <E as Engine>::Scalar::ONE;
     let mut tv = <E as Engine>::TE::new(b"logup_test");
     assert!(proof.verify(4, &mut tv).is_err());
+  }
+
+  /// Multi-witness roundtrip: several trees of different sizes against one
+  /// shared table; reduced claims match the true MLEs.
+  #[test]
+  fn multi_range_roundtrips() {
+    type E = PallasHyraxEngine;
+    type F = <E as Engine>::Scalar;
+    let w0: Vec<u64> = vec![3, 7, 3, 0, 15, 1, 9, 3]; // len 8
+    let w1: Vec<u64> = vec![14, 0]; // len 2
+    let w2: Vec<u64> = vec![5, 5, 5, 5, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 7]; // len 16
+    let witnesses: Vec<&[u64]> = vec![&w0, &w1, &w2];
+
+    let mut tp = <E as Engine>::TE::new(b"logup_multi");
+    let (proof, claims_p) = LogUpMultiRangeProof::<E>::prove(4, &witnesses, &mut tp).unwrap();
+
+    let depths = [3usize, 1, 4];
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    let claims_v = proof.verify(4, &depths, &mut tv).unwrap();
+
+    assert_eq!(claims_p.r, claims_v.r);
+    assert_eq!(claims_p.wit_claims.len(), 3);
+
+    // Every reduced witness claim matches the true MLE of its vector, and
+    // the multiplicity claim matches the shared table's MLE.
+    for (b, witness) in witnesses.iter().enumerate() {
+      let tbl: Vec<F> = witness.iter().map(|&w| F::from(w)).collect();
+      let (point, eval) = &claims_v.wit_claims[b];
+      assert_eq!(*eval, mle_eval(&tbl, point), "witness {b} claim mismatch");
+    }
+    let mult = LogUpMultiRangeProof::<E>::multiplicities(4, &witnesses).unwrap();
+    let m_tbl: Vec<F> = mult.iter().map(|&m| F::from(m)).collect();
+    assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
+  }
+
+  /// Multi-witness: out-of-range value rejected at prove; tampered roots
+  /// and wrong expected depths rejected at verify.
+  #[test]
+  fn multi_range_rejects_bad() {
+    type E = PallasHyraxEngine;
+    let w0: Vec<u64> = vec![3, 16, 0, 1]; // 16 out of range for bits=4
+    assert!(
+      LogUpMultiRangeProof::<E>::prove(4, &[&w0], &mut <E as Engine>::TE::new(b"m")).is_err()
+    );
+
+    let w0: Vec<u64> = vec![3, 7, 3, 0];
+    let w1: Vec<u64> = vec![1, 2];
+    let mut tp = <E as Engine>::TE::new(b"logup_multi");
+    let (proof, _) = LogUpMultiRangeProof::<E>::prove(4, &[&w0, &w1], &mut tp).unwrap();
+
+    // Tampered witness root breaks the summed identity.
+    let mut bad = proof.clone();
+    bad.wit_roots[1].0 += <E as Engine>::Scalar::ONE;
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    assert!(bad.verify(4, &[2, 1], &mut tv).is_err());
+
+    // Wrong pinned depth rejected.
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    assert!(proof.verify(4, &[2, 2], &mut tv).is_err());
+
+    // Honest proof still verifies.
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    assert!(proof.verify(4, &[2, 1], &mut tv).is_ok());
   }
 }
