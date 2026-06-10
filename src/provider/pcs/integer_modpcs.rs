@@ -122,8 +122,6 @@ impl IntEvalParams {
     let nl_pre = numlimb(log_t_f, log_t);
     let nlv_pre = numlimb_var(nl_pre);
     let num_vars_total = num_vars + nlv_pre;
-    let log_n = ceil_log2(num_vars_total.max(1));
-    let log_lambda = ceil_log2(LAMBDA);
 
     // Find max log_p satisfying Partial Evaluation Norm Bound:
     //   k + k·log_p + max(log_t, log_p) < log_q   (uses limb bound T)
@@ -145,17 +143,24 @@ impl IntEvalParams {
       });
     }
 
-    // Smallest s satisfying Soundness 1: s · (log_p - 5 - log λ - log n) ≥ λ.
-    let denom = log_p as isize - 5 - log_lambda as isize - log_n as isize;
-    if denom <= 0 {
+    // Smallest s satisfying the prime-divisibility soundness bound
+    //   (log_P(y) / (π(P) − π(P/2)))^s ≤ 2^{−λ},
+    // where log2(y) = n + λ·n + log_t bounds the integer difference between a
+    // false and the true partial evaluation, and log_P(y) upper-bounds how
+    // many primes ≥ P/2 can divide it. `bits_per_prime` is the soundness each
+    // random small prime in (P/2, P] contributes; the prime count π(P)−π(P/2)
+    // is lower-bounded (Dusart/Rosser–Schoenfeld) so s stays sound. Replaces
+    // the older crude `(32 λ n / P)` union bound, which over-provisioned s.
+    let bits_per_prime = soundness_bits_per_prime(log_p, num_vars_total, log_t);
+    if bits_per_prime <= 0.0 {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
-          "IntEvalParams::derive: Soundness 1 denominator non-positive for k={k}, \
-           num_vars={num_vars}, derived log_p={log_p}"
+          "IntEvalParams::derive: prime-divisibility soundness gives ≤ 0 bits per \
+           prime for k={k}, num_vars={num_vars}, derived log_p={log_p}"
         ),
       });
     }
-    let s = LAMBDA.div_ceil(denom as usize);
+    let s = (LAMBDA as f64 / bits_per_prime).ceil() as usize;
 
     let nl = numlimb(log_t_f, log_t);
     let p = Self {
@@ -214,8 +219,6 @@ impl IntEvalParams {
   /// soundness bounds.
   pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
     let num_vars_total = num_vars + self.numlimb_var;
-    let log_n = ceil_log2(num_vars_total.max(1));
-    let log_lambda = ceil_log2(LAMBDA);
 
     // Limb-decomposition self-consistency: `numlimb` and `numlimb_var`
     // must match the formulas implied by `(log_t, log_t_f)`. Catches
@@ -277,15 +280,14 @@ impl IntEvalParams {
       });
     }
 
-    // Soundness Bound 1: (32 λ n / P)^s <= 2^{-λ}
-    //   log: s · (5 + log λ + log n - log_p) <= -λ
-    //   <=>  s · (log_p - 5 - log λ - log n) >= λ
-    let log_inner = self.log_p as isize - 5 - log_lambda as isize - log_n as isize;
-    if log_inner <= 0 || (self.s as isize) * log_inner < (LAMBDA as isize) {
+    // Soundness Bound 1 (prime divisibility): (log_P(y) / (π(P) − π(P/2)))^s ≤ 2^{−λ}
+    //   <=>  s · bits_per_prime ≥ λ,  bits_per_prime = log2(π(P)−π(P/2)) − log2(log_P y).
+    let bits_per_prime = soundness_bits_per_prime(self.log_p, num_vars_total, self.log_t);
+    if bits_per_prime <= 0.0 || (self.s as f64) * bits_per_prime < LAMBDA as f64 {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
-          "IntEval Soundness Bound 1 violated: s·(log_p - 5 - log λ - log n) = {} < λ = {}",
-          (self.s as isize) * log_inner,
+          "IntEval Soundness Bound 1 violated: s·bits_per_prime = {:.2} < λ = {}",
+          (self.s as f64) * bits_per_prime,
           LAMBDA
         ),
       });
@@ -315,6 +317,51 @@ fn ceil_log2(x: usize) -> usize {
     return 0;
   }
   (usize::BITS - (x - 1).leading_zeros()) as usize
+}
+
+/// Strict lower bound on `π(2^log2_x)` (the prime-counting function). Uses
+/// Dusart's (2010) `π(x) ≥ (x/ln x)(1 + 1/ln x)` for `x ≥ 599`, and the
+/// Rosser–Schoenfeld `π(x) > x/ln x` (valid `x ≥ 17`) below that. Returns a
+/// lower bound so downstream prime-count soundness estimates stay conservative.
+fn pi_lower_2pow(log2_x: usize) -> f64 {
+  let x = (log2_x as f64).exp2();
+  let lnx = (log2_x as f64) * core::f64::consts::LN_2;
+  if x >= 599.0 {
+    (x / lnx) * (1.0 + 1.0 / lnx)
+  } else {
+    x / lnx
+  }
+}
+
+/// Upper bound on `π(2^log2_x)` via Dusart's `π(x) ≤ (x/ln x)(1 + 1.2762/ln x)`
+/// (valid `x ≥ 2`).
+fn pi_upper_2pow(log2_x: usize) -> f64 {
+  let x = (log2_x as f64).exp2();
+  let lnx = (log2_x as f64) * core::f64::consts::LN_2;
+  (x / lnx) * (1.0 + 1.2762 / lnx)
+}
+
+/// `log2` of a lower bound on the number of primes in `(P/2, P]`, `P = 2^log_p`.
+fn log2_primes_in_top_half(log_p: usize) -> f64 {
+  let count = (pi_lower_2pow(log_p) - pi_upper_2pow(log_p.saturating_sub(1))).max(1.0);
+  count.log2()
+}
+
+/// Soundness (in bits) each random small prime `p ∈ (P/2, P]`, `P = 2^log_p`,
+/// contributes to the IntEval CRT fingerprint:
+///   `log2(π(P) − π(P/2)) − log2(log_P(y))`,
+/// with `log2(y) = n + λ·n + log_t` the bound on the integer difference between
+/// a false and the true partial evaluation, and `log_P(y)` an upper bound on
+/// how many primes `≥ P/2` can divide it. `n` is the limb-split polynomial's
+/// variable count. A larger value ⇒ fewer primes `s` needed. Primes below
+/// `2^5` are too sparse for the bounds, so they return a rejecting value.
+fn soundness_bits_per_prime(log_p: usize, n: usize, log_t: usize) -> f64 {
+  if log_p < 5 {
+    return -1.0;
+  }
+  let log2_y = (n as f64) * (1.0 + LAMBDA as f64) + (log_t as f64);
+  let log_p_y = (log2_y / (log_p as f64)).max(1.0);
+  log2_primes_in_top_half(log_p) - log_p_y.log2()
 }
 
 /// Mod-PCS commitment key wraps Hyrax's plus the IntEval parameters.
@@ -2241,6 +2288,14 @@ fn prove_batch_range_check(
   let stride = 1usize << log_log_bound;
   let n_bits = n_pad * n_values * stride;
   let log_n_bits = ceil_log2(n_bits.max(1));
+  info!(
+    num_polys = num_polys,
+    n_values = n_values,
+    log_bound = log_bound,
+    stride = stride,
+    n_bits = n_bits,
+    "imod_pcs_range_batch"
+  );
 
   // 1. Stacked bit polynomial. Index `((p·n_values + within)·stride + b)`.
   //    Padding polys (`p ≥ num_polys`) and bits `b ≥ log_bound` stay zero.

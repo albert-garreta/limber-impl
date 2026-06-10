@@ -261,10 +261,10 @@ fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>
 
 /// Derive IntEval params sized for the shape's committed-value width
 /// (~2048-bit `mod N` operands → `log_t_f = 2048`) and vector length.
-fn params_for(shape: &IntModR1CSShapeModp<M>) -> IntEvalParams {
+fn params_for(shape: &IntModR1CSShapeModp<M>, int_k: usize) -> IntEvalParams {
   let n = shape.num_vars().max(shape.num_cons());
   let log_n = (n as u64).ilog2() as usize; // n is a power of two
-  IntEvalParams::derive(2048, LOG_T, DEFAULT_K, log_n).expect("IntEval params satisfy bounds")
+  IntEvalParams::derive(2048, LOG_T, int_k, log_n).expect("IntEval params satisfy bounds")
 }
 
 /// Paper Fig. 3 analytical F_p constraint count for MultiSwap at batch
@@ -310,13 +310,23 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     for &k in ks {
       let dims = Dims::multiswap(k);
       let (shape, w, q) = multiswap_shape_and_witness(dims);
-      let params = params_for(&shape);
-      let (pk, vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
-      let (witness, instance) =
-        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
-      shape.is_sat(pk.ck(), &instance, &witness).unwrap();
-      let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
-      proof.verify(&vk, &instance).unwrap();
+      // Sweep the IntEval per-iteration parameter `int_k` (distinct from the
+      // MultiSwap batch size `k`) to see how it trades off `s`/iterations
+      // against prove/verify cost under the prime-counting Soundness-1 bound.
+      for int_k in 7..=10usize {
+        let params = params_for(&shape, int_k);
+        println!(
+          "=== IntEval k={int_k}: log_p={} s={} numlimb={} numlimb_var={} (batch k={k}) ===",
+          params.log_p, params.s, params.numlimb, params.numlimb_var
+        );
+        let (pk, vk) =
+          IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
+        let (witness, instance) =
+          IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+        shape.is_sat(pk.ck(), &instance, &witness).unwrap();
+        let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+        proof.verify(&vk, &instance).unwrap();
+      }
     }
   }
 
@@ -346,7 +356,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, _, _) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape);
+          let params = params_for(&shape, DEFAULT_K);
           (shape, params)
         },
         |(shape, params)| {
@@ -377,7 +387,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, w, q) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape);
+          let params = params_for(&shape, DEFAULT_K);
           let (pk, _vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
           (pk, shape, w, q)
@@ -393,7 +403,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, w, q) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape);
+          let params = params_for(&shape, DEFAULT_K);
           let (pk, _vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
           (pk, shape, w, q)
@@ -419,7 +429,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, w, q) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape);
+          let params = params_for(&shape, DEFAULT_K);
           let (pk, vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
           let (witness, instance) =
