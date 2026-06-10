@@ -2352,6 +2352,7 @@ fn prove_shared_range_check(
     .map(|b| BatchDims::new(b.value_comms.len(), b.n_values, b.log_bound))
     .collect();
 
+  let (_rcc_span, rcc_t) = start_span!("imod_pcs_rc_chunk_commit");
   // 1. Per batch: stacked chunk polynomial (u64 entries, each < 2^16).
   //    Index `((p·n_values + within)·stride + c)`. Padding polys
   //    (`p ≥ num_polys`) and slots `c ≥ numchunks` stay zero (zero is in
@@ -2402,6 +2403,8 @@ fn prove_shared_range_check(
     chunk_comms.push(comm);
   }
 
+  info!(elapsed_ms = %rcc_t.elapsed().as_millis(), "imod_pcs_rc_chunk_commit");
+
   // 2. Shifted top chunks of the non-16-aligned batches: `top + (2^16 −
   //    2^rem)` is in the 2^16 table iff `top < 2^rem`. These become extra
   //    LogUp witness trees; no extra commitment (their MLE is the chunk
@@ -2418,6 +2421,7 @@ fn prove_shared_range_check(
     }
   }
 
+  let (_rcm_span, rcm_t) = start_span!("imod_pcs_rc_mult_commit");
   // 3. The shared multiplicity table over ALL witness trees, committed
   //    before the LogUp challenge `r` is squeezed (multiplicities chosen
   //    after `r` would break the lookup identity).
@@ -2434,6 +2438,8 @@ fn prove_shared_range_check(
   let mult_blind = Hyrax::blind(ck, mult_fq.len());
   let mult_comm = Hyrax::commit(ck, &mult_fq, &mult_blind, true)?;
 
+  info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "imod_pcs_rc_mult_commit");
+
   // 4. Sub-transcript bound to every commitment involved.
   let mut sub = spawn_shared_range_subtranscript(
     parent,
@@ -2442,6 +2448,7 @@ fn prove_shared_range_check(
     &mult_comm,
   )?;
 
+  let (_rcl_span, rcl_t) = start_span!("imod_pcs_rc_logup_gkr");
   // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
   //    [0, 2^16).
   let (logup, claims) = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::prove(
@@ -2449,6 +2456,9 @@ fn prove_shared_range_check(
     &witness_refs,
     &mut sub,
   )?;
+  info!(elapsed_ms = %rcl_t.elapsed().as_millis(), "imod_pcs_rc_logup_gkr");
+
+  let (_rco_span, rco_t) = start_span!("imod_pcs_rc_opens");
   let mult_open = hyrax_open_at(
     ck,
     ck_eval,
@@ -2503,6 +2513,9 @@ fn prove_shared_range_check(
     top_chunk_opens[*bi] = Some(open);
   }
 
+  info!(elapsed_ms = %rco_t.elapsed().as_millis(), "imod_pcs_rc_opens");
+
+  let (_rcr_span, rcr_t) = start_span!("imod_pcs_rc_reconstr");
   // 8. Per batch: value-reconstruction sumcheck tying the chunks to the
   //    batch's value commitments. Squeeze r_v over (poly-index ++ within);
   //    fold the value polys/commitments/blinds by `eq(r_v_poly, p)` so a
@@ -2587,6 +2600,8 @@ fn prove_shared_range_check(
       chunk_open_reconstr,
     });
   }
+
+  info!(elapsed_ms = %rcr_t.elapsed().as_millis(), "imod_pcs_rc_reconstr");
 
   Ok(SharedRangeCheck {
     mult_comm,
