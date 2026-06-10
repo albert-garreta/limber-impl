@@ -87,6 +87,10 @@ harness = false
 name = "multiswap_modp"
 harness = false
 
+[[bench]]
+name = "logup_gkr"
+harness = false
+
 [profile.release]
 debug = 1
 lto = "fat"

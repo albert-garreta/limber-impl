@@ -1,0 +1,628 @@
+//! LogUp-GKR range proof.
+//!
+//! Proves that every value in a witness vector lies in `[0, 2^bits)` using the
+//! logarithmic-derivative (LogUp) lookup identity
+//!
+//! ```text
+//!   sum_{i=0}^{N-1} 1/(r + w[i])  =  sum_{j=0}^{2^bits - 1} m_j/(r + j)
+//! ```
+//!
+//! where `m_j` is the multiplicity (number of witnesses equal to `j`). The
+//! identity holds for a random challenge `r` iff the multiset `{w[i]}` is
+//! contained in the table `[0, 2^bits)` — which is exactly the range claim.
+//!
+//! Each side of the identity is a sum of rational functions, evaluated by a
+//! layered GKR circuit whose gates add fractions:
+//!
+//! ```text
+//!   (p_l, q_l) + (p_r, q_r) = (p_l·q_r + p_r·q_l,  q_l·q_r)
+//! ```
+//!
+//! A balanced binary tree of these gates reduces `2^d` leaf fractions to a
+//! single root fraction `(P, Q) = (numerator, denominator)` equal to the whole
+//! sum. We run one tree per side and check the cross-product
+//! `P_L·Q_R == P_R·Q_L` (i.e. `P_L/Q_L == P_R/Q_R`).
+//!
+//! The GKR protocol reduces the root claim, layer by layer, to a single
+//! evaluation claim about each side's *leaf* multilinear extension at a random
+//! point. For the witness side that claim pins `w(ρ_L)`; for the table side it
+//! pins `m(ρ_R)`. Those two evaluations are returned as [`RangeClaims`] so the
+//! caller can discharge them with PCS openings of the committed witness and
+//! multiplicity polynomials. The table-index and all-ones-numerator leaves are
+//! structured, so the verifier checks them in closed form.
+//!
+//! This module is intentionally self-contained (no PCS dependency yet) so the
+//! GKR core and the LogUp identity can be tested in isolation before wiring the
+//! returned [`RangeClaims`] into a commitment scheme. **Fiat–Shamir note:** a
+//! real caller must absorb the witness and multiplicity commitments into the
+//! transcript *before* calling [`LogUpRangeProof::prove`]/`verify`, so the
+//! challenge `r` is bound to them.
+
+use crate::{
+  errors::SpartanError,
+  polys::eq::EqPolynomial,
+  traits::{
+    Engine,
+    transcript::{ByteTranscript, TranscriptEngineTrait},
+  },
+};
+use ff::{Field, PrimeField};
+
+/// In-place bind of a dense MLE's top variable to `r`: replaces the table with
+/// its restriction `Z(r, ·)` (length halves). Matches the big-endian
+/// convention of [`crate::polys::multilinear::MultilinearPolynomial`].
+#[inline]
+fn bind_top<F: PrimeField>(v: &mut Vec<F>, r: F) {
+  let h = v.len() / 2;
+  for i in 0..h {
+    let diff = v[i + h] - v[i];
+    v[i] += r * diff;
+  }
+  v.truncate(h);
+}
+
+/// Evaluate a degree-3 univariate at `r` from its evaluations at `0,1,2,3`
+/// via Lagrange interpolation.
+fn eval_cubic<F: PrimeField>(e: &[F; 4], r: F) -> F {
+  let inv2 = F::from(2).invert().expect("2 invertible");
+  let inv6 = F::from(6).invert().expect("6 invertible");
+  let r1 = r - F::ONE;
+  let r2 = r - F::from(2);
+  let r3 = r - F::from(3);
+  // Lagrange basis at nodes {0,1,2,3}.
+  let l0 = r1 * r2 * r3 * (-inv6);
+  let l1 = r * r2 * r3 * inv2;
+  let l2 = r * r1 * r3 * (-inv2);
+  let l3 = r * r1 * r2 * inv6;
+  e[0] * l0 + e[1] * l1 + e[2] * l2 + e[3] * l3
+}
+
+/// Closed-form evaluation of the MLE of the table-index function
+/// `f(j) = j` over `{0,1}^len`, at `point` (with `point[0]` the most
+/// significant variable): `sum_k point[k]·2^(len-1-k)`.
+fn idx_mle_eval<F: PrimeField>(point: &[F]) -> F {
+  let mut acc = F::ZERO;
+  let mut pow = F::ONE;
+  for k in (0..point.len()).rev() {
+    acc += point[k] * pow;
+    pow = pow + pow;
+  }
+  acc
+}
+
+/// One GKR layer's reduction: the cubic-sumcheck round polynomials (each as
+/// evaluations at `0,1,2,3`) plus the input layer's four evaluations
+/// `(p(0,ρ'), p(1,ρ'), q(0,ρ'), q(1,ρ'))` at the sumcheck point.
+#[derive(Clone, Debug)]
+pub(crate) struct GkrLayerProof<E: Engine> {
+  round_polys: Vec<[E::Scalar; 4]>,
+  p0: E::Scalar,
+  p1: E::Scalar,
+  q0: E::Scalar,
+  q1: E::Scalar,
+}
+
+/// A fractional-sum GKR proof: one [`GkrLayerProof`] per layer, top (root) to
+/// bottom (leaves).
+#[derive(Clone, Debug)]
+pub(crate) struct GkrProof<E: Engine> {
+  layers: Vec<GkrLayerProof<E>>,
+}
+
+/// Prover output for one fraction tree.
+struct GkrOut<E: Engine> {
+  proof: GkrProof<E>,
+  root_p: E::Scalar,
+  root_q: E::Scalar,
+  leaf_point: Vec<E::Scalar>,
+  leaf_p: E::Scalar,
+  leaf_q: E::Scalar,
+}
+
+/// Build all layers of the fraction tree from the leaves up to the root.
+/// `levels_p[k]` / `levels_q[k]` hold the `2^k`-entry layer; `[d]` is the
+/// leaves and `[0]` the single-entry root.
+fn build_levels<E: Engine>(
+  p_leaves: Vec<E::Scalar>,
+  q_leaves: Vec<E::Scalar>,
+) -> (Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>) {
+  let n = p_leaves.len();
+  let d = n.trailing_zeros() as usize;
+  let mut levels_p = vec![Vec::new(); d + 1];
+  let mut levels_q = vec![Vec::new(); d + 1];
+  levels_p[d] = p_leaves;
+  levels_q[d] = q_leaves;
+  for k in (0..d).rev() {
+    let half = 1usize << k;
+    let mut op = vec![E::Scalar::ZERO; half];
+    let mut oq = vec![E::Scalar::ZERO; half];
+    {
+      let in_p = &levels_p[k + 1];
+      let in_q = &levels_q[k + 1];
+      for i in 0..half {
+        // Combine the (top=0, i) and (top=1, i) fractions.
+        op[i] = in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i];
+        oq[i] = in_q[i] * in_q[i + half];
+      }
+    }
+    levels_p[k] = op;
+    levels_q[k] = oq;
+  }
+  (levels_p, levels_q)
+}
+
+/// Prove that `(root_p, root_q)` is the sum of the leaf fractions
+/// `(p_leaves[i], q_leaves[i])`, reducing the root claim to a single
+/// evaluation claim on the leaf MLEs.
+fn gkr_prove<E: Engine>(
+  p_leaves: Vec<E::Scalar>,
+  q_leaves: Vec<E::Scalar>,
+  transcript: &mut E::TE,
+) -> Result<GkrOut<E>, SpartanError> {
+  let n = p_leaves.len();
+  assert!(n.is_power_of_two() && n == q_leaves.len() && n >= 1);
+  let d = n.trailing_zeros() as usize;
+  let (levels_p, levels_q) = build_levels::<E>(p_leaves, q_leaves);
+
+  let root_p = levels_p[0][0];
+  let root_q = levels_q[0][0];
+  transcript.absorb(b"gkr_root_p", &root_p);
+  transcript.absorb(b"gkr_root_q", &root_q);
+
+  let mut layers = Vec::with_capacity(d);
+  let mut point: Vec<E::Scalar> = Vec::new();
+  let mut claim_p = root_p;
+  let mut claim_q = root_q;
+
+  for k in 0..d {
+    let lambda = transcript.squeeze(b"gkr_lambda")?;
+    let half = 1usize << k; // size of the x-cube for this layer's sumcheck
+
+    let mut eq = EqPolynomial::evals_from_points(&point); // len 2^k
+    let mut a0 = levels_p[k + 1][0..half].to_vec();
+    let mut a1 = levels_p[k + 1][half..2 * half].to_vec();
+    let mut b0 = levels_q[k + 1][0..half].to_vec();
+    let mut b1 = levels_q[k + 1][half..2 * half].to_vec();
+
+    let mut round_polys = Vec::with_capacity(k);
+    let mut challenges = Vec::with_capacity(k);
+
+    for _round in 0..k {
+      let l = eq.len();
+      let h = l / 2;
+      let mut s = [E::Scalar::ZERO; 4];
+      for i in 0..h {
+        let eq_lo = eq[i];
+        let eq_d = eq[i + h] - eq[i];
+        let a0_lo = a0[i];
+        let a0_d = a0[i + h] - a0[i];
+        let a1_lo = a1[i];
+        let a1_d = a1[i + h] - a1[i];
+        let b0_lo = b0[i];
+        let b0_d = b0[i + h] - b0[i];
+        let b1_lo = b1[i];
+        let b1_d = b1[i + h] - b1[i];
+        for (ti, t) in [0u64, 1, 2, 3].into_iter().enumerate() {
+          let tf = E::Scalar::from(t);
+          let eqv = eq_lo + tf * eq_d;
+          let a0v = a0_lo + tf * a0_d;
+          let a1v = a1_lo + tf * a1_d;
+          let b0v = b0_lo + tf * b0_d;
+          let b1v = b1_lo + tf * b1_d;
+          s[ti] += eqv * (a0v * b1v + a1v * b0v + lambda * (b0v * b1v));
+        }
+      }
+      for v in &s {
+        transcript.absorb(b"gkr_rp", v);
+      }
+      let ri = transcript.squeeze(b"gkr_chal")?;
+      bind_top(&mut eq, ri);
+      bind_top(&mut a0, ri);
+      bind_top(&mut a1, ri);
+      bind_top(&mut b0, ri);
+      bind_top(&mut b1, ri);
+      round_polys.push(s);
+      challenges.push(ri);
+    }
+
+    let (p0, p1, q0, q1) = (a0[0], a1[0], b0[0], b1[0]);
+    transcript.absorb(b"gkr_p0", &p0);
+    transcript.absorb(b"gkr_p1", &p1);
+    transcript.absorb(b"gkr_q0", &q0);
+    transcript.absorb(b"gkr_q1", &q1);
+    let c = transcript.squeeze(b"gkr_c")?;
+
+    // Next layer's claim point is (c, challenges) with c the top variable.
+    let mut next_point = Vec::with_capacity(k + 1);
+    next_point.push(c);
+    next_point.extend_from_slice(&challenges);
+    point = next_point;
+    claim_p = (E::Scalar::ONE - c) * p0 + c * p1;
+    claim_q = (E::Scalar::ONE - c) * q0 + c * q1;
+
+    layers.push(GkrLayerProof {
+      round_polys,
+      p0,
+      p1,
+      q0,
+      q1,
+    });
+  }
+
+  Ok(GkrOut {
+    proof: GkrProof { layers },
+    root_p,
+    root_q,
+    leaf_point: point,
+    leaf_p: claim_p,
+    leaf_q: claim_q,
+  })
+}
+
+/// Verify a fractional-sum GKR proof against the claimed root fraction and the
+/// expected number of layers `d`. Returns the reduced leaf claim
+/// `(point, p_leaf(point), q_leaf(point))`.
+fn gkr_verify<E: Engine>(
+  root_p: E::Scalar,
+  root_q: E::Scalar,
+  d: usize,
+  proof: &GkrProof<E>,
+  transcript: &mut E::TE,
+) -> Result<(Vec<E::Scalar>, E::Scalar, E::Scalar), SpartanError> {
+  if proof.layers.len() != d {
+    return Err(SpartanError::ProofVerifyError {
+      reason: "logup-gkr: wrong number of layers".to_string(),
+    });
+  }
+  transcript.absorb(b"gkr_root_p", &root_p);
+  transcript.absorb(b"gkr_root_q", &root_q);
+
+  let mut point: Vec<E::Scalar> = Vec::new();
+  let mut claim_p = root_p;
+  let mut claim_q = root_q;
+
+  for k in 0..d {
+    let lp = &proof.layers[k];
+    if lp.round_polys.len() != k {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: wrong round count in layer".to_string(),
+      });
+    }
+    let lambda = transcript.squeeze(b"gkr_lambda")?;
+    let mut claim = claim_p + lambda * claim_q;
+    let mut challenges = Vec::with_capacity(k);
+
+    for s in &lp.round_polys {
+      // Sumcheck consistency: s(0) + s(1) == running claim.
+      if s[0] + s[1] != claim {
+        return Err(SpartanError::ProofVerifyError {
+          reason: "logup-gkr: sumcheck round mismatch".to_string(),
+        });
+      }
+      for v in s {
+        transcript.absorb(b"gkr_rp", v);
+      }
+      let ri = transcript.squeeze(b"gkr_chal")?;
+      claim = eval_cubic::<E::Scalar>(s, ri);
+      challenges.push(ri);
+    }
+
+    transcript.absorb(b"gkr_p0", &lp.p0);
+    transcript.absorb(b"gkr_p1", &lp.p1);
+    transcript.absorb(b"gkr_q0", &lp.q0);
+    transcript.absorb(b"gkr_q1", &lp.q1);
+
+    // Final sumcheck check against the gate relation:
+    //   eq(point, ρ')·[p0·q1 + p1·q0 + λ·q0·q1] == claim.
+    let eq_val = EqPolynomial::new(point.clone()).evaluate(&challenges);
+    let gate = lp.p0 * lp.q1 + lp.p1 * lp.q0 + lambda * (lp.q0 * lp.q1);
+    if eq_val * gate != claim {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: layer gate check failed".to_string(),
+      });
+    }
+
+    let c = transcript.squeeze(b"gkr_c")?;
+    let mut next_point = Vec::with_capacity(k + 1);
+    next_point.push(c);
+    next_point.extend_from_slice(&challenges);
+    point = next_point;
+    claim_p = (E::Scalar::ONE - c) * lp.p0 + c * lp.p1;
+    claim_q = (E::Scalar::ONE - c) * lp.q0 + c * lp.q1;
+  }
+
+  Ok((point, claim_p, claim_q))
+}
+
+/// Evaluation claims a [`LogUpRangeProof`] reduces to, for the caller to
+/// discharge with PCS openings.
+#[derive(Clone, Debug)]
+pub struct RangeClaims<E: Engine> {
+  /// The LogUp challenge `r`.
+  pub r: E::Scalar,
+  /// Point at which the witness MLE must be opened (`ρ_L`).
+  pub wit_point: Vec<E::Scalar>,
+  /// Claimed `w(ρ_L)` — open the witness commitment here and check equality.
+  pub wit_eval: E::Scalar,
+  /// Point at which the multiplicity MLE must be opened (`ρ_R`).
+  pub mult_point: Vec<E::Scalar>,
+  /// Claimed `m(ρ_R)` — open the multiplicity commitment here and check.
+  pub mult_eval: E::Scalar,
+}
+
+/// A LogUp-GKR proof that a witness vector is range-bounded by `[0, 2^bits)`.
+#[derive(Clone, Debug)]
+pub struct LogUpRangeProof<E: Engine> {
+  p_lhs_root: E::Scalar,
+  q_lhs_root: E::Scalar,
+  p_rhs_root: E::Scalar,
+  q_rhs_root: E::Scalar,
+  lhs_gkr: GkrProof<E>,
+  rhs_gkr: GkrProof<E>,
+}
+
+impl<E: Engine> LogUpRangeProof<E> {
+  /// Number of variables of the padded witness polynomial (`log2` of the
+  /// witness leaf count). The witness commitment must be over this many
+  /// variables, with the trailing slots padded with the value `0`.
+  pub fn witness_num_vars(witness_len: usize) -> usize {
+    witness_len.max(1).next_power_of_two().trailing_zeros() as usize
+  }
+
+  /// Prove that every value in `witness` lies in `[0, 2^bits)`.
+  ///
+  /// Returns the proof and the [`RangeClaims`] (the witness and multiplicity
+  /// evaluation claims to discharge via PCS). The witness is conceptually
+  /// padded to the next power of two with the value `0` (the multiplicity of
+  /// `0` is bumped accordingly), so the committed witness polynomial has
+  /// [`Self::witness_num_vars`] variables.
+  pub fn prove(
+    bits: usize,
+    witness: &[u64],
+    transcript: &mut E::TE,
+  ) -> Result<(Self, RangeClaims<E>), SpartanError> {
+    if witness.is_empty() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "logup-gkr: empty witness".to_string(),
+      });
+    }
+    let table = 1usize << bits;
+    let n = witness.len().next_power_of_two();
+
+    // Multiplicities over the table, plus the padding `0`s.
+    let mut mult = vec![0u64; table];
+    for &w in witness {
+      let idx = w as usize;
+      if idx >= table {
+        return Err(SpartanError::InvalidInputLength {
+          reason: format!("logup-gkr: witness value {w} >= 2^{bits}"),
+        });
+      }
+      mult[idx] += 1;
+    }
+    mult[0] += (n - witness.len()) as u64;
+
+    transcript.dom_sep(b"logup_range");
+    let r = transcript.squeeze(b"logup_r")?;
+
+    // Witness-side leaves: (1, r + w[i]); padding leaves use w = 0.
+    let p_lhs = vec![E::Scalar::ONE; n];
+    let mut q_lhs = vec![E::Scalar::ZERO; n];
+    for (i, slot) in q_lhs.iter_mut().enumerate() {
+      let w = if i < witness.len() { witness[i] } else { 0 };
+      *slot = r + E::Scalar::from(w);
+    }
+
+    // Table-side leaves: (m_j, r + j).
+    let mut p_rhs = vec![E::Scalar::ZERO; table];
+    let mut q_rhs = vec![E::Scalar::ZERO; table];
+    for j in 0..table {
+      p_rhs[j] = E::Scalar::from(mult[j]);
+      q_rhs[j] = r + E::Scalar::from(j as u64);
+    }
+
+    let lhs = gkr_prove::<E>(p_lhs, q_lhs, transcript)?;
+    let rhs = gkr_prove::<E>(p_rhs, q_rhs, transcript)?;
+
+    let claims = RangeClaims {
+      r,
+      wit_point: lhs.leaf_point.clone(),
+      wit_eval: lhs.leaf_q - r, // q_leaf = r + w  ⇒  w = q_leaf - r
+      mult_point: rhs.leaf_point.clone(),
+      mult_eval: rhs.leaf_p, // p_leaf = m
+    };
+
+    Ok((
+      LogUpRangeProof {
+        p_lhs_root: lhs.root_p,
+        q_lhs_root: lhs.root_q,
+        p_rhs_root: rhs.root_p,
+        q_rhs_root: rhs.root_q,
+        lhs_gkr: lhs.proof,
+        rhs_gkr: rhs.proof,
+      },
+      claims,
+    ))
+  }
+
+  /// Verify the proof and return the [`RangeClaims`] the caller must discharge
+  /// (witness opening at `wit_point == wit_eval`, multiplicity opening at
+  /// `mult_point == mult_eval`).
+  pub fn verify(
+    &self,
+    bits: usize,
+    transcript: &mut E::TE,
+  ) -> Result<RangeClaims<E>, SpartanError> {
+    let d_lhs = self.lhs_gkr.layers.len();
+
+    transcript.dom_sep(b"logup_range");
+    let r = transcript.squeeze(b"logup_r")?;
+
+    let (lhs_point, lhs_p, lhs_q) = gkr_verify::<E>(
+      self.p_lhs_root,
+      self.q_lhs_root,
+      d_lhs,
+      &self.lhs_gkr,
+      transcript,
+    )?;
+    let (rhs_point, rhs_p, rhs_q) = gkr_verify::<E>(
+      self.p_rhs_root,
+      self.q_rhs_root,
+      bits,
+      &self.rhs_gkr,
+      transcript,
+    )?;
+
+    // LogUp identity: sum_LHS == sum_RHS  ⇔  P_L/Q_L == P_R/Q_R.
+    if self.q_lhs_root == E::Scalar::ZERO || self.q_rhs_root == E::Scalar::ZERO {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: zero denominator (challenge hit a pole)".to_string(),
+      });
+    }
+    if self.p_lhs_root * self.q_rhs_root != self.p_rhs_root * self.q_lhs_root {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: LogUp identity failed (value out of range)".to_string(),
+      });
+    }
+
+    // Structured leaf checks. Witness numerators are all 1, so the leaf
+    // numerator MLE must evaluate to 1.
+    if lhs_p != E::Scalar::ONE {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: witness numerator leaf != 1".to_string(),
+      });
+    }
+    // Table denominators are r + idx(j); the verifier reconstructs idx in
+    // closed form.
+    if rhs_q != r + idx_mle_eval::<E::Scalar>(&rhs_point) {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: table index leaf mismatch".to_string(),
+      });
+    }
+
+    Ok(RangeClaims {
+      r,
+      wit_point: lhs_point,
+      wit_eval: lhs_q - r,
+      mult_point: rhs_point,
+      mult_eval: rhs_p,
+    })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::provider::{PallasHyraxEngine, T256HyraxEngine};
+  use ff::Field;
+  use rand::{Rng, SeedableRng, rngs::StdRng};
+
+  /// Direct MLE evaluation of a dense table at `point` (point[0] = MSB),
+  /// matching the GKR's big-endian variable order.
+  fn mle_eval<F: PrimeField>(table: &[F], point: &[F]) -> F {
+    let chis = EqPolynomial::evals_from_points(point);
+    table.iter().zip(chis.iter()).map(|(z, c)| *z * *c).sum()
+  }
+
+  #[test]
+  fn idx_mle_matches_dense() {
+    type F = <PallasHyraxEngine as Engine>::Scalar;
+    for bits in 1..=6usize {
+      let table: Vec<F> = (0..(1u64 << bits)).map(F::from).collect();
+      let point: Vec<F> = (0..bits)
+        .map(|i| F::from((7 * i as u64 + 3) % 101))
+        .collect();
+      assert_eq!(idx_mle_eval::<F>(&point), mle_eval(&table, &point));
+    }
+  }
+
+  /// End-to-end: an in-range witness verifies, and the reduced witness /
+  /// multiplicity claims match the true MLE evaluations.
+  fn range_roundtrip_with<E: Engine>(bits: usize, witness: &[u64])
+  where
+    <E::Scalar as crate::traits::mod_engine::SumcheckField>::Params: Default,
+  {
+    type TEof<E> = <E as Engine>::TE;
+    let mut tp = <TEof<E>>::new(b"logup_test");
+    let (proof, claims_p) = LogUpRangeProof::<E>::prove(bits, witness, &mut tp).unwrap();
+
+    let mut tv = <TEof<E>>::new(b"logup_test");
+    let claims_v = proof.verify(bits, &mut tv).unwrap();
+
+    // Prover and verifier agree on the reduced claims.
+    assert_eq!(claims_p.r, claims_v.r);
+    assert_eq!(claims_p.wit_point, claims_v.wit_point);
+    assert_eq!(claims_p.wit_eval, claims_v.wit_eval);
+    assert_eq!(claims_p.mult_point, claims_v.mult_point);
+    assert_eq!(claims_p.mult_eval, claims_v.mult_eval);
+
+    // The reduced claims match the true MLEs of the padded witness and the
+    // multiplicity table (this is what a PCS opening would confirm).
+    let table = 1usize << bits;
+    let n = witness.len().next_power_of_two();
+    let mut w_tbl = vec![E::Scalar::ZERO; n];
+    for (i, slot) in w_tbl.iter_mut().enumerate() {
+      let w = if i < witness.len() { witness[i] } else { 0 };
+      *slot = E::Scalar::from(w);
+    }
+    let mut mult = vec![0u64; table];
+    for &w in witness {
+      mult[w as usize] += 1;
+    }
+    mult[0] += (n - witness.len()) as u64;
+    let m_tbl: Vec<E::Scalar> = mult.iter().map(|&m| E::Scalar::from(m)).collect();
+
+    assert_eq!(claims_v.wit_eval, mle_eval(&w_tbl, &claims_v.wit_point));
+    assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
+  }
+
+  #[test]
+  fn range_roundtrips_small() {
+    range_roundtrip_with::<PallasHyraxEngine>(4, &[3, 7, 3, 0, 15, 1, 9, 3]);
+  }
+
+  #[test]
+  fn range_roundtrips_non_power_of_two_witness() {
+    // 5 witnesses → padded to 8 with value 0.
+    range_roundtrip_with::<PallasHyraxEngine>(4, &[1, 2, 14, 14, 0]);
+  }
+
+  #[test]
+  fn range_roundtrips_t256_bits8() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let witness: Vec<u64> = (0..200).map(|_| rng.gen_range(0..256)).collect();
+    range_roundtrip_with::<T256HyraxEngine>(8, &witness);
+  }
+
+  #[test]
+  fn prove_rejects_out_of_range() {
+    type E = PallasHyraxEngine;
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    // 16 >= 2^4 = 16, out of range.
+    assert!(LogUpRangeProof::<E>::prove(4, &[1, 2, 16], &mut tp).is_err());
+  }
+
+  #[test]
+  fn verify_rejects_tampered_root() {
+    type E = PallasHyraxEngine;
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    let (mut proof, _) = LogUpRangeProof::<E>::prove(4, &[3, 7, 3, 0], &mut tp).unwrap();
+    // Corrupt the witness-side numerator root: breaks the LogUp identity.
+    proof.p_lhs_root += <E as Engine>::Scalar::ONE;
+    let mut tv = <E as Engine>::TE::new(b"logup_test");
+    assert!(proof.verify(4, &mut tv).is_err());
+  }
+
+  #[test]
+  fn verify_rejects_tampered_layer() {
+    type E = PallasHyraxEngine;
+    let mut tp = <E as Engine>::TE::new(b"logup_test");
+    let (mut proof, _) =
+      LogUpRangeProof::<E>::prove(4, &[3, 7, 3, 0, 1, 2, 5, 5], &mut tp).unwrap();
+    // Corrupt a sumcheck round polynomial deep in the table tree.
+    let last = proof.rhs_gkr.layers.len() - 1;
+    proof.rhs_gkr.layers[last].round_polys[0][2] += <E as Engine>::Scalar::ONE;
+    let mut tv = <E as Engine>::TE::new(b"logup_test");
+    assert!(proof.verify(4, &mut tv).is_err());
+  }
+}
