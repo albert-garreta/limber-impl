@@ -1131,7 +1131,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
     //    coefficients (and 2^numlimb_var slots per original coefficient,
     //    padded with zero if numlimb isn't a power of two).
+    let (_ls_span, ls_t) = start_span!("imod_pcs_red_limb_split");
     let f_limb = limb_split_polynomial(poly, params.log_t, params.log_t_f);
+    info!(elapsed_ms = %ls_t.elapsed().as_millis(), "imod_pcs_red_limb_split");
 
     // 1. Reduction sumcheck (Phase-3 step D3): reduce the eval claim
     //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
@@ -1140,6 +1142,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     //    {0,1}^numlimb_var. For numlimb_var = 0 the sumcheck has zero
     //    rounds, returns `r_k = []`, and the recovered eval equals
     //    the input `eval` directly (limb(empty) = T^0 = 1).
+    let (_dc_span, dc_t) = start_span!("imod_pcs_red_to_dynprime");
     let f_limb_p: Vec<crate::dyn_prime::DynPrime<4>> = f_limb
       .iter()
       .map(|b| {
@@ -1149,14 +1152,17 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         )
       })
       .collect();
+    info!(elapsed_ms = %dc_t.elapsed().as_millis(), "imod_pcs_red_to_dynprime");
     // Partial-eval f_limb at the original `point` in Z_p, leaving the
     // last numlimb_var variables free. Bind the top variables (= the
     // original n_vars) one at a time.
+    let (_pe_span, pe_t) = start_span!("imod_pcs_red_dynprime_bind");
     let mut mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
     for r_i in point {
       mle.bind_poly_var_top(r_i);
     }
     let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<4>> = mle.into_vec();
+    info!(elapsed_ms = %pe_t.elapsed().as_millis(), "imod_pcs_red_dynprime_bind");
     debug_assert_eq!(f_limb_at_int_r.len(), 1 << params.numlimb_var);
 
     let limb_p = build_limb_weight_dynprime(params, &monty);
@@ -1187,7 +1193,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let int_point_ext: Vec<BigUint> = int_point.iter().chain(r_k_int.iter()).cloned().collect();
 
     // 3. int_v' = f_limb at the extended point, over Z.
+    let (_ie_span, ie_t) = start_span!("imod_pcs_red_integer_eval");
     let int_v_prime = integer_mle_evaluate(&f_limb, &int_point_ext);
+    info!(elapsed_ms = %ie_t.elapsed().as_millis(), "imod_pcs_red_integer_eval");
 
     // 4. Sanity: f_eval_p ≡ int_v' (mod p). For numlimb_var=0, f_eval_p
     //    == eval and this matches the pre-D3 check.
@@ -1226,7 +1234,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let num_vars = point.len() + params.numlimb_var;
     let with_iter = num_vars > params.k;
     let poly = f_limb.as_slice();
+    let (_fq_span, fq_t) = start_span!("imod_pcs_red_to_fq");
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
+    info!(elapsed_ms = %fq_t.elapsed().as_millis(), "imod_pcs_red_to_fq");
     info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_pcs_reduction");
 
     // 4. Phase 1: per prime, sample p_i, run all t iterations (if any),
