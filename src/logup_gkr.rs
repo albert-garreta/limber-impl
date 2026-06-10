@@ -47,6 +47,12 @@ use crate::{
   },
 };
 use ff::{Field, PrimeField};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// Below this many index pairs, the hot loops run serially (rayon overhead
+/// would dominate).
+const PAR_THRESHOLD: usize = 1 << 12;
 
 /// In-place bind of a dense MLE's top variable to `r`: replaces the table with
 /// its restriction `Z(r, ·)` (length halves). Matches the big-endian
@@ -54,9 +60,16 @@ use ff::{Field, PrimeField};
 #[inline]
 fn bind_top<F: PrimeField>(v: &mut Vec<F>, r: F) {
   let h = v.len() / 2;
-  for i in 0..h {
-    let diff = v[i + h] - v[i];
-    v[i] += r * diff;
+  if h >= PAR_THRESHOLD {
+    let (lo, hi) = v.split_at_mut(h);
+    lo.par_iter_mut().zip(hi.par_iter()).for_each(|(a, b)| {
+      *a += r * (*b - *a);
+    });
+  } else {
+    for i in 0..h {
+      let diff = v[i + h] - v[i];
+      v[i] += r * diff;
+    }
   }
   v.truncate(h);
 }
@@ -93,7 +106,8 @@ fn idx_mle_eval<F: PrimeField>(point: &[F]) -> F {
 /// One GKR layer's reduction: the cubic-sumcheck round polynomials (each as
 /// evaluations at `0,1,2,3`) plus the input layer's four evaluations
 /// `(p(0,ρ'), p(1,ρ'), q(0,ρ'), q(1,ρ'))` at the sumcheck point.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub(crate) struct GkrLayerProof<E: Engine> {
   round_polys: Vec<[E::Scalar; 4]>,
   p0: E::Scalar,
@@ -104,7 +118,8 @@ pub(crate) struct GkrLayerProof<E: Engine> {
 
 /// A fractional-sum GKR proof: one [`GkrLayerProof`] per layer, top (root) to
 /// bottom (leaves).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub(crate) struct GkrProof<E: Engine> {
   layers: Vec<GkrLayerProof<E>>,
 }
@@ -139,10 +154,20 @@ fn build_levels<E: Engine>(
     {
       let in_p = &levels_p[k + 1];
       let in_q = &levels_q[k + 1];
-      for i in 0..half {
-        // Combine the (top=0, i) and (top=1, i) fractions.
-        op[i] = in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i];
-        oq[i] = in_q[i] * in_q[i + half];
+      // Combine the (top=0, i) and (top=1, i) fractions.
+      if half >= PAR_THRESHOLD {
+        op.par_iter_mut()
+          .zip(oq.par_iter_mut())
+          .enumerate()
+          .for_each(|(i, (p, q))| {
+            *p = in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i];
+            *q = in_q[i] * in_q[i + half];
+          });
+      } else {
+        for i in 0..half {
+          op[i] = in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i];
+          oq[i] = in_q[i] * in_q[i + half];
+        }
       }
     }
     levels_p[k] = op;
@@ -190,8 +215,10 @@ fn gkr_prove<E: Engine>(
     for _round in 0..k {
       let l = eq.len();
       let h = l / 2;
-      let mut s = [E::Scalar::ZERO; 4];
-      for i in 0..h {
+      // Per-index contribution to the round polynomial's evaluations at
+      // t ∈ {0,1,2,3}: extrapolate each table linearly in the top variable
+      // and accumulate eq·(p0·q1 + p1·q0 + λ·q0·q1).
+      let eval_at = |i: usize| -> [E::Scalar; 4] {
         let eq_lo = eq[i];
         let eq_d = eq[i + h] - eq[i];
         let a0_lo = a0[i];
@@ -202,6 +229,7 @@ fn gkr_prove<E: Engine>(
         let b0_d = b0[i + h] - b0[i];
         let b1_lo = b1[i];
         let b1_d = b1[i + h] - b1[i];
+        let mut out = [E::Scalar::ZERO; 4];
         for (ti, t) in [0u64, 1, 2, 3].into_iter().enumerate() {
           let tf = E::Scalar::from(t);
           let eqv = eq_lo + tf * eq_d;
@@ -209,9 +237,24 @@ fn gkr_prove<E: Engine>(
           let a1v = a1_lo + tf * a1_d;
           let b0v = b0_lo + tf * b0_d;
           let b1v = b1_lo + tf * b1_d;
-          s[ti] += eqv * (a0v * b1v + a1v * b0v + lambda * (b0v * b1v));
+          out[ti] = eqv * (a0v * b1v + a1v * b0v + lambda * (b0v * b1v));
         }
-      }
+        out
+      };
+      let add4 = |mut a: [E::Scalar; 4], b: [E::Scalar; 4]| {
+        for (x, y) in a.iter_mut().zip(b.iter()) {
+          *x += *y;
+        }
+        a
+      };
+      let s = if h >= PAR_THRESHOLD {
+        (0..h)
+          .into_par_iter()
+          .fold(|| [E::Scalar::ZERO; 4], |acc, i| add4(acc, eval_at(i)))
+          .reduce(|| [E::Scalar::ZERO; 4], add4)
+      } else {
+        (0..h).fold([E::Scalar::ZERO; 4], |acc, i| add4(acc, eval_at(i)))
+      };
       for v in &s {
         transcript.absorb(b"gkr_rp", v);
       }
@@ -351,7 +394,8 @@ pub struct RangeClaims<E: Engine> {
 }
 
 /// A LogUp-GKR proof that a witness vector is range-bounded by `[0, 2^bits)`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
 pub struct LogUpRangeProof<E: Engine> {
   p_lhs_root: E::Scalar,
   q_lhs_root: E::Scalar,
@@ -367,6 +411,29 @@ impl<E: Engine> LogUpRangeProof<E> {
   /// variables, with the trailing slots padded with the value `0`.
   pub fn witness_num_vars(witness_len: usize) -> usize {
     witness_len.max(1).next_power_of_two().trailing_zeros() as usize
+  }
+
+  /// The multiplicity table `m_j = #{i : w[i] = j}` over `[0, 2^bits)`,
+  /// including the power-of-two padding `0`s that [`Self::prove`] appends.
+  /// A caller that commits the multiplicity polynomial (which it must do
+  /// — and absorb — *before* the transcript point where `prove` squeezes
+  /// the LogUp challenge `r`) gets the exact vector `prove` will use.
+  /// Errors if any witness value is out of range.
+  pub fn multiplicities(bits: usize, witness: &[u64]) -> Result<Vec<u64>, SpartanError> {
+    let table = 1usize << bits;
+    let n = witness.len().max(1).next_power_of_two();
+    let mut mult = vec![0u64; table];
+    for &w in witness {
+      let idx = w as usize;
+      if idx >= table {
+        return Err(SpartanError::InvalidInputLength {
+          reason: format!("logup-gkr: witness value {w} >= 2^{bits}"),
+        });
+      }
+      mult[idx] += 1;
+    }
+    mult[0] += (n - witness.len()) as u64;
+    Ok(mult)
   }
 
   /// Prove that every value in `witness` lies in `[0, 2^bits)`.
@@ -389,18 +456,11 @@ impl<E: Engine> LogUpRangeProof<E> {
     let table = 1usize << bits;
     let n = witness.len().next_power_of_two();
 
-    // Multiplicities over the table, plus the padding `0`s.
-    let mut mult = vec![0u64; table];
-    for &w in witness {
-      let idx = w as usize;
-      if idx >= table {
-        return Err(SpartanError::InvalidInputLength {
-          reason: format!("logup-gkr: witness value {w} >= 2^{bits}"),
-        });
-      }
-      mult[idx] += 1;
-    }
-    mult[0] += (n - witness.len()) as u64;
+    // Multiplicities over the table, plus the padding `0`s. Callers that
+    // commit the multiplicity polynomial (they must, before this point in
+    // the transcript) obtain the identical vector from
+    // [`Self::multiplicities`].
+    let mult = Self::multiplicities(bits, witness)?;
 
     transcript.dom_sep(b"logup_range");
     let r = transcript.squeeze(b"logup_r")?;

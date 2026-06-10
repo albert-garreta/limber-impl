@@ -473,14 +473,14 @@ pub struct IntEvalArgument {
   /// One per small prime sampled from the transcript. Length matches
   /// `params.s`.
   pub chains: Vec<ChainData>,
-  /// Phase-3 step D5 (stacked `rbatchrange`): one batched range check
-  /// per `(bound, size)` group. Canonical group order is `f_limb`, then
-  /// for each iteration `j = 1..=t` the `a_j` batch (all `s` chains) and
-  /// the `b_j` batch. So `1 + 2t` entries (just `f_limb` when `t = 0`).
-  /// Each batch range-checks all its polynomials with one bit
-  /// commitment, one bit-validity zerocheck, and one reconstruction
-  /// sumcheck. See [`prove_batch_range_check`].
-  pub(crate) range_checks: Vec<BatchRangeCheck>,
+  /// LogUp-GKR range checks: one batched check per `(bound, size)`
+  /// group. Canonical group order is `f_limb`, then for each iteration
+  /// `j = 1..=t` the `a_j` batch (all `s` chains) and the `b_j` batch.
+  /// So `1 + 2t` entries (just `f_limb` when `t = 0`). Each batch
+  /// range-checks all its polynomials with one 16-bit-chunk commitment,
+  /// one multiplicity-table commitment, a LogUp-GKR argument, and one
+  /// reconstruction sumcheck. See [`prove_logup_range_check`].
+  pub(crate) range_checks: Vec<LogUpBatchRangeCheck>,
   /// Batched proof for the `j=1` `a_prev` openings: all `s` chains open
   /// the shared input commitment at distinct points, collapsed into one
   /// sumcheck + one opening. `None` when there are no iterations (`t=0`).
@@ -507,23 +507,61 @@ pub struct APrevBatch {
   pub(crate) f_open: SmallPrimeOpening,
 }
 
-/// Batched range-check argument (paper's `rbatchrange`) for a
-/// *homogeneous batch* of `N` value polynomials — all of the same
-/// length `n_values` and the same bound `2^log_bound`. The `N` polys
-/// are stacked along a top "poly-index" axis into one bit polynomial
-/// of `N_pad · n_values · 2^log_log_bound` bits (`N_pad = next_pow2(N)`),
-/// committed once. The protocol runs one bit-validity zerocheck and one
-/// value-reconstruction sumcheck over the whole stack, plus two openings
-/// of the bit polynomial and one opening per value polynomial.
+/// Chunk width (bits) for the LogUp range checks: values are decomposed
+/// into base-`2^16` chunks, each looked up against the `[0, 2^16)` table.
+pub(crate) const CHUNK_BITS: usize = 16;
+
+/// Tightening check for the *top* chunk when `log_bound` is not a
+/// multiple of [`CHUNK_BITS`]: a second LogUp against the smaller table
+/// `[0, 2^rem)` (`rem = log_bound − 16·(numchunks−1)`), run on the
+/// sub-polynomial of top chunks. That sub-poly is the chunk MLE with the
+/// chunk-axis variables bound to `bits(numchunks−1)`, so its evaluation
+/// claim is discharged by opening the *same* chunk commitment at the
+/// boolean-extended point — no extra witness commitment. Without this,
+/// chunking would only prove `value < 2^(16·numchunks)`, a looser bound
+/// than the bit-decomposition check it replaces.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchRangeCheck {
-  /// Stacked bit-polynomial commitment.
-  pub(crate) bit_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  /// Bit-validity sumcheck (`bit · (1 - bit) = 0`), over the Hyrax
-  /// base field.
-  pub(crate) bit_validity_sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
-  /// Value-reconstruction sumcheck (`sum_b 2^b · bit(r_v, b) = value(r_v)`),
-  /// over the Hyrax base field.
+pub struct TopChunkCheck {
+  /// Commitment to the `2^rem`-entry multiplicity table.
+  pub(crate) mult_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// LogUp-GKR proof that every top chunk lies in `[0, 2^rem)`.
+  pub(crate) logup: crate::logup_gkr::LogUpRangeProof<T256HyraxEngine>,
+  /// Opening of the chunk commitment at `(wit_point ++ bits(numchunks−1))`,
+  /// discharging the LogUp witness-side claim.
+  pub(crate) chunk_open: SmallPrimeOpening,
+  /// Opening of `mult_comm` at the LogUp table-side point.
+  pub(crate) mult_open: SmallPrimeOpening,
+}
+
+/// Batched LogUp-GKR range-check argument for a *homogeneous batch* of
+/// `N` value polynomials — all of the same length `n_values` and the
+/// same bound `2^log_bound`. The `N` polys are decomposed into 16-bit
+/// chunks and stacked along a top "poly-index" axis into one chunk
+/// polynomial of `N_pad · n_values · stride` entries (`N_pad =
+/// next_pow2(N)`, `stride = next_pow2(⌈log_bound/16⌉)`), committed once.
+/// A LogUp-GKR argument proves every chunk lies in `[0, 2^16)` against a
+/// committed multiplicity table (the GKR itself commits nothing); a
+/// [`TopChunkCheck`] tightens the top chunk to the exact bound; and one
+/// value-reconstruction sumcheck (`Σ_c 2^(16c)·chunk(r_v, c) =
+/// value(r_v)`) ties the chunks to the existing value commitments.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogUpBatchRangeCheck {
+  /// Stacked chunk-polynomial commitment (entries in `[0, 2^16)`).
+  pub(crate) chunk_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// Commitment to the `2^16`-entry multiplicity table.
+  pub(crate) mult_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// LogUp-GKR proof that every chunk lies in `[0, 2^16)`.
+  pub(crate) logup: crate::logup_gkr::LogUpRangeProof<T256HyraxEngine>,
+  /// Opening of the chunk commitment at the LogUp witness-side point,
+  /// discharging the reduced claim `chunk(wit_point) = wit_eval`.
+  pub(crate) chunk_open_wit: SmallPrimeOpening,
+  /// Opening of `mult_comm` at the LogUp table-side point.
+  pub(crate) mult_open: SmallPrimeOpening,
+  /// Exact-bound tightening of the top chunk; `None` iff `log_bound` is
+  /// a multiple of [`CHUNK_BITS`] (the 16-bit table is already exact).
+  pub(crate) top: Option<TopChunkCheck>,
+  /// Value-reconstruction sumcheck (`Σ_c 2^(16c)·chunk(r_v, c) =
+  /// value(r_v)`), over the Hyrax base field.
   pub(crate) value_reconstr_sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
   /// Single opening of the `eq(r_v_poly, ·)`-folded value commitment at
   /// the within-poly part `r_v_within`. Its evaluation is
@@ -531,13 +569,10 @@ pub struct BatchRangeCheck {
   /// for the whole batch (the per-poly commitments are folded
   /// homomorphically via `fold_commitments`).
   pub(crate) value_open_at_rv: SmallPrimeOpening,
-  /// Opening of the bit polynomial at the bit-validity sumcheck's
-  /// final challenge point.
-  pub(crate) bit_open_validity_final: SmallPrimeOpening,
-  /// Opening of the bit polynomial at `(r_v, r_b)` — the value-
+  /// Opening of the chunk polynomial at `(r_v, r_b)` — the value-
   /// reconstruction sumcheck's final point combining `r_v` (poly-index
-  /// ++ within) and `r_b` (the b-axis sumcheck challenges).
-  pub(crate) bit_open_reconstr_final: SmallPrimeOpening,
+  /// ++ within) and `r_b` (the chunk-axis sumcheck challenges).
+  pub(crate) chunk_open_reconstr: SmallPrimeOpening,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -627,35 +662,27 @@ pub fn numlimb_var(numlimb: usize) -> usize {
   ceil_log2(numlimb.max(1))
 }
 
-/// Decompose a `BigUint` value `v ∈ [0, 2^num_bits)` into its
-/// little-endian bit representation. Output `bits[i] ∈ {0, 1}` with
-/// `v = sum_i 2^i · bits[i]`. Asserts `v < 2^num_bits`; values that
-/// exceed the bound are caller errors. Used by the Phase-3 step D5
-/// batch range-check arguments to prove `value < 2^num_bits` via a
-/// sumcheck on bit constraints + value reconstruction.
-fn bit_decompose_value(v: &BigUint, num_bits: usize) -> Vec<u8> {
-  let mut out = Vec::with_capacity(num_bits);
+/// Decompose a `BigUint` value `v ∈ [0, 2^log_bound)` into base-`2^16`
+/// little-endian chunks: `v = sum_c 2^(16c) · chunks[c]` with
+/// `chunks[c] < 2^16` and `⌈log_bound / 16⌉` entries. Asserts
+/// `v < 2^log_bound`; values that exceed the bound are caller errors.
+/// Used by the LogUp range-check arguments.
+fn chunk_decompose_value(v: &BigUint, log_bound: usize) -> Vec<u64> {
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
   let bytes = v.to_bytes_le();
-  for i in 0..num_bits {
-    let byte_idx = i / 8;
-    let bit_in_byte = i % 8;
-    let bit = if byte_idx < bytes.len() {
-      (bytes[byte_idx] >> bit_in_byte) & 1
-    } else {
-      0
-    };
-    out.push(bit);
-  }
   debug_assert!(
-    bit_decompose_check_no_overflow(&bytes, num_bits),
+    bit_decompose_check_no_overflow(&bytes, log_bound),
     "value 0x{:x} exceeds bound 2^{}",
     v,
-    num_bits
+    log_bound
   );
-  out
+  let byte_at = |i: usize| -> u64 { if i < bytes.len() { bytes[i] as u64 } else { 0 } };
+  (0..numchunks)
+    .map(|c| byte_at(2 * c) | (byte_at(2 * c + 1) << 8))
+    .collect()
 }
 
-/// Helper for `bit_decompose_value`'s debug_assert: checks that the
+/// Helper for `chunk_decompose_value`'s debug_assert: checks that the
 /// LE `bytes` representation has zero bits above `num_bits`.
 fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
   let cutoff_byte = num_bits / 8;
@@ -678,15 +705,20 @@ fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
   true
 }
 
-/// Flatten a batch of values into a single bit polynomial of length
-/// `values.len() * num_bits`, with each value's bits stored
-/// contiguously in little-endian order: `bits[i * num_bits + b]` is the
-/// `b`-th bit of `values[i]`. Used as the witness polynomial of the
-/// batched range-check sumcheck (step D5).
-fn bit_decompose_polynomial(values: &[BigUint], num_bits: usize) -> Vec<u8> {
-  values
-    .par_iter()
-    .flat_map_iter(|v| bit_decompose_value(v, num_bits).into_iter())
+/// Big-endian boolean MLE point for the index `idx` over `num_bits`
+/// variables: `point[0]` is the most significant bit. Binding an MLE's
+/// trailing variables to this point selects the slot `idx` of the
+/// bottom axis.
+fn bool_point_of_index(idx: usize, num_bits: usize) -> Vec<t256::Scalar> {
+  (0..num_bits)
+    .rev()
+    .map(|b| {
+      if (idx >> b) & 1 == 1 {
+        t256::Scalar::ONE
+      } else {
+        t256::Scalar::ZERO
+      }
+    })
     .collect()
 }
 
@@ -1548,11 +1580,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     };
     let log_bound_a = params.log_p + 1;
     let log_bound_b = LOG_Q - params.log_p + 1;
-    let mut range_checks: Vec<BatchRangeCheck> = Vec::with_capacity(1 + 2 * t);
+    let mut range_checks: Vec<LogUpBatchRangeCheck> = Vec::with_capacity(1 + 2 * t);
 
     let (_rcf_span, rcf_t) = start_span!("imod_pcs_rc_flimb");
     // f_limb group (a single polynomial, bound `2^log_T`).
-    range_checks.push(prove_batch_range_check(
+    range_checks.push(prove_logup_range_check(
       RangeBatchInputs {
         ck: &ck.inner,
         ck_eval: &ck_eval.inner,
@@ -1613,7 +1645,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           })
           .collect::<Vec<_>>();
         let n_values = values[0].len();
-        range_checks.push(prove_batch_range_check(
+        range_checks.push(prove_logup_range_check(
           RangeBatchInputs {
             ck: &ck.inner,
             ck_eval: &ck_eval.inner,
@@ -1995,7 +2027,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let log_bound_b = LOG_Q - params.log_p + 1;
 
     // f_limb group (single polynomial).
-    verify_batch_range_check(
+    verify_logup_range_check(
       &vk.inner,
       &ck_eval.inner,
       &[&comm.inner],
@@ -2021,7 +2053,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
             }
           })
           .collect::<Vec<_>>();
-        verify_batch_range_check(
+        verify_logup_range_check(
           &vk.inner,
           &ck_eval.inner,
           &value_comms,
@@ -2170,19 +2202,20 @@ struct RangeBatchInputs<'a> {
   log_bound: usize,
 }
 
-/// Masked power-of-two weight vector for the value-reconstruction
-/// sumcheck: `w[b] = 2^b` for `b < log_bound`, else `0`. Length `stride`
-/// (the padded per-value bit count). Bits at `b ≥ log_bound` carry zero
-/// weight, so the prover can't inflate a value past its bound regardless
-/// of those (still bit-valid) slots.
-fn range_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
+/// Masked base-`2^16` weight vector for the value-reconstruction
+/// sumcheck: `w[c] = 2^(16c)` for `c < ⌈log_bound/16⌉`, else `0`. Length
+/// `stride` (the padded per-value chunk count). Chunk slots at
+/// `c ≥ numchunks` carry zero weight, so the prover can't inflate a
+/// value past its bound regardless of those (still range-checked) slots.
+fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
+  let base = t256::Scalar::from(1u64 << CHUNK_BITS);
   let mut weight = Vec::with_capacity(stride);
   let mut pow = t256::Scalar::ONE;
-  let two = t256::Scalar::from(2u64);
-  for b in 0..stride {
-    if b < log_bound {
+  for c in 0..stride {
+    if c < numchunks {
       weight.push(pow);
-      pow *= two;
+      pow *= base;
     } else {
       weight.push(t256::Scalar::ZERO);
     }
@@ -2191,11 +2224,13 @@ fn range_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
 }
 
 /// Spawn an F-side sub-transcript seeded from the parent, binding the
-/// stacked bit commitment and every value commitment in the batch. Both
-/// prover and verifier reconstruct it identically.
+/// stacked chunk commitment and every value commitment in the batch. Both
+/// prover and verifier reconstruct it identically. (The multiplicity
+/// commitments are absorbed by the caller right after, still before any
+/// challenge is squeezed.)
 fn spawn_range_subtranscript(
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-  bit_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  chunk_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
   value_comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
 ) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
   let seed = parent.squeeze_bytes(b"range_seed")?;
@@ -2203,7 +2238,7 @@ fn spawn_range_subtranscript(
     T256HyraxEngine,
   >>::new_with_params(b"range_check", ());
   sub.absorb_bytes(b"seed", &seed);
-  sub.absorb(b"range_bit_comm", bit_comm);
+  sub.absorb(b"range_chunk_comm", chunk_comm);
   for vc in value_comms {
     sub.absorb(b"range_value_comm", *vc);
   }
@@ -2254,17 +2289,19 @@ fn aprev_batch_weight(
   (w, claim)
 }
 
-/// Prover side of a homogeneous batch range check (paper `rbatchrange`).
-/// The `N` value polys are stacked along a top poly-index axis into one
-/// bit polynomial of `N_pad · n_values · stride` bits (`N_pad =
-/// next_pow2(N)`, `stride = 2^⌈log₂ log_bound⌉`), laid out as
-/// `((p·n_values + within)·stride + b)`. One Hyrax commit, one bit-
-/// validity zerocheck, one value-reconstruction sumcheck, two bit
-/// openings, and one opening per value poly.
-fn prove_batch_range_check(
+/// Prover side of a homogeneous LogUp-GKR batch range check. The `N`
+/// value polys are decomposed into 16-bit chunks and stacked along a top
+/// poly-index axis into one chunk polynomial of `N_pad · n_values ·
+/// stride` entries (`N_pad = next_pow2(N)`, `stride =
+/// next_pow2(⌈log_bound/16⌉)`, min 2), laid out as
+/// `((p·n_values + within)·stride + c)`. One Hyrax chunk commit, one
+/// multiplicity-table commit, a LogUp-GKR membership argument (plus a
+/// [`TopChunkCheck`] when the bound isn't 16-aligned), one
+/// value-reconstruction sumcheck, and the discharging Hyrax openings.
+fn prove_logup_range_check(
   inputs: RangeBatchInputs<'_>,
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-) -> Result<BatchRangeCheck, SpartanError> {
+) -> Result<LogUpBatchRangeCheck, SpartanError> {
   let RangeBatchInputs {
     ck,
     ck_eval,
@@ -2284,72 +2321,155 @@ fn prove_batch_range_check(
   let n_pad = num_polys.next_power_of_two();
   let log_np = n_pad.trailing_zeros() as usize;
   let log_nv = ceil_log2(n_values.max(1));
-  let log_log_bound = ceil_log2(log_bound.max(1));
-  let stride = 1usize << log_log_bound;
-  let n_bits = n_pad * n_values * stride;
-  let log_n_bits = ceil_log2(n_bits.max(1));
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
+  // Min stride 2 keeps the reconstruction sumcheck non-degenerate when a
+  // bound fits in a single chunk (the extra slot is zero-valued and
+  // zero-weighted).
+  let stride = numchunks.next_power_of_two().max(2);
+  let log_stride = stride.trailing_zeros() as usize;
+  let n_chunks = n_pad * n_values * stride;
+  let rem = log_bound - CHUNK_BITS * (numchunks - 1); // ∈ [1, 16]
   info!(
     num_polys = num_polys,
     n_values = n_values,
     log_bound = log_bound,
     stride = stride,
-    n_bits = n_bits,
+    n_chunks = n_chunks,
     "imod_pcs_range_batch"
   );
 
-  // 1. Stacked bit polynomial. Index `((p·n_values + within)·stride + b)`.
-  //    Padding polys (`p ≥ num_polys`) and bits `b ≥ log_bound` stay zero.
-  //    Built in parallel over disjoint `stride`-sized slots (one per value).
-  let mut bit_poly: Vec<t256::Scalar> = vec![t256::Scalar::ZERO; n_bits];
-  bit_poly
+  // 1. Stacked chunk polynomial. Index `((p·n_values + within)·stride + c)`.
+  //    Padding polys (`p ≥ num_polys`) and slots `c ≥ numchunks` stay zero
+  //    (zero is in every table, and those slots carry zero weight).
+  let mut chunk_vals: Vec<u64> = vec![0u64; n_chunks];
+  chunk_vals
     .par_chunks_mut(stride)
     .enumerate()
-    .for_each(|(gv, chunk)| {
+    .for_each(|(gv, slot)| {
       let p = gv / n_values;
       if p >= num_polys {
         return; // padding poly: all-zero
       }
       let within = gv % n_values;
-      for (b, &bit) in bit_decompose_value(&values[p][within], log_bound)
-        .iter()
+      for (c, ch) in chunk_decompose_value(&values[p][within], log_bound)
+        .into_iter()
         .enumerate()
       {
-        if bit == 1 {
-          chunk[b] = t256::Scalar::ONE;
-        }
+        slot[c] = ch;
       }
     });
+  let chunk_fq: Vec<t256::Scalar> = chunk_vals
+    .par_iter()
+    .map(|&c| t256::Scalar::from(c))
+    .collect();
 
-  // 2. Commit the stacked bit polynomial.
-  let bit_blind = Hyrax::blind(ck, n_bits);
-  let bit_comm = Hyrax::commit(ck, &bit_poly, &bit_blind, true)?;
+  // 2. Commit the chunk polynomial and the multiplicity tables. All
+  //    commitments must enter the transcript before the LogUp challenge
+  //    `r` is squeezed (inside `LogUpRangeProof::prove`) — otherwise a
+  //    cheating prover could pick multiplicities after seeing `r`.
+  let chunk_blind = Hyrax::blind(ck, n_chunks);
+  let chunk_comm = Hyrax::commit(ck, &chunk_fq, &chunk_blind, true)?;
 
-  // 3. Sub-transcript bound to (parent, bit_comm, all value_comms).
-  let mut sub = spawn_range_subtranscript(parent, &bit_comm, &value_comms)?;
+  let mult =
+    crate::logup_gkr::LogUpRangeProof::<T256HyraxEngine>::multiplicities(CHUNK_BITS, &chunk_vals)?;
+  let mult_fq: Vec<t256::Scalar> = mult.iter().map(|&m| t256::Scalar::from(m)).collect();
+  let mult_blind = Hyrax::blind(ck, mult_fq.len());
+  let mult_comm = Hyrax::commit(ck, &mult_fq, &mult_blind, true)?;
 
-  // 4. Bit-validity zerocheck: `sum_x eq(x,τ)·(bit(x)² - bit(x)) = 0`.
-  let tau: Vec<t256::Scalar> = (0..log_n_bits)
-    .map(|_| sub.squeeze(b"range_tau"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let mut poly_a = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
-  let (bit_validity_sumcheck, r_validity, _claims) =
-    crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_cubic_square(
-      &t256::Scalar::ZERO,
-      tau,
-      &mut poly_a,
-      &mut sub,
-    )?;
+  // Top-chunk tightening data (only when the bound isn't 16-aligned).
+  let top_needed = rem < CHUNK_BITS;
+  let top_vals: Vec<u64> = if top_needed {
+    (0..n_pad * n_values)
+      .map(|gv| chunk_vals[gv * stride + (numchunks - 1)])
+      .collect()
+  } else {
+    Vec::new()
+  };
+  let top_mult_data = if top_needed {
+    let top_mult =
+      crate::logup_gkr::LogUpRangeProof::<T256HyraxEngine>::multiplicities(rem, &top_vals)?;
+    let top_mult_fq: Vec<t256::Scalar> = top_mult.iter().map(|&m| t256::Scalar::from(m)).collect();
+    let top_mult_blind = Hyrax::blind(ck, top_mult_fq.len());
+    let top_mult_comm = Hyrax::commit(ck, &top_mult_fq, &top_mult_blind, true)?;
+    Some((top_mult_fq, top_mult_blind, top_mult_comm))
+  } else {
+    None
+  };
 
-  // 5. Open bit_poly at r_validity.
-  let bit_open_validity_final = hyrax_open_at(
+  // 3. Sub-transcript bound to (parent, chunk_comm, value_comms, mult comms).
+  let mut sub = spawn_range_subtranscript(parent, &chunk_comm, &value_comms)?;
+  sub.absorb(b"range_mult_comm", &mult_comm);
+  if let Some((_, _, top_mult_comm)) = &top_mult_data {
+    sub.absorb(b"range_top_mult_comm", top_mult_comm);
+  }
+
+  // 4. LogUp-GKR: every chunk lies in [0, 2^16). The reduced claims are
+  //    discharged by opening the chunk and multiplicity commitments.
+  let (logup, claims) =
+    crate::logup_gkr::LogUpRangeProof::<T256HyraxEngine>::prove(CHUNK_BITS, &chunk_vals, &mut sub)?;
+  let chunk_open_wit = hyrax_open_at(
     ck,
     ck_eval,
     &mut sub,
-    &bit_comm,
-    &bit_poly,
-    &bit_blind,
-    &r_validity,
+    &chunk_comm,
+    &chunk_fq,
+    &chunk_blind,
+    &claims.wit_point,
   )?;
+  debug_assert_eq!(chunk_open_wit.f_y, claims.wit_eval);
+  let mult_open = hyrax_open_at(
+    ck,
+    ck_eval,
+    &mut sub,
+    &mult_comm,
+    &mult_fq,
+    &mult_blind,
+    &claims.mult_point,
+  )?;
+  debug_assert_eq!(mult_open.f_y, claims.mult_eval);
+
+  // 5. Top-chunk LogUp against the 2^rem table for the exact bound. The
+  //    top-chunk sub-poly is the chunk MLE with the chunk-axis variables
+  //    bound to bits(numchunks−1), so its claim is discharged by opening
+  //    the SAME chunk commitment at the boolean-extended point.
+  let top = if let Some((top_mult_fq, top_mult_blind, top_mult_comm)) = top_mult_data {
+    let (logup2, claims2) =
+      crate::logup_gkr::LogUpRangeProof::<T256HyraxEngine>::prove(rem, &top_vals, &mut sub)?;
+    let ext: Vec<t256::Scalar> = claims2
+      .wit_point
+      .iter()
+      .copied()
+      .chain(bool_point_of_index(numchunks - 1, log_stride))
+      .collect();
+    let chunk_open = hyrax_open_at(
+      ck,
+      ck_eval,
+      &mut sub,
+      &chunk_comm,
+      &chunk_fq,
+      &chunk_blind,
+      &ext,
+    )?;
+    debug_assert_eq!(chunk_open.f_y, claims2.wit_eval);
+    let top_mult_open = hyrax_open_at(
+      ck,
+      ck_eval,
+      &mut sub,
+      &top_mult_comm,
+      &top_mult_fq,
+      &top_mult_blind,
+      &claims2.mult_point,
+    )?;
+    debug_assert_eq!(top_mult_open.f_y, claims2.mult_eval);
+    Some(TopChunkCheck {
+      mult_comm: top_mult_comm,
+      logup: logup2,
+      chunk_open,
+      mult_open: top_mult_open,
+    })
+  } else {
+    None
+  };
 
   // 6. Value-reconstruction. Squeeze r_v over (poly-index ++ within).
   let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
@@ -2386,59 +2506,69 @@ fn prove_batch_range_check(
     r_v_within,
   )?;
 
-  // Partial-eval bit_poly at r_v over the top (log_np + log_nv) vars,
-  // leaving the b-axis (`stride` values).
-  let mut bit_mle = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
+  // Partial-eval chunk poly at r_v over the top (log_np + log_nv) vars,
+  // leaving the chunk axis (`stride` values).
+  let mut chunk_mle = crate::polys::multilinear::MultilinearPolynomial::new(chunk_fq.clone());
   for r in &r_v {
-    bit_mle.bind_poly_var_top(r);
+    chunk_mle.bind_poly_var_top(r);
   }
-  let bit_at_rv: Vec<t256::Scalar> = bit_mle.into_vec();
-  debug_assert_eq!(bit_at_rv.len(), stride);
+  let chunk_at_rv: Vec<t256::Scalar> = chunk_mle.into_vec();
+  debug_assert_eq!(chunk_at_rv.len(), stride);
 
-  // Initial claim = V(r_v) = sum_b w[b]·bit_at_rv[b] (uniform weight).
-  let weight = range_weight_vector(log_bound, stride);
+  // Initial claim = V(r_v) = sum_c w[c]·chunk_at_rv[c] (base-2^16 weight).
+  let weight = chunk_weight_vector(log_bound, stride);
   let claim_v: t256::Scalar = weight
     .iter()
-    .zip(bit_at_rv.iter())
+    .zip(chunk_at_rv.iter())
     .map(|(w, b)| *w * *b)
     .sum();
   let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(weight);
-  let mut poly_b2 = crate::polys::multilinear::MultilinearPolynomial::new(bit_at_rv);
+  let mut poly_b2 = crate::polys::multilinear::MultilinearPolynomial::new(chunk_at_rv);
   let (value_reconstr_sumcheck, r_b, _claims) =
     crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
       &claim_v,
-      log_log_bound,
+      log_stride,
       &mut poly_w,
       &mut poly_b2,
       &mut sub,
     )?;
 
-  // 7. Open bit_poly at (r_v ++ r_b) for the reconstruction final check.
+  // 7. Open chunk poly at (r_v ++ r_b) for the reconstruction final check.
   let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
-  let bit_open_reconstr_final = hyrax_open_at(
-    ck, ck_eval, &mut sub, &bit_comm, &bit_poly, &bit_blind, &combined,
+  let chunk_open_reconstr = hyrax_open_at(
+    ck,
+    ck_eval,
+    &mut sub,
+    &chunk_comm,
+    &chunk_fq,
+    &chunk_blind,
+    &combined,
   )?;
 
-  Ok(BatchRangeCheck {
-    bit_comm,
-    bit_validity_sumcheck,
+  Ok(LogUpBatchRangeCheck {
+    chunk_comm,
+    mult_comm,
+    logup,
+    chunk_open_wit,
+    mult_open,
+    top,
     value_reconstr_sumcheck,
     value_open_at_rv,
-    bit_open_validity_final,
-    bit_open_reconstr_final,
+    chunk_open_reconstr,
   })
 }
 
-/// Verifier-side mirror of `prove_batch_range_check`. Re-derives the
-/// transcript challenges, re-runs the two sumchecks, and verifies the
-/// three openings + the final integrand checks.
-fn verify_batch_range_check(
+/// Verifier-side mirror of `prove_logup_range_check`. Re-derives the
+/// transcript challenges, verifies the LogUp-GKR argument(s) and their
+/// discharging openings, re-runs the reconstruction sumcheck, and checks
+/// the final integrand.
+fn verify_logup_range_check(
   vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
   ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   value_comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
   n_values: usize,
   log_bound: usize,
-  arg: &BatchRangeCheck,
+  arg: &LogUpBatchRangeCheck,
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
 ) -> Result<(), SpartanError> {
   let num_polys = value_comms.len();
@@ -2448,42 +2578,94 @@ fn verify_batch_range_check(
   let n_pad = num_polys.next_power_of_two();
   let log_np = n_pad.trailing_zeros() as usize;
   let log_nv = ceil_log2(n_values.max(1));
-  let log_log_bound = ceil_log2(log_bound.max(1));
-  let stride = 1usize << log_log_bound;
-  let n_bits = n_pad * n_values * stride;
-  let log_n_bits = ceil_log2(n_bits.max(1));
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
+  let stride = numchunks.next_power_of_two().max(2);
+  let log_stride = stride.trailing_zeros() as usize;
+  let n_chunks = n_pad * n_values * stride;
+  let log_n_chunks = ceil_log2(n_chunks.max(1));
+  let rem = log_bound - CHUNK_BITS * (numchunks - 1);
+  let top_needed = rem < CHUNK_BITS;
+  if top_needed != arg.top.is_some() {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
 
-  // 1. Spawn the same sub-transcript the prover used.
-  let mut sub = spawn_range_subtranscript(parent, &arg.bit_comm, value_comms)?;
+  // 1. Spawn the same sub-transcript the prover used (all commitments
+  //    bound before the LogUp challenge is squeezed).
+  let mut sub = spawn_range_subtranscript(parent, &arg.chunk_comm, value_comms)?;
+  sub.absorb(b"range_mult_comm", &arg.mult_comm);
+  if let Some(top) = &arg.top {
+    sub.absorb(b"range_top_mult_comm", &top.mult_comm);
+  }
 
-  // 2. Bit-validity zerocheck (claim = 0, degree 3, log_n_bits rounds).
-  let tau: Vec<t256::Scalar> = (0..log_n_bits)
-    .map(|_| sub.squeeze(b"range_tau"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let (bv_final_claim, r_validity) =
-    arg
-      .bit_validity_sumcheck
-      .verify(t256::Scalar::ZERO, log_n_bits, 3, &mut sub)?;
-
-  // 3. Verify bit_poly open at r_validity.
+  // 2. LogUp-GKR membership: every chunk in [0, 2^16). The proof's
+  //    witness tree depth must match the committed chunk poly's size —
+  //    otherwise a prover could range-check a smaller polynomial.
+  let claims = arg.logup.verify(CHUNK_BITS, &mut sub)?;
+  if claims.wit_point.len() != log_n_chunks {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
   hyrax_verify_open(
     vk,
     ck_eval,
     &mut sub,
-    &arg.bit_comm,
-    &r_validity,
-    &arg.bit_open_validity_final,
+    &arg.chunk_comm,
+    &claims.wit_point,
+    &arg.chunk_open_wit,
   )?;
-
-  // 4. Reconstruct bit-validity integrand: eq(r_validity, τ)·(bit² - bit).
-  let eq_at_r = EqPolynomial::<t256::Scalar>::new(tau).evaluate(&r_validity);
-  let bit_at_r = arg.bit_open_validity_final.f_y;
-  let expected = eq_at_r * (bit_at_r * bit_at_r - bit_at_r);
-  if bv_final_claim != expected {
+  if arg.chunk_open_wit.f_y != claims.wit_eval {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  hyrax_verify_open(
+    vk,
+    ck_eval,
+    &mut sub,
+    &arg.mult_comm,
+    &claims.mult_point,
+    &arg.mult_open,
+  )?;
+  if arg.mult_open.f_y != claims.mult_eval {
     return Err(SpartanError::InvalidSumcheckProof);
   }
 
-  // 5. Squeeze r_v = (poly-index ++ within), fold the value commitments
+  // 3. Top-chunk tightening: every top chunk in [0, 2^rem). The witness
+  //    sub-poly claim opens the chunk commitment at the boolean-extended
+  //    point (chunk-axis bound to bits(numchunks−1)).
+  if let Some(top) = &arg.top {
+    let claims2 = top.logup.verify(rem, &mut sub)?;
+    if claims2.wit_point.len() != log_np + log_nv {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    let ext: Vec<t256::Scalar> = claims2
+      .wit_point
+      .iter()
+      .copied()
+      .chain(bool_point_of_index(numchunks - 1, log_stride))
+      .collect();
+    hyrax_verify_open(
+      vk,
+      ck_eval,
+      &mut sub,
+      &arg.chunk_comm,
+      &ext,
+      &top.chunk_open,
+    )?;
+    if top.chunk_open.f_y != claims2.wit_eval {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    hyrax_verify_open(
+      vk,
+      ck_eval,
+      &mut sub,
+      &top.mult_comm,
+      &claims2.mult_point,
+      &top.mult_open,
+    )?;
+    if top.mult_open.f_y != claims2.mult_eval {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+  }
+
+  // 4. Squeeze r_v = (poly-index ++ within), fold the value commitments
   //    by `eq(r_v_poly, p)` (matching the prover), and verify the single
   //    folded open. Its evaluation is V(r_v) = Σ_p eq(r_v_poly,p)·value_p.
   let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
@@ -2505,33 +2687,33 @@ fn verify_batch_range_check(
   )?;
   let value_at_rv = arg.value_open_at_rv.f_y;
 
-  // 6. Value-reconstruction sumcheck (claim = V(r_v), degree 2,
-  //    log_log_bound rounds).
+  // 5. Value-reconstruction sumcheck (claim = V(r_v), degree 2,
+  //    log_stride rounds).
   let (vr_final_claim, r_b) =
     arg
       .value_reconstr_sumcheck
-      .verify(value_at_rv, log_log_bound, 2, &mut sub)?;
+      .verify(value_at_rv, log_stride, 2, &mut sub)?;
 
-  // 7. Verify bit_poly open at (r_v ++ r_b).
+  // 6. Verify chunk poly open at (r_v ++ r_b).
   let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
   hyrax_verify_open(
     vk,
     ck_eval,
     &mut sub,
-    &arg.bit_comm,
+    &arg.chunk_comm,
     &combined,
-    &arg.bit_open_reconstr_final,
+    &arg.chunk_open_reconstr,
   )?;
 
-  // 8. Reconstruct integrand at r_b: w(r_b)·bit(r_v, r_b).
+  // 7. Reconstruct integrand at r_b: w(r_b)·chunk(r_v, r_b).
   let mut w_poly =
-    crate::polys::multilinear::MultilinearPolynomial::new(range_weight_vector(log_bound, stride));
+    crate::polys::multilinear::MultilinearPolynomial::new(chunk_weight_vector(log_bound, stride));
   for r in &r_b {
     w_poly.bind_poly_var_top(r);
   }
   let w_at_rb = w_poly.into_vec()[0];
-  let bit_at_rv_rb = arg.bit_open_reconstr_final.f_y;
-  let expected_vr = w_at_rb * bit_at_rv_rb;
+  let chunk_at_rv_rb = arg.chunk_open_reconstr.f_y;
+  let expected_vr = w_at_rb * chunk_at_rv_rb;
   if vr_final_claim != expected_vr {
     return Err(SpartanError::InvalidSumcheckProof);
   }
@@ -2643,10 +2825,11 @@ mod tests {
     assert_eq!(numlimb(33, 16), 3); // log_t_f not divisible by log_t
   }
 
-  /// `bit_decompose_value` is invertible by `sum_i 2^i · bit[i]`.
+  /// `chunk_decompose_value` is invertible by `sum_c 2^(16c) · chunk[c]`
+  /// and every chunk lies in `[0, 2^16)`.
   #[test]
-  fn bit_decompose_round_trips() {
-    for (v, num_bits) in [
+  fn chunk_decompose_round_trips() {
+    for (v, log_bound) in [
       (BigUint::from(0u32), 8),
       (BigUint::from(1u32), 1),
       (BigUint::from(0xffu32), 8),
@@ -2654,38 +2837,34 @@ mod tests {
       (BigUint::from(0xdeadbeefu32), 32),
       (BigUint::from(0xffff_ffff_ffff_ffffu64), 64),
       (BigUint::from(0x7fff_ffffu32), 31), // odd bit count, top-bit-zero
+      ((BigUint::one() << 227) - BigUint::one(), 227), // b_j-style width
     ] {
-      let bits = bit_decompose_value(&v, num_bits);
-      assert_eq!(bits.len(), num_bits);
-      for b in &bits {
-        assert!(*b == 0 || *b == 1);
+      let chunks = chunk_decompose_value(&v, log_bound);
+      assert_eq!(chunks.len(), log_bound.div_ceil(CHUNK_BITS));
+      let rem = log_bound - CHUNK_BITS * (chunks.len() - 1);
+      for (c, ch) in chunks.iter().enumerate() {
+        assert!(*ch < 1u64 << CHUNK_BITS);
+        if c == chunks.len() - 1 {
+          assert!(*ch < 1u64 << rem, "top chunk exceeds 2^{rem}");
+        }
       }
       let mut acc = BigUint::zero();
-      for (i, b) in bits.iter().enumerate() {
-        if *b == 1 {
-          acc += BigUint::one() << i;
-        }
+      for (c, ch) in chunks.iter().enumerate() {
+        acc += BigUint::from(*ch) << (CHUNK_BITS * c);
       }
       assert_eq!(acc, v, "decomp of 0x{v:x} doesn't round-trip");
     }
   }
 
-  /// `bit_decompose_polynomial` lays out `values.len() · num_bits`
-  /// bits contiguously, with value `i`'s bits in slots `[i·num_bits,
-  /// (i+1)·num_bits)`.
+  /// `bool_point_of_index` selects the right slot: binding an MLE's
+  /// variables to `bits(idx)` evaluates the dense table at `idx`.
   #[test]
-  fn bit_decompose_polynomial_layout() {
-    let values = vec![
-      BigUint::from(0b1010u32),
-      BigUint::from(0b0011u32),
-      BigUint::from(0b1100u32),
-    ];
-    let bits = bit_decompose_polynomial(&values, 4);
-    assert_eq!(bits.len(), 12);
-    // LE order: value[0] = 0b1010 = bits [0, 1, 0, 1]
-    assert_eq!(&bits[0..4], &[0u8, 1, 0, 1]);
-    assert_eq!(&bits[4..8], &[1u8, 1, 0, 0]);
-    assert_eq!(&bits[8..12], &[0u8, 0, 1, 1]);
+  fn bool_point_selects_index() {
+    let table: Vec<t256::Scalar> = (0..8u64).map(|i| t256::Scalar::from(100 + i)).collect();
+    for idx in 0..8usize {
+      let pt = bool_point_of_index(idx, 3);
+      assert_eq!(mle_evaluate_fq(&table, &pt), table[idx]);
+    }
   }
 
   /// `split_value_into_limbs` is invertible: reconstruct from limbs.
@@ -3160,12 +3339,12 @@ mod tests {
       "expected f_limb + a_1 + b_1 groups"
     );
 
-    // Tampering each group's bit opening (in turn) must be rejected
-    // (the Hyrax opening check or the bit-validity integrand check fires,
+    // Tampering each group's chunk opening (in turn) must be rejected
+    // (the Hyrax opening check or the LogUp wit-eval check fires,
     // depending on which trips first).
     for gi in 0..arg.range_checks.len() {
       let mut bad = arg.clone();
-      bad.range_checks[gi].bit_open_validity_final.f_y += t256::Scalar::ONE;
+      bad.range_checks[gi].chunk_open_wit.f_y += t256::Scalar::ONE;
       let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
       assert!(
         <MP as ModPCSEngineTrait<ME>>::verify(
