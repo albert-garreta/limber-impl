@@ -13,7 +13,7 @@ static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 
 use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use spartan2::{
   provider::T256HyraxEngine,
   spartan::SpartanSNARK,
@@ -26,12 +26,30 @@ type E = T256HyraxEngine;
 #[derive(Clone, Debug)]
 struct SyntheticMulCircuit<F: PrimeField> {
   n: usize,
+  /// Full-width witness values (offset by ~random 255-bit constants)
+  /// instead of small 1–100 values, so the witness commit can't take
+  /// Hyrax's small-scalar MSM fast path. Used by the MultiSwap-shaped
+  /// config to stay value-comparable with `imod_spartan_modp`'s
+  /// `msshape` (uniform 256-bit operands).
+  wide: bool,
   _p: PhantomData<F>,
 }
 
 impl<F: PrimeField> SyntheticMulCircuit<F> {
   fn new(n: usize) -> Self {
-    Self { n, _p: PhantomData }
+    Self {
+      n,
+      wide: false,
+      _p: PhantomData,
+    }
+  }
+
+  fn new_wide(n: usize) -> Self {
+    Self {
+      n,
+      wide: true,
+      _p: PhantomData,
+    }
   }
 }
 
@@ -66,12 +84,22 @@ impl<E: Engine> SpartanCircuit<E> for SyntheticMulCircuit<E::Scalar> {
     _: &[AllocatedNum<E::Scalar>],
     _: Option<&[E::Scalar]>,
   ) -> Result<(), SynthesisError> {
+    // Fixed full-width offsets for `wide` mode: any nothing-up-my-sleeve
+    // large constants work — the point is full-width limbs per witness
+    // value, not cryptographic randomness.
+    let (off_a, off_b) = if self.wide {
+      let two = E::Scalar::from(2u64);
+      let off = two.pow_vartime([251u64]); // ≈ 2^251, full-width limbs
+      (off, off * E::Scalar::from(3u64))
+    } else {
+      (E::Scalar::from(0u64), E::Scalar::from(0u64))
+    };
     for i in 0..self.n {
       let a = AllocatedNum::alloc(cs.namespace(|| format!("a_{i}")), || {
-        Ok(E::Scalar::from((i as u64 % 100) + 1))
+        Ok(off_a + E::Scalar::from((i as u64 % 100) + 1))
       })?;
       let b = AllocatedNum::alloc(cs.namespace(|| format!("b_{i}")), || {
-        Ok(E::Scalar::from(((i as u64 * 7) % 100) + 1))
+        Ok(off_b + E::Scalar::from(((i as u64 * 7) % 100) + 1))
       })?;
       let _c = a.mul(cs.namespace(|| format!("c_{i}")), &b)?;
     }
@@ -151,6 +179,55 @@ fn spartan_synthetic_benches(c: &mut Criterion) {
           let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
           let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), true).unwrap();
           let (proof, _) = SpartanSNARK::<E>::prove(&pk, circuit, prep, true).unwrap();
+          (vk, proof)
+        },
+        |(vk, proof)| {
+          proof.verify(&vk).unwrap();
+        },
+        BatchSize::LargeInput,
+      );
+    });
+  }
+
+  // MultiSwap-shaped *native baseline* for
+  // `imod_spartan_modp/.../msshape_c2^12_v2^13`: the same R1CS
+  // dimensions (2730 real gates → 2^12 cons / 2^13 vars) and full-width
+  // witness values, but native field gates — it does NOT express the
+  // imod side's mod-p (T256 base field) statement, which natively would
+  // need limb-decomposition gadgets. The ratio therefore reads as
+  // "integer-machinery overhead vs the same shape natively". `wide`
+  // keeps witness values full-width so the witness commit can't take
+  // the small-scalar MSM fast path.
+  {
+    let n = 2730usize;
+    let tag = "msshape";
+    // `is_small = false`: full-width witness values do NOT fit machine
+    // words; claiming otherwise mis-commits via the small-scalar MSM
+    // path and the proof fails verification.
+    g.bench_function(format!("prove/{tag}"), |b| {
+      b.iter_batched(
+        || {
+          let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new_wide(n);
+          let (pk, _vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
+          let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), false).unwrap();
+          let (_proof, prep_back) =
+            SpartanSNARK::<E>::prove(&pk, circuit.clone(), prep, false).unwrap();
+          (pk, circuit, prep_back)
+        },
+        |(pk, circuit, prep)| {
+          let _ = SpartanSNARK::<E>::prove(&pk, circuit, prep, false).unwrap();
+        },
+        BatchSize::LargeInput,
+      );
+    });
+
+    g.bench_function(format!("verify/{tag}"), |b| {
+      b.iter_batched(
+        || {
+          let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new_wide(n);
+          let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
+          let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), false).unwrap();
+          let (proof, _) = SpartanSNARK::<E>::prove(&pk, circuit, prep, false).unwrap();
           (vk, proof)
         },
         |(vk, proof)| {
