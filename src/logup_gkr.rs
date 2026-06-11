@@ -140,6 +140,7 @@ struct GkrOut<E: Engine> {
 fn build_levels<E: Engine>(
   p_leaves: Vec<E::Scalar>,
   q_leaves: Vec<E::Scalar>,
+  ones_numerator: bool,
 ) -> (Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>) {
   let n = p_leaves.len();
   let d = n.trailing_zeros() as usize;
@@ -154,18 +155,29 @@ fn build_levels<E: Engine>(
     {
       let in_p = &levels_p[k + 1];
       let in_q = &levels_q[k + 1];
-      // Combine the (top=0, i) and (top=1, i) fractions.
+      // Combine the (top=0, i) and (top=1, i) fractions. When the leaf
+      // numerators are all 1 (witness trees) the first combine is just
+      // p = q0 + q1.
+      let leaf_ones = ones_numerator && k + 1 == d;
       if half >= PAR_THRESHOLD {
         op.par_iter_mut()
           .zip(oq.par_iter_mut())
           .enumerate()
           .for_each(|(i, (p, q))| {
-            *p = in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i];
+            *p = if leaf_ones {
+              in_q[i] + in_q[i + half]
+            } else {
+              in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i]
+            };
             *q = in_q[i] * in_q[i + half];
           });
       } else {
         for i in 0..half {
-          op[i] = in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i];
+          op[i] = if leaf_ones {
+            in_q[i] + in_q[i + half]
+          } else {
+            in_p[i] * in_q[i + half] + in_p[i + half] * in_q[i]
+          };
           oq[i] = in_q[i] * in_q[i + half];
         }
       }
@@ -182,12 +194,13 @@ fn build_levels<E: Engine>(
 fn gkr_prove<E: Engine>(
   p_leaves: Vec<E::Scalar>,
   q_leaves: Vec<E::Scalar>,
+  ones_numerator: bool,
   transcript: &mut E::TE,
 ) -> Result<GkrOut<E>, SpartanError> {
   let n = p_leaves.len();
   assert!(n.is_power_of_two() && n == q_leaves.len() && n >= 1);
   let d = n.trailing_zeros() as usize;
-  let (levels_p, levels_q) = build_levels::<E>(p_leaves, q_leaves);
+  let (levels_p, levels_q) = build_levels::<E>(p_leaves, q_leaves, ones_numerator);
 
   let root_p = levels_p[0][0];
   let root_q = levels_q[0][0];
@@ -202,9 +215,20 @@ fn gkr_prove<E: Engine>(
   for k in 0..d {
     let lambda = transcript.squeeze(b"gkr_lambda")?;
     let half = 1usize << k; // size of the x-cube for this layer's sumcheck
+    // Witness trees have all-ones leaf numerators; the MLE of all-ones
+    // is identically 1 under binding, so the leaf layer's a-tables are
+    // implicit (g = b0 + b1 + λ·b0·b1, h(∞) = λ·b0d·b1d) and never
+    // allocated or bound. The emitted round polynomials are identical.
+    let leaf_ones = ones_numerator && k + 1 == d;
 
-    let mut a0 = levels_p[k + 1][0..half].to_vec();
-    let mut a1 = levels_p[k + 1][half..2 * half].to_vec();
+    let (mut a0, mut a1) = if leaf_ones {
+      (Vec::new(), Vec::new())
+    } else {
+      (
+        levels_p[k + 1][0..half].to_vec(),
+        levels_p[k + 1][half..2 * half].to_vec(),
+      )
+    };
     let mut b0 = levels_q[k + 1][0..half].to_vec();
     let mut b1 = levels_q[k + 1][half..2 * half].to_vec();
 
@@ -242,17 +266,22 @@ fn gkr_prove<E: Engine>(
     let mut challenges = Vec::with_capacity(k);
 
     for round in 0..k {
-      let h = a0.len() / 2;
+      let h = b0.len() / 2;
       let w = &suffix[round + 1];
       debug_assert_eq!(w.len(), h);
       let c = point[round];
 
       // Accumulate h(0) and h(∞) (the quadratic coefficient of h).
       let eval_at = |i: usize| -> [E::Scalar; 2] {
-        let a0d = a0[i + h] - a0[i];
-        let a1d = a1[i + h] - a1[i];
         let b0d = b0[i + h] - b0[i];
         let b1d = b1[i + h] - b1[i];
+        if leaf_ones {
+          let g0 = b0[i] + b1[i] + lambda * (b0[i] * b1[i]);
+          let ginf = lambda * (b0d * b1d);
+          return [w[i] * g0, w[i] * ginf];
+        }
+        let a0d = a0[i + h] - a0[i];
+        let a1d = a1[i + h] - a1[i];
         let g0 = a0[i] * b1[i] + a1[i] * b0[i] + lambda * (b0[i] * b1[i]);
         let ginf = a0d * b1d + a1d * b0d + lambda * (b0d * b1d);
         [w[i] * g0, w[i] * ginf]
@@ -303,8 +332,10 @@ fn gkr_prove<E: Engine>(
         transcript.absorb(b"gkr_rp", v);
       }
       let ri = transcript.squeeze(b"gkr_chal")?;
-      bind_top(&mut a0, ri);
-      bind_top(&mut a1, ri);
+      if !leaf_ones {
+        bind_top(&mut a0, ri);
+        bind_top(&mut a1, ri);
+      }
       bind_top(&mut b0, ri);
       bind_top(&mut b1, ri);
       claim = eval_cubic::<E::Scalar>(&s, ri);
@@ -313,7 +344,12 @@ fn gkr_prove<E: Engine>(
       challenges.push(ri);
     }
 
-    let (p0, p1, q0, q1) = (a0[0], a1[0], b0[0], b1[0]);
+    let (p0, p1) = if leaf_ones {
+      (E::Scalar::ONE, E::Scalar::ONE)
+    } else {
+      (a0[0], a1[0])
+    };
+    let (q0, q1) = (b0[0], b1[0]);
     transcript.absorb(b"gkr_p0", &p0);
     transcript.absorb(b"gkr_p1", &p1);
     transcript.absorb(b"gkr_q0", &q0);
@@ -526,8 +562,8 @@ impl<E: Engine> LogUpRangeProof<E> {
       q_rhs[j] = r + E::Scalar::from(j as u64);
     }
 
-    let lhs = gkr_prove::<E>(p_lhs, q_lhs, transcript)?;
-    let rhs = gkr_prove::<E>(p_rhs, q_rhs, transcript)?;
+    let lhs = gkr_prove::<E>(p_lhs, q_lhs, true, transcript)?;
+    let rhs = gkr_prove::<E>(p_rhs, q_rhs, false, transcript)?;
 
     let claims = RangeClaims {
       r,
@@ -709,7 +745,7 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     for witness in witnesses {
       let p = vec![E::Scalar::ONE; witness.len()];
       let q: Vec<E::Scalar> = witness.iter().map(|&w| r + E::Scalar::from(w)).collect();
-      let out = gkr_prove::<E>(p, q, transcript)?;
+      let out = gkr_prove::<E>(p, q, true, transcript)?;
       wit_roots.push((out.root_p, out.root_q));
       wit_claims.push((out.leaf_point, out.leaf_q - r));
       wit_gkrs.push(out.proof);
@@ -718,7 +754,7 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     // One shared table tree: leaves (m_j, r + j).
     let p_rhs: Vec<E::Scalar> = mult.iter().map(|&m| E::Scalar::from(m)).collect();
     let q_rhs: Vec<E::Scalar> = (0..table).map(|j| r + E::Scalar::from(j as u64)).collect();
-    let rhs = gkr_prove::<E>(p_rhs, q_rhs, transcript)?;
+    let rhs = gkr_prove::<E>(p_rhs, q_rhs, false, transcript)?;
 
     let claims = MultiRangeClaims {
       r,
