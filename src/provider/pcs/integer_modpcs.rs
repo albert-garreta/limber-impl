@@ -39,7 +39,7 @@ use crate::{
   traits::{
     PrimeFieldExt,
     mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
-    pcs::{FoldingEngineTrait, PCSEngineTrait},
+    pcs::PCSEngineTrait,
     transcript::{ByteTranscript, TranscriptEngineTrait, TranscriptReprTrait},
   },
 };
@@ -122,8 +122,6 @@ impl IntEvalParams {
     let nl_pre = numlimb(log_t_f, log_t);
     let nlv_pre = numlimb_var(nl_pre);
     let num_vars_total = num_vars + nlv_pre;
-    let log_n = ceil_log2(num_vars_total.max(1));
-    let log_lambda = ceil_log2(LAMBDA);
 
     // Find max log_p satisfying Partial Evaluation Norm Bound:
     //   k + k·log_p + max(log_t, log_p) < log_q   (uses limb bound T)
@@ -145,17 +143,24 @@ impl IntEvalParams {
       });
     }
 
-    // Smallest s satisfying Soundness 1: s · (log_p - 5 - log λ - log n) ≥ λ.
-    let denom = log_p as isize - 5 - log_lambda as isize - log_n as isize;
-    if denom <= 0 {
+    // Smallest s satisfying the prime-divisibility soundness bound
+    //   (log_P(y) / (π(P) − π(P/2)))^s ≤ 2^{−λ},
+    // where log2(y) = n + λ·n + log_t bounds the integer difference between a
+    // false and the true partial evaluation, and log_P(y) upper-bounds how
+    // many primes ≥ P/2 can divide it. `bits_per_prime` is the soundness each
+    // random small prime in (P/2, P] contributes; the prime count π(P)−π(P/2)
+    // is lower-bounded (Dusart/Rosser–Schoenfeld) so s stays sound. Replaces
+    // the older crude `(32 λ n / P)` union bound, which over-provisioned s.
+    let bits_per_prime = soundness_bits_per_prime(log_p, num_vars_total, log_t);
+    if bits_per_prime <= 0.0 {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
-          "IntEvalParams::derive: Soundness 1 denominator non-positive for k={k}, \
-           num_vars={num_vars}, derived log_p={log_p}"
+          "IntEvalParams::derive: prime-divisibility soundness gives ≤ 0 bits per \
+           prime for k={k}, num_vars={num_vars}, derived log_p={log_p}"
         ),
       });
     }
-    let s = LAMBDA.div_ceil(denom as usize);
+    let s = (LAMBDA as f64 / bits_per_prime).ceil() as usize;
 
     let nl = numlimb(log_t_f, log_t);
     let p = Self {
@@ -214,8 +219,6 @@ impl IntEvalParams {
   /// soundness bounds.
   pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
     let num_vars_total = num_vars + self.numlimb_var;
-    let log_n = ceil_log2(num_vars_total.max(1));
-    let log_lambda = ceil_log2(LAMBDA);
 
     // Limb-decomposition self-consistency: `numlimb` and `numlimb_var`
     // must match the formulas implied by `(log_t, log_t_f)`. Catches
@@ -277,15 +280,14 @@ impl IntEvalParams {
       });
     }
 
-    // Soundness Bound 1: (32 λ n / P)^s <= 2^{-λ}
-    //   log: s · (5 + log λ + log n - log_p) <= -λ
-    //   <=>  s · (log_p - 5 - log λ - log n) >= λ
-    let log_inner = self.log_p as isize - 5 - log_lambda as isize - log_n as isize;
-    if log_inner <= 0 || (self.s as isize) * log_inner < (LAMBDA as isize) {
+    // Soundness Bound 1 (prime divisibility): (log_P(y) / (π(P) − π(P/2)))^s ≤ 2^{−λ}
+    //   <=>  s · bits_per_prime ≥ λ,  bits_per_prime = log2(π(P)−π(P/2)) − log2(log_P y).
+    let bits_per_prime = soundness_bits_per_prime(self.log_p, num_vars_total, self.log_t);
+    if bits_per_prime <= 0.0 || (self.s as f64) * bits_per_prime < LAMBDA as f64 {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
-          "IntEval Soundness Bound 1 violated: s·(log_p - 5 - log λ - log n) = {} < λ = {}",
-          (self.s as isize) * log_inner,
+          "IntEval Soundness Bound 1 violated: s·bits_per_prime = {:.2} < λ = {}",
+          (self.s as f64) * bits_per_prime,
           LAMBDA
         ),
       });
@@ -315,6 +317,51 @@ fn ceil_log2(x: usize) -> usize {
     return 0;
   }
   (usize::BITS - (x - 1).leading_zeros()) as usize
+}
+
+/// Strict lower bound on `π(2^log2_x)` (the prime-counting function). Uses
+/// Dusart's (2010) `π(x) ≥ (x/ln x)(1 + 1/ln x)` for `x ≥ 599`, and the
+/// Rosser–Schoenfeld `π(x) > x/ln x` (valid `x ≥ 17`) below that. Returns a
+/// lower bound so downstream prime-count soundness estimates stay conservative.
+fn pi_lower_2pow(log2_x: usize) -> f64 {
+  let x = (log2_x as f64).exp2();
+  let lnx = (log2_x as f64) * core::f64::consts::LN_2;
+  if x >= 599.0 {
+    (x / lnx) * (1.0 + 1.0 / lnx)
+  } else {
+    x / lnx
+  }
+}
+
+/// Upper bound on `π(2^log2_x)` via Dusart's `π(x) ≤ (x/ln x)(1 + 1.2762/ln x)`
+/// (valid `x ≥ 2`).
+fn pi_upper_2pow(log2_x: usize) -> f64 {
+  let x = (log2_x as f64).exp2();
+  let lnx = (log2_x as f64) * core::f64::consts::LN_2;
+  (x / lnx) * (1.0 + 1.2762 / lnx)
+}
+
+/// `log2` of a lower bound on the number of primes in `(P/2, P]`, `P = 2^log_p`.
+fn log2_primes_in_top_half(log_p: usize) -> f64 {
+  let count = (pi_lower_2pow(log_p) - pi_upper_2pow(log_p.saturating_sub(1))).max(1.0);
+  count.log2()
+}
+
+/// Soundness (in bits) each random small prime `p ∈ (P/2, P]`, `P = 2^log_p`,
+/// contributes to the IntEval CRT fingerprint:
+///   `log2(π(P) − π(P/2)) − log2(log_P(y))`,
+/// with `log2(y) = n + λ·n + log_t` the bound on the integer difference between
+/// a false and the true partial evaluation, and `log_P(y)` an upper bound on
+/// how many primes `≥ P/2` can divide it. `n` is the limb-split polynomial's
+/// variable count. A larger value ⇒ fewer primes `s` needed. Primes below
+/// `2^5` are too sparse for the bounds, so they return a rejecting value.
+fn soundness_bits_per_prime(log_p: usize, n: usize, log_t: usize) -> f64 {
+  if log_p < 5 {
+    return -1.0;
+  }
+  let log2_y = (n as f64) * (1.0 + LAMBDA as f64) + (log_t as f64);
+  let log_p_y = (log2_y / (log_p as f64)).max(1.0);
+  log2_primes_in_top_half(log_p) - log_p_y.log2()
 }
 
 /// Mod-PCS commitment key wraps Hyrax's plus the IntEval parameters.
@@ -366,42 +413,32 @@ pub struct SmallPrimeOpening {
   pub hyrax_arg: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::EvaluationArgument,
 }
 
-/// One iteration's oracle commitments + identity-check openings at γ.
+/// One iteration's identity-check evaluation claims. The commitments
+/// live in the per-layer stacked `(role, chain, x)` polynomials
+/// ([`IntEvalArgument::ab_comms`]); every claim here is discharged by the
+/// final batched opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IterationOracles {
-  /// Hyrax commitment to the *shifted* `a_j` (each coefficient + `shift_a`).
-  pub comm_a_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  /// Hyrax commitment to the *shifted* `b_j`.
-  pub comm_b_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
   /// Claimed `a_{j-1}(γ_ext)` where `γ_ext = (γ[0..n-jk], r^(i)[n-jk..n-(j-1)k])`.
-  /// Used directly in the identity check.
+  /// A claim on the input commitment for `j=1`, else on layer `j-1`'s
+  /// stacked commitment at the chain's boolean-extended point.
   pub a_prev_eval: t256::Scalar,
-  /// Opening binding `a_prev_eval` to the `a_{j-1}` commitment, at
-  /// `γ_ext`. `None` for `j=1`: those open the shared *input* commitment
-  /// at `s` distinct points and are batched across all chains into
-  /// [`IntEvalArgument::a_prev_batch`]. `Some` for `j>1` (chain-specific
-  /// commitment, one point — not batchable across chains).
-  pub open_a_prev: Option<SmallPrimeOpening>,
-  /// Claimed `a_j(γ[0..n-jk])`. Used directly in the identity check. The
-  /// binding to `comm_a_shifted` is via the per-`ρ` fold
-  /// `comm_a + ρ·comm_b`, and all `s` chains' folds at this (shared) point
-  /// are opened together in one [`IntEvalArgument::curr_batch`] entry — so
-  /// there's no per-iteration opening here.
+  /// Claimed `a_j(γ[0..n-jk])` — a claim on layer `j`'s stacked
+  /// commitment at `(0, bits(chain), γ_prefix)`.
   pub a_curr_eval: t256::Scalar,
-  /// Claimed `b_j(γ[0..n-jk])`. See [`Self::a_curr_eval`].
+  /// Claimed `b_j(γ[0..n-jk])` — same point with role bit 1.
   pub b_curr_eval: t256::Scalar,
 }
 
-/// Per-prime chain: `t = ⌈(n-k)/k⌉` iterations plus the final-remainder
-/// opening at `r^(i)[0..n-tk]`. For `n ≤ k` the iterations vec is empty
-/// and `final_open` opens the input polynomial at `r^(i)`.
+/// Per-prime chain: `t = ⌈(n-k)/k⌉` iterations plus the claimed
+/// final-remainder evaluation `a_t(r^(i)[0..n-tk])` (a claim on the input
+/// commitment for `t = 0`, else on the last stacked layer).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainData {
-  /// Per-iteration oracle commitments and identity-check openings.
+  /// Per-iteration identity-check evaluation claims.
   pub iterations: Vec<IterationOracles>,
-  /// `a_t(r^(i)[0..n-tk])` — opens the final remainder commitment for
-  /// `t ≥ 1`; opens the input polynomial commitment for `t = 0`.
-  pub final_open: SmallPrimeOpening,
+  /// Claimed `a_t(r^(i)[0..n-tk])`, used by the CRT check.
+  pub final_eval: t256::Scalar,
 }
 
 /// Evaluation argument: the prover-sent integer evaluation `int_v'`,
@@ -426,71 +463,82 @@ pub struct IntEvalArgument {
   /// One per small prime sampled from the transcript. Length matches
   /// `params.s`.
   pub chains: Vec<ChainData>,
-  /// Phase-3 step D5 (stacked `rbatchrange`): one batched range check
-  /// per `(bound, size)` group. Canonical group order is `f_limb`, then
-  /// for each iteration `j = 1..=t` the `a_j` batch (all `s` chains) and
-  /// the `b_j` batch. So `1 + 2t` entries (just `f_limb` when `t = 0`).
-  /// Each batch range-checks all its polynomials with one bit
-  /// commitment, one bit-validity zerocheck, and one reconstruction
-  /// sumcheck. See [`prove_batch_range_check`].
-  pub(crate) range_checks: Vec<BatchRangeCheck>,
-  /// Batched proof for the `j=1` `a_prev` openings: all `s` chains open
-  /// the shared input commitment at distinct points, collapsed into one
-  /// sumcheck + one opening. `None` when there are no iterations (`t=0`).
-  pub(crate) a_prev_batch: Option<APrevBatch>,
-  /// One batched curr-opening per iteration layer `j ∈ [0, t)`. All `s`
-  /// chains' folded commitments `comm_a + ρ_c·comm_b` for layer `j` are
-  /// opened at the *same* point `γ[0..n-(j+1)k]`, so they're combined by a
-  /// per-layer RLC challenge `λ_j` into a single opening whose evaluation
-  /// must equal `Σ_c λ_j^c·(a_curr_eval + ρ_c·b_curr_eval)`.
-  pub(crate) curr_batch: Vec<SmallPrimeOpening>,
+  /// One stacked commitment per iteration layer `j ∈ [1, t]`, holding ALL
+  /// chains' shifted `a_j` and `b_j`: index `(role, chain, x)` with role
+  /// `0 = a`, `1 = b` and chains padded to the next power of two. Empty
+  /// when `t = 0`.
+  pub(crate) ab_comms: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  /// ONE shared LogUp-GKR range check covering all `(bound, size)`
+  /// batch groups. Canonical batch order is `f_limb`, then for each
+  /// iteration `j = 1..=t` the `a_j` batch (all `s` chains) and the
+  /// `b_j` batch — `1 + 2t` batches (just `f_limb` when `t = 0`), each
+  /// with its own 16-bit-chunk commitment and reconstruction sumcheck,
+  /// all sharing one multiplicity table and one table-side GKR. See
+  /// [`prove_shared_range_check`].
+  pub(crate) range_check: SharedRangeCheck,
+  /// One batched multi-point opening per commitment, in canonical order:
+  /// the input `f`, the stacked layers `ab_1..ab_t`, the `1+2t` chunk
+  /// commitments, and the multiplicity table. Every evaluation claim made
+  /// anywhere in the protocol is discharged here.
+  pub(crate) batched_opens: Vec<BatchedOpen>,
 }
 
-/// Multi-point batch evaluation of the input polynomial `f` (commitment
-/// `comm.inner`) at the `s` distinct `j=1` `a_prev` points. Proves
-/// `Σ_c λ^c·f(z_c) = Σ_x f(x)·W(x)` with `W = Σ_c λ^c·eq(z_c,·)` via one
-/// degree-2 sumcheck reducing to a single opening of `f` at the
-/// sumcheck challenge `r`. The claimed `f(z_c)` are the chains'
-/// `iterations[0].a_prev_eval`.
+/// One batched multi-point opening: all claims `f(z_i) = y_i` against a
+/// single commitment are RLC-combined — `Σ_i λ^i·y_i = Σ_x f(x)·W(x)`
+/// with `W = Σ_i λ^i·eq(z_i,·)` — and reduced by one degree-2 sumcheck to
+/// a single Hyrax opening of `f` at the sumcheck challenge.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct APrevBatch {
+pub struct BatchedOpen {
   /// Degree-2 sumcheck on `f(x)·W(x)`, over the Hyrax base field.
   pub(crate) sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
-  /// Opening of the input commitment `f` at the sumcheck challenge `r`.
+  /// Opening of the commitment at the sumcheck challenge `r`.
   pub(crate) f_open: SmallPrimeOpening,
 }
 
-/// Batched range-check argument (paper's `rbatchrange`) for a
-/// *homogeneous batch* of `N` value polynomials — all of the same
-/// length `n_values` and the same bound `2^log_bound`. The `N` polys
-/// are stacked along a top "poly-index" axis into one bit polynomial
-/// of `N_pad · n_values · 2^log_log_bound` bits (`N_pad = next_pow2(N)`),
-/// committed once. The protocol runs one bit-validity zerocheck and one
-/// value-reconstruction sumcheck over the whole stack, plus two openings
-/// of the bit polynomial and one opening per value polynomial.
+/// Chunk width (bits) for the LogUp range checks: values are decomposed
+/// into base-`2^16` chunks, each looked up against the `[0, 2^16)` table.
+pub(crate) const CHUNK_BITS: usize = 16;
+
+/// Per-batch data of the shared range check: the batch's chunk
+/// commitment, the claimed evaluations its checks rest on (discharged by
+/// the final batched opens), and the value-reconstruction sumcheck tying
+/// chunks to the batch's value polynomials.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchRangeCheck {
-  /// Stacked bit-polynomial commitment.
-  pub(crate) bit_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  /// Bit-validity sumcheck (`bit · (1 - bit) = 0`), over the Hyrax
-  /// base field.
-  pub(crate) bit_validity_sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
-  /// Value-reconstruction sumcheck (`sum_b 2^b · bit(r_v, b) = value(r_v)`),
-  /// over the Hyrax base field.
+pub struct RangeCheckBatchData {
+  /// Stacked chunk-polynomial commitment (entries in `[0, 2^16)`),
+  /// laid out `((p·n_values + within)·stride + c)`.
+  pub(crate) chunk_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// Claimed `V(r_v) = Σ_p eq(r_v_poly, p)·value_p(r_v_within)` — for an
+  /// `a/b` batch this equals the stacked layer MLE at `(role, r_v)`, for
+  /// the `f_limb` batch it is `f(r_v_within)`; discharged by the
+  /// corresponding commitment's batched open.
+  pub(crate) value_eval: t256::Scalar,
+  /// Claimed `chunk(r_v ++ r_b)` — the reconstruction sumcheck's final
+  /// chunk evaluation, discharged by the chunk commitment's batched open.
+  pub(crate) reconstr_eval: t256::Scalar,
+  /// Value-reconstruction sumcheck (`Σ_c 2^(16c)·chunk(r_v, c) =
+  /// value(r_v)`), over the Hyrax base field.
   pub(crate) value_reconstr_sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
-  /// Single opening of the `eq(r_v_poly, ·)`-folded value commitment at
-  /// the within-poly part `r_v_within`. Its evaluation is
-  /// `V(r_v) = Σ_p eq(r_v_poly, p)·value_p(r_v_within)` — one Hyrax open
-  /// for the whole batch (the per-poly commitments are folded
-  /// homomorphically via `fold_commitments`).
-  pub(crate) value_open_at_rv: SmallPrimeOpening,
-  /// Opening of the bit polynomial at the bit-validity sumcheck's
-  /// final challenge point.
-  pub(crate) bit_open_validity_final: SmallPrimeOpening,
-  /// Opening of the bit polynomial at `(r_v, r_b)` — the value-
-  /// reconstruction sumcheck's final point combining `r_v` (poly-index
-  /// ++ within) and `r_b` (the b-axis sumcheck challenges).
-  pub(crate) bit_open_reconstr_final: SmallPrimeOpening,
+}
+
+/// ONE shared LogUp-GKR range check covering all `(bound, size)` batch
+/// groups of a Mod-PCS opening. Every batch's 16-bit chunks (and, for
+/// non-16-aligned bounds, its shifted top chunks) are witness trees of a
+/// single [`crate::logup_gkr::LogUpMultiRangeProof`] against one
+/// `2^16`-entry multiplicity table — the table-side GKR and the
+/// multiplicity commitment are paid once per opening instead of once per
+/// batch. Witness-tree order: all batches' chunk trees in canonical
+/// batch order, then the shifted-top trees of the non-aligned batches in
+/// the same order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SharedRangeCheck {
+  /// Commitment to the shared `2^16`-entry multiplicity table.
+  pub(crate) mult_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  /// The multi-witness LogUp-GKR membership argument.
+  pub(crate) logup: crate::logup_gkr::LogUpMultiRangeProof<T256HyraxEngine>,
+  /// Per-batch commitments, openings, and reconstruction sumchecks, in
+  /// canonical batch order (`f_limb`, then `a_j`/`b_j` per iteration).
+  pub(crate) batches: Vec<RangeCheckBatchData>,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -580,35 +628,27 @@ pub fn numlimb_var(numlimb: usize) -> usize {
   ceil_log2(numlimb.max(1))
 }
 
-/// Decompose a `BigUint` value `v ∈ [0, 2^num_bits)` into its
-/// little-endian bit representation. Output `bits[i] ∈ {0, 1}` with
-/// `v = sum_i 2^i · bits[i]`. Asserts `v < 2^num_bits`; values that
-/// exceed the bound are caller errors. Used by the Phase-3 step D5
-/// batch range-check arguments to prove `value < 2^num_bits` via a
-/// sumcheck on bit constraints + value reconstruction.
-fn bit_decompose_value(v: &BigUint, num_bits: usize) -> Vec<u8> {
-  let mut out = Vec::with_capacity(num_bits);
+/// Decompose a `BigUint` value `v ∈ [0, 2^log_bound)` into base-`2^16`
+/// little-endian chunks: `v = sum_c 2^(16c) · chunks[c]` with
+/// `chunks[c] < 2^16` and `⌈log_bound / 16⌉` entries. Asserts
+/// `v < 2^log_bound`; values that exceed the bound are caller errors.
+/// Used by the LogUp range-check arguments.
+fn chunk_decompose_value(v: &BigUint, log_bound: usize) -> Vec<u64> {
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
   let bytes = v.to_bytes_le();
-  for i in 0..num_bits {
-    let byte_idx = i / 8;
-    let bit_in_byte = i % 8;
-    let bit = if byte_idx < bytes.len() {
-      (bytes[byte_idx] >> bit_in_byte) & 1
-    } else {
-      0
-    };
-    out.push(bit);
-  }
   debug_assert!(
-    bit_decompose_check_no_overflow(&bytes, num_bits),
+    bit_decompose_check_no_overflow(&bytes, log_bound),
     "value 0x{:x} exceeds bound 2^{}",
     v,
-    num_bits
+    log_bound
   );
-  out
+  let byte_at = |i: usize| -> u64 { if i < bytes.len() { bytes[i] as u64 } else { 0 } };
+  (0..numchunks)
+    .map(|c| byte_at(2 * c) | (byte_at(2 * c + 1) << 8))
+    .collect()
 }
 
-/// Helper for `bit_decompose_value`'s debug_assert: checks that the
+/// Helper for `chunk_decompose_value`'s debug_assert: checks that the
 /// LE `bytes` representation has zero bits above `num_bits`.
 fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
   let cutoff_byte = num_bits / 8;
@@ -631,15 +671,20 @@ fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
   true
 }
 
-/// Flatten a batch of values into a single bit polynomial of length
-/// `values.len() * num_bits`, with each value's bits stored
-/// contiguously in little-endian order: `bits[i * num_bits + b]` is the
-/// `b`-th bit of `values[i]`. Used as the witness polynomial of the
-/// batched range-check sumcheck (step D5).
-fn bit_decompose_polynomial(values: &[BigUint], num_bits: usize) -> Vec<u8> {
-  values
-    .par_iter()
-    .flat_map_iter(|v| bit_decompose_value(v, num_bits).into_iter())
+/// Big-endian boolean MLE point for the index `idx` over `num_bits`
+/// variables: `point[0]` is the most significant bit. Binding an MLE's
+/// trailing variables to this point selects the slot `idx` of the
+/// bottom axis.
+fn bool_point_of_index(idx: usize, num_bits: usize) -> Vec<t256::Scalar> {
+  (0..num_bits)
+    .rev()
+    .map(|b| {
+      if (idx >> b) & 1 == 1 {
+        t256::Scalar::ONE
+      } else {
+        t256::Scalar::ZERO
+      }
+    })
     .collect()
 }
 
@@ -807,24 +852,33 @@ fn integer_mle_evaluate(poly: &[BigUint], point: &[BigUint]) -> BigInt {
   debug_assert_eq!(1 << num_vars, n);
   debug_assert_eq!(point.len(), num_vars);
 
-  // Pre-lift point components to BigInt.
-  let point_int: Vec<BigInt> = point.iter().map(|x| BigInt::from(x.clone())).collect();
-  let one = BigInt::one();
-
-  // Walk all 2^num_vars hypercube points. Bit-order matches
-  // `EqPolynomial::evals_from_points`: variable `i ∈ [0, num_vars)`
-  // corresponds to bit `num_vars - 1 - i` of `k`.
-  let mut acc = BigInt::zero();
-  for (k, poly_k) in poly.iter().enumerate().take(n) {
-    let mut chi = one.clone();
-    for (i, pi) in point_int.iter().enumerate().take(num_vars) {
-      let bit = (k >> (num_vars - 1 - i)) & 1;
-      let factor = if bit == 1 { pi.clone() } else { &one - pi };
-      chi *= factor;
-    }
-    acc += chi * BigInt::from(poly_k.clone());
+  // Bind variables one at a time (top variable first), folding the table
+  // in half per round over ℤ: out[i] = lo[i] + r·(hi[i] − lo[i]). The
+  // bit-order matches `EqPolynomial::evals_from_points` / `bind_poly_var_top`:
+  // variable `i` corresponds to bit `num_vars - 1 - i` of the index, so
+  // `point[0]` splits the table into its two halves. Entry widths grow by
+  // ~|r| bits per round while the count halves, so the total bigint work
+  // is dominated by the early (narrow) rounds — far cheaper than
+  // materializing the 2^n chi table at full width, and each round is
+  // embarrassingly parallel.
+  let mut cur: Vec<BigInt> = poly.par_iter().map(|x| BigInt::from(x.clone())).collect();
+  for r in point {
+    let r_int = BigInt::from(r.clone());
+    let h = cur.len() / 2;
+    let (lo, hi) = cur.split_at(h);
+    cur = if h >= 1 << 10 {
+      lo.par_iter()
+        .zip(hi.par_iter())
+        .map(|(a, b)| a + &r_int * (b - a))
+        .collect()
+    } else {
+      lo.iter()
+        .zip(hi.iter())
+        .map(|(a, b)| a + &r_int * (b - a))
+        .collect()
+    };
   }
-  acc
+  cur.pop().expect("non-empty table")
 }
 
 /// Rejection-sample a small prime in `[2^{log_p - 1}, 2^{log_p})` from
@@ -1049,7 +1103,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
     //    coefficients (and 2^numlimb_var slots per original coefficient,
     //    padded with zero if numlimb isn't a power of two).
+    let (_ls_span, ls_t) = start_span!("imod_pcs_red_limb_split");
     let f_limb = limb_split_polynomial(poly, params.log_t, params.log_t_f);
+    info!(elapsed_ms = %ls_t.elapsed().as_millis(), "imod_pcs_red_limb_split");
 
     // 1. Reduction sumcheck (Phase-3 step D3): reduce the eval claim
     //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
@@ -1058,6 +1114,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     //    {0,1}^numlimb_var. For numlimb_var = 0 the sumcheck has zero
     //    rounds, returns `r_k = []`, and the recovered eval equals
     //    the input `eval` directly (limb(empty) = T^0 = 1).
+    let (_dc_span, dc_t) = start_span!("imod_pcs_red_to_dynprime");
     let f_limb_p: Vec<crate::dyn_prime::DynPrime<4>> = f_limb
       .iter()
       .map(|b| {
@@ -1067,14 +1124,17 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         )
       })
       .collect();
+    info!(elapsed_ms = %dc_t.elapsed().as_millis(), "imod_pcs_red_to_dynprime");
     // Partial-eval f_limb at the original `point` in Z_p, leaving the
     // last numlimb_var variables free. Bind the top variables (= the
     // original n_vars) one at a time.
+    let (_pe_span, pe_t) = start_span!("imod_pcs_red_dynprime_bind");
     let mut mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
     for r_i in point {
       mle.bind_poly_var_top(r_i);
     }
     let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<4>> = mle.into_vec();
+    info!(elapsed_ms = %pe_t.elapsed().as_millis(), "imod_pcs_red_dynprime_bind");
     debug_assert_eq!(f_limb_at_int_r.len(), 1 << params.numlimb_var);
 
     let limb_p = build_limb_weight_dynprime(params, &monty);
@@ -1105,7 +1165,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let int_point_ext: Vec<BigUint> = int_point.iter().chain(r_k_int.iter()).cloned().collect();
 
     // 3. int_v' = f_limb at the extended point, over Z.
+    let (_ie_span, ie_t) = start_span!("imod_pcs_red_integer_eval");
     let int_v_prime = integer_mle_evaluate(&f_limb, &int_point_ext);
+    info!(elapsed_ms = %ie_t.elapsed().as_millis(), "imod_pcs_red_integer_eval");
 
     // 4. Sanity: f_eval_p ≡ int_v' (mod p). For numlimb_var=0, f_eval_p
     //    == eval and this matches the pre-D3 check.
@@ -1144,13 +1206,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let num_vars = point.len() + params.numlimb_var;
     let with_iter = num_vars > params.k;
     let poly = f_limb.as_slice();
+    let (_fq_span, fq_t) = start_span!("imod_pcs_red_to_fq");
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
+    info!(elapsed_ms = %fq_t.elapsed().as_millis(), "imod_pcs_red_to_fq");
     info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_pcs_reduction");
 
-    // 4. Phase 1: per prime, sample p_i, run all t iterations (if any),
-    //    committing a_j_shifted / b_j_shifted and absorbing into the
-    //    transcript. We stash the per-chain prover state needed to
-    //    generate openings in phase 2.
+    // 4. Phase 1: per prime, sample p_i, run all t iterations (if any).
+    //    No per-chain commitments: all chains' shifted (a_j, b_j) are
+    //    stacked into ONE commitment per layer below.
     let (_p1_span, p1_t) = start_span!("imod_pcs_chain_phase1");
     // Lift `poly` to BigInt once; each iterating chain clones it as its
     // `a_0`. Only the `with_iter` path consumes it.
@@ -1162,10 +1225,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
     // Sample all `s` small primes upfront (paper §4: the verifier sends
     // `[p_i]_{i=1}^s` in one round, then the prover responds with the chain
-    // oracles). Decoupling the primes from the per-chain commitments makes
-    // the chains independent, so they're built — including the Hyrax
-    // commits — in parallel. The commitments are then absorbed in order,
-    // before γ, so the binding is unchanged.
+    // oracles). The chains are independent and built in parallel.
     let primes: Vec<BigUint> = (0..params.s)
       .map(|_| sample_small_prime(transcript, params.log_p))
       .collect::<Result<Vec<_>, SpartanError>>()?;
@@ -1219,20 +1279,11 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
             let b_j_shifted_fq: Vec<t256::Scalar> =
               b_j_shifted.iter().map(biguint_to_scalar).collect();
 
-            let a_blind = Hyrax::blind(&ck.inner, a_j_shifted_fq.len());
-            let b_blind = Hyrax::blind(&ck.inner, b_j_shifted_fq.len());
-            let comm_a_shifted = Hyrax::commit(&ck.inner, &a_j_shifted_fq, &a_blind, false)?;
-            let comm_b_shifted = Hyrax::commit(&ck.inner, &b_j_shifted_fq, &b_blind, false)?;
-
             iters.push(IterationProverState {
               a_shifted: a_j_shifted,
               a_shifted_fq: a_j_shifted_fq,
-              a_blind,
-              comm_a_shifted,
               b_shifted: b_j_shifted,
               b_shifted_fq: b_j_shifted_fq,
-              b_blind,
-              comm_b_shifted,
             });
 
             a_prev_int = a_j_int;
@@ -1247,12 +1298,35 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       })
       .collect::<Result<Vec<_>, SpartanError>>()?;
 
-    // Absorb all chain commitments in transcript order, before γ.
-    for state in &chain_states {
-      for it in &state.iters {
-        transcript.absorb(b"a_shifted", &it.comm_a_shifted);
-        transcript.absorb(b"b_shifted", &it.comm_b_shifted);
+    // Stack all chains' shifted (a_j, b_j) per layer into ONE commitment:
+    // index = (role, chain, x), role 0 = a / 1 = b, chains padded to
+    // s_pad = next_pow2(s). Absorbed in layer order, before γ.
+    let t_layers = if with_iter {
+      num_vars.saturating_sub(params.k).div_ceil(params.k)
+    } else {
+      0
+    };
+    let s_pad = params.s.next_power_of_two();
+    let log_spad = s_pad.trailing_zeros() as usize;
+    type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+    type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+    let mut ab_polys: Vec<Vec<t256::Scalar>> = Vec::with_capacity(t_layers);
+    let mut ab_blinds: Vec<HB> = Vec::with_capacity(t_layers);
+    let mut ab_comms: Vec<HC> = Vec::with_capacity(t_layers);
+    for jm1 in 0..t_layers {
+      let m = 1usize << (num_vars - (jm1 + 1) * params.k);
+      let mut stacked = vec![t256::Scalar::ZERO; 2 * s_pad * m];
+      for (c, st) in chain_states.iter().enumerate() {
+        let it = &st.iters[jm1];
+        stacked[c * m..(c + 1) * m].copy_from_slice(&it.a_shifted_fq);
+        stacked[(s_pad + c) * m..(s_pad + c + 1) * m].copy_from_slice(&it.b_shifted_fq);
       }
+      let ab_blind = Hyrax::blind(&ck.inner, stacked.len());
+      let ab_comm = Hyrax::commit(&ck.inner, &stacked, &ab_blind, false)?;
+      transcript.absorb(b"ab_stacked", &ab_comm);
+      ab_polys.push(stacked);
+      ab_blinds.push(ab_blind);
+      ab_comms.push(ab_comm);
     }
     info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
@@ -1270,36 +1344,35 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       Vec::new()
     };
 
-    // 6. Phase 2: per chain, generate openings. Borrow `chain_states`
-    //    rather than consuming — D5.3 / D5.4 need to re-walk it after
-    //    phase 2 to run deferred range checks on each iter's shifted
-    //    polynomials.
-    let (_open_span, open_t) = start_span!("imod_pcs_chain_openings");
-    // `j=1` a_prev opens all hit the shared input commitment at distinct
-    // points; collect them for the batched multi-point evaluation below.
-    let mut aprev_points: Vec<Vec<t256::Scalar>> = Vec::with_capacity(params.s);
-    let mut aprev_evals: Vec<t256::Scalar> = Vec::with_capacity(params.s);
-    // Per-layer folded curr data (one entry per chain), collected for the
-    // same-point batched opening after the loop.
-    let t_layers = if with_iter {
-      num_vars.saturating_sub(params.k).div_ceil(params.k)
+    // 6. Identity-check and final-remainder evaluations become multi-point
+    //    CLAIMS on `f` / the stacked layer commitments; each claimed eval
+    //    is absorbed (binding it before the batch challenges), and all
+    //    claims are discharged by one batched open per commitment below.
+    let (_open_span, open_t) = start_span!("imod_pcs_chain_claims");
+    let mut f_claims = OpenClaims::default();
+    let mut ab_claims: Vec<OpenClaims> = (0..t_layers).map(|_| OpenClaims::default()).collect();
+
+    // Fast path for the j=1 a_prev evals: all chains share the γ-prefix,
+    // so bind `f` once at γ[..n-k]; per chain only a 2^k-size dot with
+    // eq(r_lower) remains.
+    let poly_at_gamma: Vec<t256::Scalar> = if with_iter {
+      let mut m = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.clone());
+      for r in &gamma_fq[..(num_vars - params.k)] {
+        m.bind_poly_var_top(r);
+      }
+      m.into_vec()
     } else {
-      0
+      Vec::new()
     };
-    type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
-    type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
-    let mut curr_comms: Vec<Vec<HC>> = vec![Vec::with_capacity(params.s); t_layers];
-    let mut curr_polys: Vec<Vec<Vec<t256::Scalar>>> = vec![Vec::with_capacity(params.s); t_layers];
-    let mut curr_blinds: Vec<Vec<HB>> = vec![Vec::with_capacity(params.s); t_layers];
+
     let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
-    for state in &chain_states {
+    for (ci, state) in chain_states.iter().enumerate() {
       let r_i_int = &state.r_i_int;
       let iters = &state.iters;
-
-      // 6a. Generate identity-check openings for each iteration j.
-      let mut iter_oracles = Vec::with_capacity(iters.len());
       let n = num_vars;
       let k = params.k;
+
+      let mut iter_oracles = Vec::with_capacity(iters.len());
       for (jm1, iter_state) in iters.iter().enumerate() {
         let j = jm1 + 1;
         let prefix_len = n - j * k;
@@ -1313,252 +1386,89 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           .copied()
           .collect();
 
-        // a_{j-1}: for j=1 is the input commitment; otherwise iters[j-2]'s comm_a_shifted.
-        let (a_prev_comm, a_prev_poly_fq, a_prev_blind) = if j == 1 {
-          (comm.inner.clone(), poly_fq.clone(), blind.inner.clone())
+        let a_prev_eval = if j == 1 {
+          let v = mle_evaluate_fq(&poly_at_gamma, &r_lower_fq);
+          f_claims.push(gamma_extended.clone(), v);
+          v
         } else {
-          let prev = &iters[jm1 - 1];
-          (
-            prev.comm_a_shifted.clone(),
-            prev.a_shifted_fq.clone(),
-            prev.a_blind.clone(),
-          )
+          let v = mle_evaluate_fq(&iters[jm1 - 1].a_shifted_fq, &gamma_extended);
+          ab_claims[jm1 - 1].push(ab_stack_point(0, ci, log_spad, &gamma_extended), v);
+          v
         };
-
-        // a_prev eval (used in the identity check). For j=1 it opens the
-        // shared input commitment → defer binding to the batch (collect
-        // point+eval, no individual open). For j>1 open the chain-specific
-        // commitment directly.
-        let a_prev_eval = mle_evaluate_fq(&a_prev_poly_fq, &gamma_extended);
-        let open_a_prev = if j == 1 {
-          aprev_points.push(gamma_extended.clone());
-          aprev_evals.push(a_prev_eval);
-          None
-        } else {
-          Some(hyrax_open_at(
-            &ck.inner,
-            &ck_eval.inner,
-            transcript,
-            &a_prev_comm,
-            &a_prev_poly_fq,
-            &a_prev_blind,
-            &gamma_extended,
-          )?)
-        };
-        // a_j and b_j are both opened at the *shared* point `gamma_prefix`.
-        // Fold them per-chain as `comm_a + ρ·comm_b`, then collect for the
-        // single same-point batched opening of layer `j` below (across all
-        // chains). Send the two evals (used in the identity check).
         let a_curr_eval = mle_evaluate_fq(&iter_state.a_shifted_fq, &gamma_prefix);
         let b_curr_eval = mle_evaluate_fq(&iter_state.b_shifted_fq, &gamma_prefix);
-        let rho = squeeze_curr_rho(transcript, &a_curr_eval, &b_curr_eval)?;
-        let one = t256::Scalar::ONE;
-        let folded_comm = Hyrax::fold_commitments(
-          &[
-            iter_state.comm_a_shifted.clone(),
-            iter_state.comm_b_shifted.clone(),
-          ],
-          &[one, rho],
-        )?;
-        let folded_blind = Hyrax::fold_blinds(
-          &[iter_state.a_blind.clone(), iter_state.b_blind.clone()],
-          &[one, rho],
-        )?;
-        let folded_poly: Vec<t256::Scalar> = iter_state
-          .a_shifted_fq
-          .iter()
-          .zip(iter_state.b_shifted_fq.iter())
-          .map(|(a, b)| *a + rho * *b)
-          .collect();
-        curr_comms[jm1].push(folded_comm);
-        curr_polys[jm1].push(folded_poly);
-        curr_blinds[jm1].push(folded_blind);
-
+        ab_claims[jm1].push(ab_stack_point(0, ci, log_spad, &gamma_prefix), a_curr_eval);
+        ab_claims[jm1].push(ab_stack_point(1, ci, log_spad, &gamma_prefix), b_curr_eval);
+        for ev in [&a_prev_eval, &a_curr_eval, &b_curr_eval] {
+          transcript.absorb_bytes(b"claim_ev", ev.to_repr().as_ref());
+        }
         iter_oracles.push(IterationOracles {
-          comm_a_shifted: iter_state.comm_a_shifted.clone(),
-          comm_b_shifted: iter_state.comm_b_shifted.clone(),
           a_prev_eval,
-          open_a_prev,
           a_curr_eval,
           b_curr_eval,
         });
       }
 
-      // 6b. Final-remainder open: a_t at r_i[0..n-tk]. For t=0 this opens
-      //     the *input* polynomial at the full r_i (step B path).
+      // Final-remainder claim: a_t at r_i[0..n-tk]. For t=0 this is a
+      // claim on the *input* polynomial at the full r_i (step B path).
       let t = iters.len();
-      let final_point_int: Vec<BigUint> = r_i_int[..(num_vars - t * params.k)].to_vec();
-      let final_point_fq: Vec<t256::Scalar> =
-        final_point_int.iter().map(biguint_to_scalar).collect();
-      let final_open = if t == 0 {
-        hyrax_open_at(
-          &ck.inner,
-          &ck_eval.inner,
-          transcript,
-          &comm.inner,
-          &poly_fq,
-          &blind.inner,
-          &final_point_fq,
-        )?
+      let final_point_fq: Vec<t256::Scalar> = r_i_int[..(num_vars - t * params.k)]
+        .iter()
+        .map(biguint_to_scalar)
+        .collect();
+      let final_eval = if t == 0 {
+        let v = mle_evaluate_fq(&poly_fq, &final_point_fq);
+        f_claims.push(final_point_fq, v);
+        v
       } else {
         let last = &iters[t - 1];
-        hyrax_open_at(
-          &ck.inner,
-          &ck_eval.inner,
-          transcript,
-          &last.comm_a_shifted,
-          &last.a_shifted_fq,
-          &last.a_blind,
-          &final_point_fq,
-        )?
+        let v = mle_evaluate_fq(&last.a_shifted_fq, &final_point_fq);
+        ab_claims[t - 1].push(ab_stack_point(0, ci, log_spad, &final_point_fq), v);
+        v
       };
+      transcript.absorb_bytes(b"claim_ev", final_eval.to_repr().as_ref());
 
       chains.push(ChainData {
         iterations: iter_oracles,
-        final_open,
+        final_eval,
       });
     }
-    info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_openings");
+    info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_claims");
 
-    // Batched curr openings: for each iteration layer `j`, all `s` chains'
-    // folded commitments are at the same point `γ[0..n-(j+1)k]`, so combine
-    // them with a per-layer RLC challenge `λ_j` and open once.
-    let (_cb_span, cb_t) = start_span!("imod_pcs_curr_batch");
-    let mut curr_batch: Vec<SmallPrimeOpening> = Vec::with_capacity(t_layers);
-    for j in 0..t_layers {
-      let prefix_len = num_vars - (j + 1) * params.k;
-      let gamma_prefix = gamma_fq[..prefix_len].to_vec();
-      let lam_bytes = transcript.squeeze_bytes(b"curr_lambda")?;
-      let lambda = <t256::Scalar as PrimeFieldExt>::from_uniform(&lam_bytes);
-      let mut weights = Vec::with_capacity(params.s);
-      let mut pow = t256::Scalar::ONE;
-      for _ in 0..params.s {
-        weights.push(pow);
-        pow *= lambda;
-      }
-      let combined_comm = Hyrax::fold_commitments(&curr_comms[j], &weights)?;
-      let combined_blind = Hyrax::fold_blinds(&curr_blinds[j], &weights)?;
-      let plen = curr_polys[j][0].len();
-      let mut combined_poly = vec![t256::Scalar::ZERO; plen];
-      for (c, poly) in curr_polys[j].iter().enumerate() {
-        for (o, &v) in combined_poly.iter_mut().zip(poly.iter()) {
-          *o += weights[c] * v;
-        }
-      }
-      curr_batch.push(hyrax_open_at(
-        &ck.inner,
-        &ck_eval.inner,
-        transcript,
-        &combined_comm,
-        &combined_poly,
-        &combined_blind,
-        &gamma_prefix,
-      )?);
-    }
-    info!(elapsed_ms = %cb_t.elapsed().as_millis(), "imod_pcs_curr_batch");
-
-    // Batched `j=1` a_prev evaluation: prove all `s` claimed
-    // `f(z_c) = aprev_evals[c]` against the shared input commitment with
-    // one degree-2 sumcheck on `f(x)·W(x)` (W = Σ_c λ^c·eq(z_c,·)) plus a
-    // single opening of `f` at the sumcheck challenge.
-    let (_apb_span, apb_t) = start_span!("imod_pcs_aprev_batch");
-    let a_prev_batch = if with_iter {
-      let mut sub = spawn_aprev_subtranscript(transcript, &comm.inner, &aprev_evals)?;
-      let lambda = sub.squeeze(b"aprev_lambda")?;
-      let (w, claim) = aprev_batch_weight(&aprev_points, &aprev_evals, lambda, poly_fq.len());
-      let mut poly_f = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.clone());
-      let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(w);
-      let (sumcheck, r, _claims) = crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
-        &claim,
-        num_vars,
-        &mut poly_f,
-        &mut poly_w,
-        &mut sub,
-      )?;
-      let f_open = hyrax_open_at(
-        &ck.inner,
-        &ck_eval.inner,
-        &mut sub,
-        &comm.inner,
-        &poly_fq,
-        &blind.inner,
-        &r,
-      )?;
-      Some(APrevBatch { sumcheck, f_open })
-    } else {
-      None
-    };
-    info!(elapsed_ms = %apb_t.elapsed().as_millis(), "imod_pcs_aprev_batch");
-
-    // Phase-3 step D5 (stacked `rbatchrange`): one batched range check
-    // per `(bound, size)` group, in canonical order `f_limb`, then for
-    // each iteration `j` the `a_j` batch (all `s` chains) and the `b_j`
-    // batch. Each batch folds `s` polynomials into a single argument.
-    let t = if with_iter {
-      num_vars.saturating_sub(params.k).div_ceil(params.k)
-    } else {
-      0
-    };
+    // 7. ONE shared LogUp-GKR range check across all `(bound, size)`
+    // groups, in canonical order `f_limb`, then for each iteration `j`
+    // the `a_j` batch (all `s` chains) and the `b_j` batch. All batches
+    // share one multiplicity table and one table-side GKR; its value and
+    // chunk evaluations come back as claims.
+    let t = t_layers;
     let log_bound_a = params.log_p + 1;
     let log_bound_b = LOG_Q - params.log_p + 1;
-    let mut range_checks: Vec<BatchRangeCheck> = Vec::with_capacity(1 + 2 * t);
+    let mut rc_batches: Vec<RangeBatchInputs<'_>> = Vec::with_capacity(1 + 2 * t);
 
-    let (_rcf_span, rcf_t) = start_span!("imod_pcs_rc_flimb");
-    // f_limb group (a single polynomial, bound `2^log_T`).
-    range_checks.push(prove_batch_range_check(
-      RangeBatchInputs {
-        ck: &ck.inner,
-        ck_eval: &ck_eval.inner,
-        value_comms: vec![&comm.inner],
-        value_polys_fq: vec![poly_fq.as_slice()],
-        value_blinds: vec![&blind.inner],
-        values: vec![poly],
-        n_values: poly.len(),
-        log_bound: params.log_t,
-      },
-      transcript,
-    )?);
-    info!(elapsed_ms = %rcf_t.elapsed().as_millis(), "imod_pcs_rc_flimb");
+    rc_batches.push(RangeBatchInputs {
+      target: RcTarget::F,
+      value_polys_fq: vec![poly_fq.as_slice()],
+      values: vec![poly],
+      n_values: poly.len(),
+      log_bound: params.log_t,
+    });
 
-    let (_rcab_span, rcab_t) = start_span!("imod_pcs_rc_ab");
-    // For each iteration `j`, batch all `s` chains' `a_j` (bound `2P`)
-    // then all `s` chains' `b_j` (bound `2q/P`). Same size per `j`.
     for j in 0..t {
-      for (is_a, log_bound) in [(true, log_bound_a), (false, log_bound_b)] {
-        let value_comms = chain_states
-          .iter()
-          .map(|st| {
-            if is_a {
-              &st.iters[j].comm_a_shifted
-            } else {
-              &st.iters[j].comm_b_shifted
-            }
-          })
-          .collect::<Vec<_>>();
+      for (role, log_bound) in [(0u8, log_bound_a), (1u8, log_bound_b)] {
         let value_polys_fq = chain_states
           .iter()
           .map(|st| {
-            if is_a {
+            if role == 0 {
               st.iters[j].a_shifted_fq.as_slice()
             } else {
               st.iters[j].b_shifted_fq.as_slice()
             }
           })
           .collect::<Vec<_>>();
-        let value_blinds = chain_states
-          .iter()
-          .map(|st| {
-            if is_a {
-              &st.iters[j].a_blind
-            } else {
-              &st.iters[j].b_blind
-            }
-          })
-          .collect::<Vec<_>>();
         let values = chain_states
           .iter()
           .map(|st| {
-            if is_a {
+            if role == 0 {
               st.iters[j].a_shifted.as_slice()
             } else {
               st.iters[j].b_shifted.as_slice()
@@ -1566,31 +1476,93 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           })
           .collect::<Vec<_>>();
         let n_values = values[0].len();
-        range_checks.push(prove_batch_range_check(
-          RangeBatchInputs {
-            ck: &ck.inner,
-            ck_eval: &ck_eval.inner,
-            value_comms,
-            value_polys_fq,
-            value_blinds,
-            values,
-            n_values,
-            log_bound,
-          },
-          transcript,
-        )?);
+        rc_batches.push(RangeBatchInputs {
+          target: RcTarget::Ab { layer: j, role },
+          value_polys_fq,
+          values,
+          n_values,
+          log_bound,
+        });
       }
     }
-    info!(elapsed_ms = %rcab_t.elapsed().as_millis(), "imod_pcs_rc_ab");
+
+    let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
+    let (range_check, rc_art) =
+      prove_shared_range_check(&ck.inner, &ck_eval.inner, &rc_batches, transcript)?;
+    info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
+
+    // Route the range check's value claims to their target commitments.
+    for (target, z, y) in rc_art.value_claims {
+      match target {
+        RcTarget::F => f_claims.push(z, y),
+        RcTarget::Ab { layer, role } => {
+          let mut pt = Vec::with_capacity(1 + z.len());
+          pt.push(if role == 1 {
+            t256::Scalar::ONE
+          } else {
+            t256::Scalar::ZERO
+          });
+          pt.extend(z);
+          ab_claims[layer].push(pt, y);
+        }
+      }
+    }
+
+    // 8. Batched opens — one per commitment, canonical order: `f`, the
+    //    stacked layers, the chunk commitments, the multiplicity table.
+    let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
+    let mut bsub = spawn_batch_subtranscript(transcript)?;
+    let mut batched_opens: Vec<BatchedOpen> = Vec::with_capacity(1 + t + (1 + 2 * t) + 1);
+    batched_opens.push(prove_batched_open(
+      &ck.inner,
+      &ck_eval.inner,
+      &mut bsub,
+      &comm.inner,
+      &poly_fq,
+      &blind.inner,
+      &f_claims,
+    )?);
+    for j in 0..t_layers {
+      batched_opens.push(prove_batched_open(
+        &ck.inner,
+        &ck_eval.inner,
+        &mut bsub,
+        &ab_comms[j],
+        &ab_polys[j],
+        &ab_blinds[j],
+        &ab_claims[j],
+      )?);
+    }
+    for (bi, (chunk_fq, chunk_blind, claims)) in rc_art.chunk_data.iter().enumerate() {
+      batched_opens.push(prove_batched_open(
+        &ck.inner,
+        &ck_eval.inner,
+        &mut bsub,
+        &range_check.batches[bi].chunk_comm,
+        chunk_fq,
+        chunk_blind,
+        claims,
+      )?);
+    }
+    batched_opens.push(prove_batched_open(
+      &ck.inner,
+      &ck_eval.inner,
+      &mut bsub,
+      &range_check.mult_comm,
+      &rc_art.mult_fq,
+      &rc_art.mult_blind,
+      &rc_art.mult_claims,
+    )?);
+    info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
 
     Ok(IntEvalArgument {
       reduction_round_polys,
       int_v_prime,
       chains,
-      range_checks,
-      a_prev_batch,
-      curr_batch,
+      ab_comms,
+      range_check,
+      batched_opens,
     })
   }
 
@@ -1698,8 +1670,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction");
 
     let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
-    // 3. Phase 1: re-sample all `s` primes upfront, then absorb the chain
-    //    commitments in order — mirroring the prover's reordered FS.
+    // 3. Phase 1 mirror: re-sample all `s` primes, absorb the stacked
+    //    layer commitments, sample γ.
     let primes: Vec<BigUint> = (0..params.s)
       .map(|_| sample_small_prime(transcript, params.log_p))
       .collect::<Result<Vec<_>, SpartanError>>()?;
@@ -1711,11 +1683,13 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
       chain_primes.push((p_i.clone(), r_i_int));
     }
-    for chain in &arg.chains {
-      for iter in &chain.iterations {
-        transcript.absorb(b"a_shifted", &iter.comm_a_shifted);
-        transcript.absorb(b"b_shifted", &iter.comm_b_shifted);
-      }
+    if arg.ab_comms.len() != t {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    let s_pad = params.s.next_power_of_two();
+    let log_spad = s_pad.trailing_zeros() as usize;
+    for c in &arg.ab_comms {
+      transcript.absorb(b"ab_stacked", c);
     }
 
     // 4. Sample γ if iterating, identically to prover.
@@ -1732,18 +1706,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       Vec::new()
     };
 
-    // 5. Phase 2: per chain, verify each iteration's three openings +
-    //    identity check, then verify the final-remainder opening + CRT.
+    // 5. Per chain: re-derive the claim points, absorb the claimed evals
+    //    (mirroring the prover), run the identity and CRT checks, and
+    //    collect the claims for the batched-open verification.
     let shift_a_fq = biguint_to_scalar(&shift_a(params));
     let shift_b_fq = biguint_to_scalar(&shift_b(params));
 
-    let mut aprev_points: Vec<Vec<t256::Scalar>> = Vec::with_capacity(params.s);
-    let mut aprev_evals: Vec<t256::Scalar> = Vec::with_capacity(params.s);
-    // Per-layer reconstructed folded commitments + per-chain folded evals
-    // (`a + ρ·b`), for the batched curr-open verification after the loop.
-    type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
-    let mut curr_comms: Vec<Vec<HC>> = vec![Vec::with_capacity(params.s); t];
-    let mut curr_evals: Vec<Vec<t256::Scalar>> = vec![Vec::with_capacity(params.s); t];
+    let mut f_claims = OpenClaims::default();
+    let mut ab_claims: Vec<OpenClaims> = (0..t).map(|_| OpenClaims::default()).collect();
     for (chain_idx, chain) in arg.chains.iter().enumerate() {
       let (p_i, r_i_int) = &chain_primes[chain_idx];
       let p_i_fq = biguint_to_scalar(p_i);
@@ -1761,43 +1731,25 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
           .copied()
           .collect();
 
-        // a_prev: j=1 opens the shared input commitment → collect for the
-        // batched verification below (no individual open). j>1 opens the
-        // chain-specific commitment directly; check it binds a_prev_eval.
         if j == 1 {
-          if iter.open_a_prev.is_some() {
-            return Err(SpartanError::InvalidSumcheckProof);
-          }
-          aprev_points.push(gamma_extended.clone());
-          aprev_evals.push(iter.a_prev_eval);
+          f_claims.push(gamma_extended.clone(), iter.a_prev_eval);
         } else {
-          let a_prev_comm = chain.iterations[jm1 - 1].comm_a_shifted.clone();
-          let open = iter
-            .open_a_prev
-            .as_ref()
-            .ok_or(SpartanError::InvalidSumcheckProof)?;
-          hyrax_verify_open(
-            &vk.inner,
-            &ck_eval.inner,
-            transcript,
-            &a_prev_comm,
-            &gamma_extended,
-            open,
-          )?;
-          if open.f_y != iter.a_prev_eval {
-            return Err(SpartanError::InvalidSumcheckProof);
-          }
+          ab_claims[jm1 - 1].push(
+            ab_stack_point(0, chain_idx, log_spad, &gamma_extended),
+            iter.a_prev_eval,
+          );
         }
-        // Batched a_j/b_j opening at `gamma_prefix`: re-derive ρ, reconstruct
-        // the folded commitment `comm_a + ρ·comm_b` and the folded eval, and
-        // collect them for the per-layer batched open verified after the loop.
-        let rho = squeeze_curr_rho(transcript, &iter.a_curr_eval, &iter.b_curr_eval)?;
-        let folded_comm = Hyrax::fold_commitments(
-          &[iter.comm_a_shifted.clone(), iter.comm_b_shifted.clone()],
-          &[t256::Scalar::ONE, rho],
-        )?;
-        curr_comms[jm1].push(folded_comm);
-        curr_evals[jm1].push(iter.a_curr_eval + rho * iter.b_curr_eval);
+        ab_claims[jm1].push(
+          ab_stack_point(0, chain_idx, log_spad, &gamma_prefix),
+          iter.a_curr_eval,
+        );
+        ab_claims[jm1].push(
+          ab_stack_point(1, chain_idx, log_spad, &gamma_prefix),
+          iter.b_curr_eval,
+        );
+        for ev in [&iter.a_prev_eval, &iter.a_curr_eval, &iter.b_curr_eval] {
+          transcript.absorb_bytes(b"claim_ev", ev.to_repr().as_ref());
+        }
 
         // Identity check in F: a_j(γ) + p_i · b_j(γ) ?= a_{j-1}(γ_ext).
         // a_prev for j=1 is the *unshifted* input poly (no subtract);
@@ -1815,31 +1767,26 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         }
       }
 
-      // Final remainder verification.
+      // Final-remainder claim + CRT check: (final_eval [- shift_a if t>0])
+      // interpreted as a *balanced* integer ≡ int_v' (mod p_i).
       let final_point_fq: Vec<t256::Scalar> = r_i_int[..(n - t * k)]
         .iter()
         .map(biguint_to_scalar)
         .collect();
-      let final_comm = if t == 0 {
-        comm.inner.clone()
+      if t == 0 {
+        f_claims.push(final_point_fq, chain.final_eval);
       } else {
-        chain.iterations[t - 1].comm_a_shifted.clone()
-      };
-      hyrax_verify_open(
-        &vk.inner,
-        &ck_eval.inner,
-        transcript,
-        &final_comm,
-        &final_point_fq,
-        &chain.final_open,
-      )?;
+        ab_claims[t - 1].push(
+          ab_stack_point(0, chain_idx, log_spad, &final_point_fq),
+          chain.final_eval,
+        );
+      }
+      transcript.absorb_bytes(b"claim_ev", chain.final_eval.to_repr().as_ref());
 
-      // CRT check: (final_open.f_y [- shift_a if t>0]) interpreted as a
-      // *balanced* integer ≡ int_v' (mod p_i).
       let final_f = if t == 0 {
-        chain.final_open.f_y
+        chain.final_eval
       } else {
-        chain.final_open.f_y - shift_a_fq
+        chain.final_eval - shift_a_fq
       };
       let lhs = scalar_to_balanced_int(&final_f)
         .mod_floor(&BigInt::from(p_i.clone()))
@@ -1856,136 +1803,101 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     }
     info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
 
-    // Verify the per-layer batched curr openings: re-derive λ_j, fold the
-    // reconstructed commitments with λ_j powers, verify the single open, and
-    // check its eval equals `Σ_c λ_j^c·(a_curr + ρ_c·b_curr)`.
-    let (_vcb_span, vcb_t) = start_span!("imod_pcs_verify_curr_batch");
-    if arg.curr_batch.len() != t {
-      return Err(SpartanError::InvalidSumcheckProof);
-    }
-    for j in 0..t {
-      let prefix_len = n - (j + 1) * k;
-      let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
-      let lam_bytes = transcript.squeeze_bytes(b"curr_lambda")?;
-      let lambda = <t256::Scalar as PrimeFieldExt>::from_uniform(&lam_bytes);
-      let mut weights = Vec::with_capacity(params.s);
-      let mut pow = t256::Scalar::ONE;
-      for _ in 0..params.s {
-        weights.push(pow);
-        pow *= lambda;
-      }
-      let combined_comm = Hyrax::fold_commitments(&curr_comms[j], &weights)?;
-      hyrax_verify_open(
-        &vk.inner,
-        &ck_eval.inner,
-        transcript,
-        &combined_comm,
-        &gamma_prefix,
-        &arg.curr_batch[j],
-      )?;
-      let expected: t256::Scalar = weights
-        .iter()
-        .zip(curr_evals[j].iter())
-        .map(|(w, e)| *w * *e)
-        .sum();
-      if arg.curr_batch[j].f_y != expected {
-        return Err(SpartanError::InvalidSumcheckProof);
-      }
-    }
-    info!(elapsed_ms = %vcb_t.elapsed().as_millis(), "imod_pcs_verify_curr_batch");
-
-    // Verify the batched `j=1` a_prev evaluation: re-derive λ, reconstruct
-    // the sumcheck claim `Σ_c λ^c·a_prev_eval`, verify the sumcheck + the
-    // single `f` opening, and check `final_claim == f(r)·W(r)` with
-    // `W(r) = Σ_c λ^c·eq(z_c, r)`.
-    let (_vapb_span, vapb_t) = start_span!("imod_pcs_verify_aprev_batch");
-    if with_iter {
-      let batch = arg
-        .a_prev_batch
-        .as_ref()
-        .ok_or(SpartanError::InvalidSumcheckProof)?;
-      let mut sub = spawn_aprev_subtranscript(transcript, &comm.inner, &aprev_evals)?;
-      let lambda = sub.squeeze(b"aprev_lambda")?;
-      let mut claim = t256::Scalar::ZERO;
-      let mut lam_pow = t256::Scalar::ONE;
-      for &y_c in &aprev_evals {
-        claim += lam_pow * y_c;
-        lam_pow *= lambda;
-      }
-      let (final_claim, r) = batch.sumcheck.verify(claim, num_vars, 2, &mut sub)?;
-      hyrax_verify_open(
-        &vk.inner,
-        &ck_eval.inner,
-        &mut sub,
-        &comm.inner,
-        &r,
-        &batch.f_open,
-      )?;
-      let mut w_at_r = t256::Scalar::ZERO;
-      let mut lam_pow = t256::Scalar::ONE;
-      for z_c in &aprev_points {
-        w_at_r += lam_pow * EqPolynomial::<t256::Scalar>::new(z_c.clone()).evaluate(&r);
-        lam_pow *= lambda;
-      }
-      if final_claim != batch.f_open.f_y * w_at_r {
-        return Err(SpartanError::InvalidSumcheckProof);
-      }
-    } else if arg.a_prev_batch.is_some() {
-      return Err(SpartanError::InvalidSumcheckProof);
-    }
-    info!(elapsed_ms = %vapb_t.elapsed().as_millis(), "imod_pcs_verify_aprev_batch");
-
     let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
-    // Phase-3 step D5 (stacked rbatchrange): verify one batched range
-    // check per (bound, size) group, in the same canonical order the
-    // prover used: f_limb, then for each iteration j the a_j batch (all
-    // s chains) and the b_j batch.
-    let expected_groups = 1 + 2 * t;
-    if arg.range_checks.len() != expected_groups {
-      return Err(SpartanError::InvalidSumcheckProof);
-    }
+    // ONE shared LogUp-GKR range check across all (bound, size) groups,
+    // in the same canonical batch order the prover used. Its value and
+    // chunk claims come back for the batched-open verification.
     let log_bound_a = params.log_p + 1;
     let log_bound_b = LOG_Q - params.log_p + 1;
-
-    // f_limb group (single polynomial).
-    verify_batch_range_check(
-      &vk.inner,
-      &ck_eval.inner,
-      &[&comm.inner],
-      1usize << num_vars,
-      params.log_t,
-      &arg.range_checks[0],
-      transcript,
-    )?;
-
-    // a_j / b_j groups: all s chains' j-th iteration, same size per j.
+    let mut rc_metas: Vec<RangeBatchMeta> = Vec::with_capacity(1 + 2 * t);
+    rc_metas.push(RangeBatchMeta {
+      target: RcTarget::F,
+      num_polys: 1,
+      n_values: 1usize << num_vars,
+      log_bound: params.log_t,
+    });
     for j in 0..t {
       let n_values = 1usize << (num_vars - (j + 1) * params.k);
-      for (offset, is_a, log_bound) in [(0usize, true, log_bound_a), (1usize, false, log_bound_b)] {
-        let value_comms = arg
-          .chains
-          .iter()
-          .map(|chain| {
-            let it = &chain.iterations[j];
-            if is_a {
-              &it.comm_a_shifted
-            } else {
-              &it.comm_b_shifted
-            }
-          })
-          .collect::<Vec<_>>();
-        verify_batch_range_check(
-          &vk.inner,
-          &ck_eval.inner,
-          &value_comms,
+      for (role, log_bound) in [(0u8, log_bound_a), (1u8, log_bound_b)] {
+        rc_metas.push(RangeBatchMeta {
+          target: RcTarget::Ab { layer: j, role },
+          num_polys: params.s,
           n_values,
           log_bound,
-          &arg.range_checks[1 + 2 * j + offset],
-          transcript,
-        )?;
+        });
+      }
+    }
+    let rc_claims = verify_shared_range_check(&rc_metas, &arg.range_check, transcript)?;
+    for (target, z, y) in rc_claims.value_claims {
+      match target {
+        RcTarget::F => f_claims.push(z, y),
+        RcTarget::Ab { layer, role } => {
+          let mut pt = Vec::with_capacity(1 + z.len());
+          pt.push(if role == 1 {
+            t256::Scalar::ONE
+          } else {
+            t256::Scalar::ZERO
+          });
+          pt.extend(z);
+          ab_claims[layer].push(pt, y);
+        }
       }
     }
     info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
+
+    // 6. Verify the batched opens — one per commitment, same canonical
+    //    order as the prover. Each enforces every collected claim.
+    let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
+    let expected_opens = 1 + t + (1 + 2 * t) + 1;
+    if arg.batched_opens.len() != expected_opens {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    let mut bsub = spawn_batch_subtranscript(transcript)?;
+    let mut bo_iter = arg.batched_opens.iter();
+    verify_batched_open(
+      &vk.inner,
+      &ck_eval.inner,
+      &mut bsub,
+      &comm.inner,
+      num_vars,
+      &f_claims,
+      bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
+    )?;
+    for (j, (ab_comm, claims)) in arg.ab_comms.iter().zip(ab_claims.iter()).enumerate() {
+      let m_vars = num_vars - (j + 1) * params.k;
+      verify_batched_open(
+        &vk.inner,
+        &ck_eval.inner,
+        &mut bsub,
+        ab_comm,
+        1 + log_spad + m_vars,
+        claims,
+        bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
+      )?;
+    }
+    for (bi, meta) in rc_metas.iter().enumerate() {
+      let d = BatchDims::new(meta.num_polys, meta.n_values, meta.log_bound);
+      verify_batched_open(
+        &vk.inner,
+        &ck_eval.inner,
+        &mut bsub,
+        &arg.range_check.batches[bi].chunk_comm,
+        ceil_log2(d.n_chunks.max(1)),
+        &rc_claims.chunk_claims[bi],
+        bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
+      )?;
+    }
+    verify_batched_open(
+      &vk.inner,
+      &ck_eval.inner,
+      &mut bsub,
+      &arg.range_check.mult_comm,
+      CHUNK_BITS,
+      &rc_claims.mult_claims,
+      bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
+    )?;
+    info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
+
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify");
 
     Ok(())
@@ -2009,18 +1921,13 @@ fn mle_evaluate_fq(poly_fq: &[t256::Scalar], r: &[t256::Scalar]) -> t256::Scalar
 /// for both `a_j_shifted` and `b_j_shifted` so phase 2 can produce
 /// openings at γ.
 struct IterationProverState {
-  /// `a_j_shifted` as integers; kept so D5.3's deferred range check can
-  /// re-bit-decompose without re-shifting / re-casting from F.
+  /// `a_j_shifted` as integers; kept so the range check can re-chunk
+  /// without re-shifting / re-casting from F.
   a_shifted: Vec<BigUint>,
   a_shifted_fq: Vec<t256::Scalar>,
-  a_blind: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-  comm_a_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  /// `b_j_shifted` as integers; kept so D5.4's deferred range check can
-  /// re-bit-decompose without re-shifting / re-casting from F.
+  /// `b_j_shifted` as integers (same reason).
   b_shifted: Vec<BigUint>,
   b_shifted_fq: Vec<t256::Scalar>,
-  b_blind: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-  comm_b_shifted: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
 }
 
 /// Prover-side per-chain state collected in phase 1 and consumed in
@@ -2029,23 +1936,6 @@ struct ChainProverState {
   p_i: BigUint,
   r_i_int: Vec<BigUint>,
   iters: Vec<IterationProverState>,
-}
-
-/// Absorb the two claimed identity-check evals `a_j(γ)`, `b_j(γ)` into
-/// the transcript and squeeze the RLC challenge `ρ`. The same `ρ` folds
-/// `comm_a + ρ·comm_b` so a single opening at `γ` binds both evals (the
-/// folded eval must equal `a_curr_eval + ρ·b_curr_eval`). Sampling `ρ`
-/// after absorbing the evals is what makes the fold binding.
-fn squeeze_curr_rho<T: ByteTranscript>(
-  transcript: &mut T,
-  a_eval: &t256::Scalar,
-  b_eval: &t256::Scalar,
-) -> Result<t256::Scalar, SpartanError> {
-  let mut buf = a_eval.to_repr().as_ref().to_vec();
-  buf.extend_from_slice(b_eval.to_repr().as_ref());
-  transcript.absorb_bytes(b"curr_evals", &buf);
-  let bytes = transcript.squeeze_bytes(b"curr_rho")?;
-  Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
 }
 
 /// Helper: open the Hyrax commitment `comm` at `point` to produce a
@@ -2104,18 +1994,37 @@ fn hyrax_verify_open<T: ByteTranscript>(
   )
 }
 
-/// Inputs for a homogeneous batch range check: `N` value polynomials,
-/// all of length `n_values` (a power of two) and the same bound
-/// `2^log_bound`. They are range-checked together as one `rbatchrange`.
+/// Which commitment a range-check batch's value claim targets.
+#[derive(Clone, Copy, Debug)]
+enum RcTarget {
+  /// The input polynomial `f` (the `f_limb` batch).
+  F,
+  /// The stacked `(role, chain, x)` commitment of iteration layer `layer`
+  /// (0-indexed), restricted to `role` (0 = a, 1 = b).
+  Ab { layer: usize, role: u8 },
+}
+
+/// Accumulated multi-point evaluation claims against one commitment.
+#[derive(Default, Clone, Debug)]
+struct OpenClaims {
+  points: Vec<Vec<t256::Scalar>>,
+  evals: Vec<t256::Scalar>,
+}
+
+impl OpenClaims {
+  fn push(&mut self, point: Vec<t256::Scalar>, eval: t256::Scalar) {
+    self.points.push(point);
+    self.evals.push(eval);
+  }
+}
+
+/// Inputs for one homogeneous batch of the shared range check: `N` value
+/// polynomials, all of length `n_values` (a power of two) and the same
+/// bound `2^log_bound`. The value polynomials are NOT separately
+/// committed — their `V(r_v)` evaluation becomes a claim on `target`.
 struct RangeBatchInputs<'a> {
-  /// The CK / VK pair (Hyrax inner).
-  ck: &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
-  ck_eval: &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
-  /// One entry per polynomial, in the batch's canonical order: existing
-  /// commitment, F-cast coefficients, and blind.
-  value_comms: Vec<&'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  target: RcTarget,
   value_polys_fq: Vec<&'a [t256::Scalar]>,
-  value_blinds: Vec<&'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind>,
   values: Vec<&'a [BigUint]>,
   /// Coefficients per polynomial (same for all; a power of two).
   n_values: usize,
@@ -2123,19 +2032,75 @@ struct RangeBatchInputs<'a> {
   log_bound: usize,
 }
 
-/// Masked power-of-two weight vector for the value-reconstruction
-/// sumcheck: `w[b] = 2^b` for `b < log_bound`, else `0`. Length `stride`
-/// (the padded per-value bit count). Bits at `b ≥ log_bound` carry zero
-/// weight, so the prover can't inflate a value past its bound regardless
-/// of those (still bit-valid) slots.
-fn range_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
+/// Verifier-side metadata for one batch of the shared range check.
+struct RangeBatchMeta {
+  target: RcTarget,
+  num_polys: usize,
+  n_values: usize,
+  log_bound: usize,
+}
+
+/// Sizes derived from a batch's public parameters, shared by prover and
+/// verifier.
+#[derive(Clone, Copy)]
+struct BatchDims {
+  log_np: usize,
+  log_nv: usize,
+  numchunks: usize,
+  stride: usize,
+  log_stride: usize,
+  n_chunks: usize,
+  /// Bit-width of the top chunk, `log_bound − 16·(numchunks−1)` ∈ [1, 16].
+  rem: usize,
+}
+
+impl BatchDims {
+  fn new(num_polys: usize, n_values: usize, log_bound: usize) -> Self {
+    let n_pad = num_polys.next_power_of_two();
+    let log_np = n_pad.trailing_zeros() as usize;
+    let log_nv = ceil_log2(n_values.max(1));
+    let numchunks = log_bound.div_ceil(CHUNK_BITS);
+    // Min stride 2 keeps the reconstruction sumcheck non-degenerate when a
+    // bound fits in a single chunk (the extra slot is zero-valued and
+    // zero-weighted).
+    let stride = numchunks.next_power_of_two().max(2);
+    Self {
+      log_np,
+      log_nv,
+      numchunks,
+      stride,
+      log_stride: stride.trailing_zeros() as usize,
+      n_chunks: n_pad * n_values * stride,
+      rem: log_bound - CHUNK_BITS * (numchunks - 1),
+    }
+  }
+
+  /// Whether the top chunk needs the shifted-lookup tightening.
+  fn top_needed(&self) -> bool {
+    self.rem < CHUNK_BITS
+  }
+
+  /// The public shift `2^16 − 2^rem` applied to top chunks so the same
+  /// `2^16` table enforces `top < 2^rem`.
+  fn top_shift(&self) -> u64 {
+    (1u64 << CHUNK_BITS) - (1u64 << self.rem)
+  }
+}
+
+/// Masked base-`2^16` weight vector for the value-reconstruction
+/// sumcheck: `w[c] = 2^(16c)` for `c < ⌈log_bound/16⌉`, else `0`. Length
+/// `stride` (the padded per-value chunk count). Chunk slots at
+/// `c ≥ numchunks` carry zero weight, so the prover can't inflate a
+/// value past its bound regardless of those (still range-checked) slots.
+fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
+  let base = t256::Scalar::from(1u64 << CHUNK_BITS);
   let mut weight = Vec::with_capacity(stride);
   let mut pow = t256::Scalar::ONE;
-  let two = t256::Scalar::from(2u64);
-  for b in 0..stride {
-    if b < log_bound {
+  for c in 0..stride {
+    if c < numchunks {
       weight.push(pow);
-      pow *= two;
+      pow *= base;
     } else {
       weight.push(t256::Scalar::ZERO);
     }
@@ -2143,45 +2108,144 @@ fn range_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
   weight
 }
 
-/// Spawn an F-side sub-transcript seeded from the parent, binding the
-/// stacked bit commitment and every value commitment in the batch. Both
-/// prover and verifier reconstruct it identically.
-fn spawn_range_subtranscript(
+/// Spawn the F-side sub-transcript of the shared range check, seeded
+/// from the parent and binding every batch's chunk commitment plus the
+/// shared multiplicity commitment — all before any challenge (in
+/// particular the LogUp `r`) is squeezed. Both prover and verifier
+/// reconstruct it identically.
+fn spawn_shared_range_subtranscript<'a>(
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-  bit_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  value_comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
+  chunk_comms: impl Iterator<Item = &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  mult_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
 ) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
   let seed = parent.squeeze_bytes(b"range_seed")?;
   let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
     T256HyraxEngine,
   >>::new_with_params(b"range_check", ());
   sub.absorb_bytes(b"seed", &seed);
-  sub.absorb(b"range_bit_comm", bit_comm);
-  for vc in value_comms {
-    sub.absorb(b"range_value_comm", *vc);
+  for cc in chunk_comms {
+    sub.absorb(b"range_chunk_comm", cc);
   }
+  sub.absorb(b"range_mult_comm", mult_comm);
   Ok(sub)
 }
 
-/// Spawn the sub-transcript for the `j=1` `a_prev` batch evaluation,
-/// binding the parent state, the input commitment `f`, and the claimed
-/// evals `f(z_c)`. The RLC challenge `λ` is squeezed from this sub after
-/// the evals are bound. Both prover and verifier reconstruct it identically.
-fn spawn_aprev_subtranscript(
+/// Spawn the F-side sub-transcript of the final batched-open phase.
+/// Each commitment's claims are absorbed (and its λ squeezed) inside
+/// [`prove_batched_open`] / [`verify_batched_open`].
+fn spawn_batch_subtranscript(
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-  f_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  evals: &[t256::Scalar],
 ) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
-  let seed = parent.squeeze_bytes(b"aprev_seed")?;
+  let seed = parent.squeeze_bytes(b"batch_seed")?;
   let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
     T256HyraxEngine,
-  >>::new_with_params(b"aprev_batch", ());
+  >>::new_with_params(b"batched_opens", ());
   sub.absorb_bytes(b"seed", &seed);
-  sub.absorb(b"aprev_f_comm", f_comm);
-  for e in evals {
-    sub.absorb_bytes(b"aprev_eval", e.to_repr().as_ref());
-  }
   Ok(sub)
+}
+
+/// Boolean-extended point selecting the `(role, chain)` block of a
+/// stacked per-layer `(a, b)` polynomial: `[role] ++ bits(chain) ++
+/// sub_point`.
+fn ab_stack_point(
+  role: u8,
+  chain: usize,
+  log_spad: usize,
+  sub_point: &[t256::Scalar],
+) -> Vec<t256::Scalar> {
+  let mut pt = Vec::with_capacity(1 + log_spad + sub_point.len());
+  pt.push(if role == 1 {
+    t256::Scalar::ONE
+  } else {
+    t256::Scalar::ZERO
+  });
+  pt.extend(bool_point_of_index(chain, log_spad));
+  pt.extend_from_slice(sub_point);
+  pt
+}
+
+/// Absorb a commitment and its claims into the batch sub-transcript,
+/// binding them before the RLC challenge λ is squeezed.
+fn absorb_batch_claims(
+  sub: &mut Keccak256Transcript<T256HyraxEngine>,
+  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  claims: &OpenClaims,
+) {
+  sub.absorb(b"bo_comm", comm);
+  for (z, y) in claims.points.iter().zip(claims.evals.iter()) {
+    for c in z {
+      sub.absorb_bytes(b"bo_pt", c.to_repr().as_ref());
+    }
+    sub.absorb_bytes(b"bo_ev", y.to_repr().as_ref());
+  }
+}
+
+/// Prove one batched multi-point opening: RLC-combine all claims
+/// `f(z_i) = y_i` (`Σ_i λ^i·y_i = Σ_x f(x)·W(x)`, `W = Σ_i λ^i·eq(z_i,·)`)
+/// and reduce by one degree-2 sumcheck to a single Hyrax opening at the
+/// sumcheck challenge.
+fn prove_batched_open(
+  ck: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  sub: &mut Keccak256Transcript<T256HyraxEngine>,
+  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  poly_fq: &[t256::Scalar],
+  blind: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  claims: &OpenClaims,
+) -> Result<BatchedOpen, SpartanError> {
+  debug_assert!(!claims.points.is_empty());
+  absorb_batch_claims(sub, comm, claims);
+  let lambda = sub.squeeze(b"bo_lambda")?;
+  let (w, claim) = aprev_batch_weight(&claims.points, &claims.evals, lambda, poly_fq.len());
+  let num_vars = poly_fq.len().trailing_zeros() as usize;
+  let mut poly_f = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.to_vec());
+  let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(w);
+  let (sumcheck, r, _claims) = crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
+    &claim,
+    num_vars,
+    &mut poly_f,
+    &mut poly_w,
+    sub,
+  )?;
+  let f_open = hyrax_open_at(ck, ck_eval, sub, comm, poly_fq, blind, &r)?;
+  Ok(BatchedOpen { sumcheck, f_open })
+}
+
+/// Verify one batched multi-point opening against `claims`, with the
+/// commitment's variable count pinned to `num_vars`. The verifier
+/// recomputes `W(r) = Σ_i λ^i·eq(z_i, r)` in closed form (O(#claims·n)).
+fn verify_batched_open(
+  vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
+  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  sub: &mut Keccak256Transcript<T256HyraxEngine>,
+  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  num_vars: usize,
+  claims: &OpenClaims,
+  arg: &BatchedOpen,
+) -> Result<(), SpartanError> {
+  if claims.points.is_empty() || claims.points.iter().any(|z| z.len() != num_vars) {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  absorb_batch_claims(sub, comm, claims);
+  let lambda = sub.squeeze(b"bo_lambda")?;
+  let mut claim = t256::Scalar::ZERO;
+  let mut lam_pow = t256::Scalar::ONE;
+  for y in &claims.evals {
+    claim += lam_pow * y;
+    lam_pow *= lambda;
+  }
+  let (final_claim, r) = arg.sumcheck.verify(claim, num_vars, 2, sub)?;
+  hyrax_verify_open(vk, ck_eval, sub, comm, &r, &arg.f_open)?;
+  let mut w_at_r = t256::Scalar::ZERO;
+  let mut lam_pow = t256::Scalar::ONE;
+  for z in &claims.points {
+    w_at_r += lam_pow * EqPolynomial::<t256::Scalar>::new(z.clone()).evaluate(&r);
+    lam_pow *= lambda;
+  }
+  if final_claim != arg.f_open.f_y * w_at_r {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  Ok(())
 }
 
 /// Build `W = Σ_c λ^c · eq(z_c, ·)` as length-`n` evals (the public
@@ -2207,281 +2271,348 @@ fn aprev_batch_weight(
   (w, claim)
 }
 
-/// Prover side of a homogeneous batch range check (paper `rbatchrange`).
-/// The `N` value polys are stacked along a top poly-index axis into one
-/// bit polynomial of `N_pad · n_values · stride` bits (`N_pad =
-/// next_pow2(N)`, `stride = 2^⌈log₂ log_bound⌉`), laid out as
-/// `((p·n_values + within)·stride + b)`. One Hyrax commit, one bit-
-/// validity zerocheck, one value-reconstruction sumcheck, two bit
-/// openings, and one opening per value poly.
-fn prove_batch_range_check(
-  inputs: RangeBatchInputs<'_>,
-  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-) -> Result<BatchRangeCheck, SpartanError> {
-  let RangeBatchInputs {
-    ck,
-    ck_eval,
-    value_comms,
-    value_polys_fq,
-    value_blinds,
-    values,
-    n_values,
-    log_bound,
-  } = inputs;
-
-  let num_polys = value_comms.len();
-  debug_assert!(num_polys >= 1);
-  debug_assert!(n_values.is_power_of_two());
-  debug_assert!(values.iter().all(|v| v.len() == n_values));
-
-  let n_pad = num_polys.next_power_of_two();
-  let log_np = n_pad.trailing_zeros() as usize;
-  let log_nv = ceil_log2(n_values.max(1));
-  let log_log_bound = ceil_log2(log_bound.max(1));
-  let stride = 1usize << log_log_bound;
-  let n_bits = n_pad * n_values * stride;
-  let log_n_bits = ceil_log2(n_bits.max(1));
-
-  // 1. Stacked bit polynomial. Index `((p·n_values + within)·stride + b)`.
-  //    Padding polys (`p ≥ num_polys`) and bits `b ≥ log_bound` stay zero.
-  //    Built in parallel over disjoint `stride`-sized slots (one per value).
-  let mut bit_poly: Vec<t256::Scalar> = vec![t256::Scalar::ZERO; n_bits];
-  bit_poly
-    .par_chunks_mut(stride)
-    .enumerate()
-    .for_each(|(gv, chunk)| {
-      let p = gv / n_values;
-      if p >= num_polys {
-        return; // padding poly: all-zero
-      }
-      let within = gv % n_values;
-      for (b, &bit) in bit_decompose_value(&values[p][within], log_bound)
-        .iter()
-        .enumerate()
-      {
-        if bit == 1 {
-          chunk[b] = t256::Scalar::ONE;
-        }
-      }
-    });
-
-  // 2. Commit the stacked bit polynomial.
-  let bit_blind = Hyrax::blind(ck, n_bits);
-  let bit_comm = Hyrax::commit(ck, &bit_poly, &bit_blind, true)?;
-
-  // 3. Sub-transcript bound to (parent, bit_comm, all value_comms).
-  let mut sub = spawn_range_subtranscript(parent, &bit_comm, &value_comms)?;
-
-  // 4. Bit-validity zerocheck: `sum_x eq(x,τ)·(bit(x)² - bit(x)) = 0`.
-  let tau: Vec<t256::Scalar> = (0..log_n_bits)
-    .map(|_| sub.squeeze(b"range_tau"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let mut poly_a = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
-  let (bit_validity_sumcheck, r_validity, _claims) =
-    crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_cubic_square(
-      &t256::Scalar::ZERO,
-      tau,
-      &mut poly_a,
-      &mut sub,
-    )?;
-
-  // 5. Open bit_poly at r_validity.
-  let bit_open_validity_final = hyrax_open_at(
-    ck,
-    ck_eval,
-    &mut sub,
-    &bit_comm,
-    &bit_poly,
-    &bit_blind,
-    &r_validity,
-  )?;
-
-  // 6. Value-reconstruction. Squeeze r_v over (poly-index ++ within).
-  let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
-    .map(|_| sub.squeeze(b"range_rv"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let r_v_poly = &r_v[..log_np];
-  let r_v_within = &r_v[log_np..];
-
-  // Fold the `num_polys` value polys/commitments/blinds by the weights
-  // `eq(r_v_poly, p)` so a SINGLE Hyrax open yields
-  // `V(r_v) = Σ_p eq(r_v_poly,p)·value_p(r_v_within)`. All polys share
-  // `n_values`, so they share `r_v_within`; folding is exact by Pedersen
-  // homomorphism. (For `num_polys = 1` the weight is 1 and this is the
-  // plain single-poly open.)
-  let eq_weights = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
-  let w = &eq_weights[..num_polys];
-  let mut combined_poly = vec![t256::Scalar::ZERO; n_values];
-  for (p, poly) in value_polys_fq.iter().enumerate() {
-    for (o, &v) in combined_poly.iter_mut().zip(poly.iter()) {
-      *o += w[p] * v;
-    }
-  }
-  let comms_owned: Vec<_> = value_comms.iter().map(|c| (*c).clone()).collect();
-  let blinds_owned: Vec<_> = value_blinds.iter().map(|b| (*b).clone()).collect();
-  let combined_comm = Hyrax::fold_commitments(&comms_owned, w)?;
-  let combined_blind = Hyrax::fold_blinds(&blinds_owned, w)?;
-  let value_open_at_rv = hyrax_open_at(
-    ck,
-    ck_eval,
-    &mut sub,
-    &combined_comm,
-    &combined_poly,
-    &combined_blind,
-    r_v_within,
-  )?;
-
-  // Partial-eval bit_poly at r_v over the top (log_np + log_nv) vars,
-  // leaving the b-axis (`stride` values).
-  let mut bit_mle = crate::polys::multilinear::MultilinearPolynomial::new(bit_poly.clone());
-  for r in &r_v {
-    bit_mle.bind_poly_var_top(r);
-  }
-  let bit_at_rv: Vec<t256::Scalar> = bit_mle.into_vec();
-  debug_assert_eq!(bit_at_rv.len(), stride);
-
-  // Initial claim = V(r_v) = sum_b w[b]·bit_at_rv[b] (uniform weight).
-  let weight = range_weight_vector(log_bound, stride);
-  let claim_v: t256::Scalar = weight
-    .iter()
-    .zip(bit_at_rv.iter())
-    .map(|(w, b)| *w * *b)
-    .sum();
-  let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(weight);
-  let mut poly_b2 = crate::polys::multilinear::MultilinearPolynomial::new(bit_at_rv);
-  let (value_reconstr_sumcheck, r_b, _claims) =
-    crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
-      &claim_v,
-      log_log_bound,
-      &mut poly_w,
-      &mut poly_b2,
-      &mut sub,
-    )?;
-
-  // 7. Open bit_poly at (r_v ++ r_b) for the reconstruction final check.
-  let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
-  let bit_open_reconstr_final = hyrax_open_at(
-    ck, ck_eval, &mut sub, &bit_comm, &bit_poly, &bit_blind, &combined,
-  )?;
-
-  Ok(BatchRangeCheck {
-    bit_comm,
-    bit_validity_sumcheck,
-    value_reconstr_sumcheck,
-    value_open_at_rv,
-    bit_open_validity_final,
-    bit_open_reconstr_final,
-  })
+/// Prover-side artifacts of the shared range check that feed the final
+/// batched opens: value claims routed to `f` / stacked-layer targets,
+/// per-batch chunk polynomials + blinds + claims, and the multiplicity
+/// table's polynomial + blind + claim.
+struct RcProverArtifacts {
+  value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)>,
+  chunk_data: Vec<(
+    Vec<t256::Scalar>,
+    <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+    OpenClaims,
+  )>,
+  mult_fq: Vec<t256::Scalar>,
+  mult_blind: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  mult_claims: OpenClaims,
 }
 
-/// Verifier-side mirror of `prove_batch_range_check`. Re-derives the
-/// transcript challenges, re-runs the two sumchecks, and verifies the
-/// three openings + the final integrand checks.
-fn verify_batch_range_check(
-  vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
-  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
-  value_comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
-  n_values: usize,
-  log_bound: usize,
-  arg: &BatchRangeCheck,
+/// Claims the verifier of the shared range check hands back for the
+/// batched-open verification.
+struct RcVerifyClaims {
+  value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)>,
+  chunk_claims: Vec<OpenClaims>,
+  mult_claims: OpenClaims,
+}
+
+/// Prover side of the shared LogUp-GKR range check covering all batches
+/// of one Mod-PCS opening. Per batch: build and commit the stacked chunk
+/// polynomial. Shared: one multiplicity table and one multi-witness
+/// LogUp whose witness trees are all batches' chunk polys plus the
+/// shifted-top-chunk sub-polys of non-16-aligned batches. All
+/// evaluation obligations (LogUp witness/table claims, top claims, the
+/// per-batch `V(r_v)` value claims, and the reconstruction sumchecks'
+/// final chunk evaluations) are returned as CLAIMS to be discharged by
+/// the caller's batched opens — this function performs no Hyrax opens.
+fn prove_shared_range_check(
+  ck: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  _ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  batches: &[RangeBatchInputs<'_>],
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-) -> Result<(), SpartanError> {
-  let num_polys = value_comms.len();
-  if num_polys == 0 {
+) -> Result<(SharedRangeCheck, RcProverArtifacts), SpartanError> {
+  type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+  type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+  debug_assert!(!batches.is_empty());
+
+  let dims: Vec<BatchDims> = batches
+    .iter()
+    .map(|b| BatchDims::new(b.value_polys_fq.len(), b.n_values, b.log_bound))
+    .collect();
+
+  // 1. Per batch: stacked chunk polynomial (u64 entries, each < 2^16).
+  //    Index `((p·n_values + within)·stride + c)`. Padding polys
+  //    (`p ≥ num_polys`) and slots `c ≥ numchunks` stay zero (zero is in
+  //    the table, and those slots carry zero weight).
+  let mut chunk_vals_all: Vec<Vec<u64>> = Vec::with_capacity(batches.len());
+  let mut chunk_fq_all: Vec<Vec<t256::Scalar>> = Vec::with_capacity(batches.len());
+  let mut chunk_blinds: Vec<HB> = Vec::with_capacity(batches.len());
+  let mut chunk_comms: Vec<HC> = Vec::with_capacity(batches.len());
+  for (b, d) in batches.iter().zip(dims.iter()) {
+    let num_polys = b.value_polys_fq.len();
+    debug_assert!(num_polys >= 1);
+    debug_assert!(b.n_values.is_power_of_two());
+    debug_assert!(b.values.iter().all(|v| v.len() == b.n_values));
+    info!(
+      num_polys = num_polys,
+      n_values = b.n_values,
+      log_bound = b.log_bound,
+      stride = d.stride,
+      n_chunks = d.n_chunks,
+      "imod_pcs_range_batch"
+    );
+    let mut chunk_vals: Vec<u64> = vec![0u64; d.n_chunks];
+    chunk_vals
+      .par_chunks_mut(d.stride)
+      .enumerate()
+      .for_each(|(gv, slot)| {
+        let p = gv / b.n_values;
+        if p >= num_polys {
+          return; // padding poly: all-zero
+        }
+        let within = gv % b.n_values;
+        for (c, ch) in chunk_decompose_value(&b.values[p][within], b.log_bound)
+          .into_iter()
+          .enumerate()
+        {
+          slot[c] = ch;
+        }
+      });
+    let chunk_fq: Vec<t256::Scalar> = chunk_vals
+      .par_iter()
+      .map(|&c| t256::Scalar::from(c))
+      .collect();
+    let blind = Hyrax::blind(ck, d.n_chunks);
+    let comm = Hyrax::commit(ck, &chunk_fq, &blind, true)?;
+    chunk_vals_all.push(chunk_vals);
+    chunk_fq_all.push(chunk_fq);
+    chunk_blinds.push(blind);
+    chunk_comms.push(comm);
+  }
+
+  // 2. Shifted top chunks of the non-16-aligned batches: `top + (2^16 −
+  //    2^rem)` is in the 2^16 table iff `top < 2^rem`. These become extra
+  //    LogUp witness trees; no extra commitment (their MLE is the chunk
+  //    MLE at a boolean-extended point, plus the public shift).
+  let mut top_vals_all: Vec<(usize, Vec<u64>)> = Vec::new(); // (batch idx, shifted tops)
+  for (bi, d) in dims.iter().enumerate() {
+    if d.top_needed() {
+      let shift = d.top_shift();
+      let stride = d.stride;
+      let tops: Vec<u64> = (0..d.n_chunks / stride)
+        .map(|gv| chunk_vals_all[bi][gv * stride + (d.numchunks - 1)] + shift)
+        .collect();
+      top_vals_all.push((bi, tops));
+    }
+  }
+
+  // 3. The shared multiplicity table over ALL witness trees, committed
+  //    before the LogUp challenge `r` is squeezed (multiplicities chosen
+  //    after `r` would break the lookup identity).
+  let witness_refs: Vec<&[u64]> = chunk_vals_all
+    .iter()
+    .map(|v| v.as_slice())
+    .chain(top_vals_all.iter().map(|(_, v)| v.as_slice()))
+    .collect();
+  let mult = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::multiplicities(
+    CHUNK_BITS,
+    &witness_refs,
+  )?;
+  let mult_fq: Vec<t256::Scalar> = mult.iter().map(|&m| t256::Scalar::from(m)).collect();
+  let mult_blind = Hyrax::blind(ck, mult_fq.len());
+  let mult_comm = Hyrax::commit(ck, &mult_fq, &mult_blind, true)?;
+
+  // 4. Sub-transcript bound to (parent, chunk comms, mult comm).
+  let mut sub = spawn_shared_range_subtranscript(parent, chunk_comms.iter(), &mult_comm)?;
+
+  // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
+  //    [0, 2^16). Its reduced claims become batched-open claims.
+  let (logup, claims) = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::prove(
+    CHUNK_BITS,
+    &chunk_vals_all
+      .iter()
+      .map(|v| v.as_slice())
+      .chain(top_vals_all.iter().map(|(_, v)| v.as_slice()))
+      .collect::<Vec<_>>(),
+    &mut sub,
+  )?;
+  let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); batches.len()];
+  for (bi, (point, eval)) in claims.wit_claims.iter().take(batches.len()).enumerate() {
+    chunk_claims[bi].push(point.clone(), *eval);
+  }
+  for (ti, (bi, _)) in top_vals_all.iter().enumerate() {
+    let d = &dims[*bi];
+    let (point, eval) = &claims.wit_claims[batches.len() + ti];
+    let ext: Vec<t256::Scalar> = point
+      .iter()
+      .copied()
+      .chain(bool_point_of_index(d.numchunks - 1, d.log_stride))
+      .collect();
+    chunk_claims[*bi].push(ext, *eval - t256::Scalar::from(d.top_shift()));
+  }
+  let mut mult_claims = OpenClaims::default();
+  mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
+
+  // 6. Per batch: value-reconstruction sumcheck tying the chunks to the
+  //    batch's value polynomials. The folded value `V(r_v) =
+  //    Σ_p eq(r_v_poly, p)·value_p(r_v_within)` is sent as a claim on the
+  //    batch's target commitment, and the sumcheck's final chunk
+  //    evaluation is a claim on the chunk commitment.
+  let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
+    Vec::with_capacity(batches.len());
+  let mut batch_data: Vec<RangeCheckBatchData> = Vec::with_capacity(batches.len());
+  for (bi, (b, d)) in batches.iter().zip(dims.iter()).enumerate() {
+    let num_polys = b.value_polys_fq.len();
+    let r_v: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
+      .map(|_| sub.squeeze(b"range_rv"))
+      .collect::<Result<Vec<_>, _>>()?;
+    let r_v_poly = &r_v[..d.log_np];
+    let r_v_within = &r_v[d.log_np..];
+
+    let eq_weights = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
+    let w = &eq_weights[..num_polys];
+    let mut combined_poly = vec![t256::Scalar::ZERO; b.n_values];
+    for (p, poly) in b.value_polys_fq.iter().enumerate() {
+      for (o, &v) in combined_poly.iter_mut().zip(poly.iter()) {
+        *o += w[p] * v;
+      }
+    }
+    let value_eval = mle_evaluate_fq(&combined_poly, r_v_within);
+    sub.absorb_bytes(b"rc_value_ev", value_eval.to_repr().as_ref());
+    value_claims.push((b.target, r_v.clone(), value_eval));
+
+    // Partial-eval chunk poly at r_v, leaving the chunk axis.
+    let mut chunk_mle =
+      crate::polys::multilinear::MultilinearPolynomial::new(chunk_fq_all[bi].clone());
+    for r in &r_v {
+      chunk_mle.bind_poly_var_top(r);
+    }
+    let chunk_at_rv: Vec<t256::Scalar> = chunk_mle.into_vec();
+    debug_assert_eq!(chunk_at_rv.len(), d.stride);
+
+    let weight = chunk_weight_vector(b.log_bound, d.stride);
+    let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(weight);
+    let mut poly_c = crate::polys::multilinear::MultilinearPolynomial::new(chunk_at_rv);
+    let (value_reconstr_sumcheck, r_b, sc_claims) =
+      crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
+        &value_eval,
+        d.log_stride,
+        &mut poly_w,
+        &mut poly_c,
+        &mut sub,
+      )?;
+    let reconstr_eval = sc_claims[1];
+    sub.absorb_bytes(b"rc_reconstr_ev", reconstr_eval.to_repr().as_ref());
+    let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
+    chunk_claims[bi].push(combined, reconstr_eval);
+
+    batch_data.push(RangeCheckBatchData {
+      chunk_comm: chunk_comms[bi].clone(),
+      value_eval,
+      reconstr_eval,
+      value_reconstr_sumcheck,
+    });
+  }
+
+  let chunk_data: Vec<(Vec<t256::Scalar>, HB, OpenClaims)> = chunk_fq_all
+    .into_iter()
+    .zip(chunk_blinds)
+    .zip(chunk_claims)
+    .map(|((fq, blind), claims)| (fq, blind, claims))
+    .collect();
+
+  Ok((
+    SharedRangeCheck {
+      mult_comm,
+      logup,
+      batches: batch_data,
+    },
+    RcProverArtifacts {
+      value_claims,
+      chunk_data,
+      mult_fq,
+      mult_blind,
+      mult_claims,
+    },
+  ))
+}
+
+/// Verifier-side mirror of `prove_shared_range_check`. Re-derives the
+/// transcript, verifies the multi-witness LogUp (with all tree depths
+/// pinned to the public batch shapes), re-runs each batch's
+/// reconstruction sumcheck against the claimed evaluations, and returns
+/// the claims for the batched-open verification.
+fn verify_shared_range_check(
+  metas: &[RangeBatchMeta],
+  arg: &SharedRangeCheck,
+  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
+) -> Result<RcVerifyClaims, SpartanError> {
+  if metas.is_empty() || arg.batches.len() != metas.len() {
     return Err(SpartanError::InvalidSumcheckProof);
   }
-  let n_pad = num_polys.next_power_of_two();
-  let log_np = n_pad.trailing_zeros() as usize;
-  let log_nv = ceil_log2(n_values.max(1));
-  let log_log_bound = ceil_log2(log_bound.max(1));
-  let stride = 1usize << log_log_bound;
-  let n_bits = n_pad * n_values * stride;
-  let log_n_bits = ceil_log2(n_bits.max(1));
+  let dims: Vec<BatchDims> = metas
+    .iter()
+    .map(|m| BatchDims::new(m.num_polys, m.n_values, m.log_bound))
+    .collect();
+
+  // Tree-depth pinning: chunk trees (one per batch, sized by the public
+  // batch shape), then shifted-top trees of the non-aligned batches.
+  let mut expected_depths: Vec<usize> = dims.iter().map(|d| ceil_log2(d.n_chunks.max(1))).collect();
+  let mut top_batches: Vec<usize> = Vec::new();
+  for (bi, d) in dims.iter().enumerate() {
+    if d.top_needed() {
+      expected_depths.push(d.log_np + d.log_nv);
+      top_batches.push(bi);
+    }
+  }
 
   // 1. Spawn the same sub-transcript the prover used.
-  let mut sub = spawn_range_subtranscript(parent, &arg.bit_comm, value_comms)?;
-
-  // 2. Bit-validity zerocheck (claim = 0, degree 3, log_n_bits rounds).
-  let tau: Vec<t256::Scalar> = (0..log_n_bits)
-    .map(|_| sub.squeeze(b"range_tau"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let (bv_final_claim, r_validity) =
-    arg
-      .bit_validity_sumcheck
-      .verify(t256::Scalar::ZERO, log_n_bits, 3, &mut sub)?;
-
-  // 3. Verify bit_poly open at r_validity.
-  hyrax_verify_open(
-    vk,
-    ck_eval,
-    &mut sub,
-    &arg.bit_comm,
-    &r_validity,
-    &arg.bit_open_validity_final,
+  let mut sub = spawn_shared_range_subtranscript(
+    parent,
+    arg.batches.iter().map(|b| &b.chunk_comm),
+    &arg.mult_comm,
   )?;
 
-  // 4. Reconstruct bit-validity integrand: eq(r_validity, τ)·(bit² - bit).
-  let eq_at_r = EqPolynomial::<t256::Scalar>::new(tau).evaluate(&r_validity);
-  let bit_at_r = arg.bit_open_validity_final.f_y;
-  let expected = eq_at_r * (bit_at_r * bit_at_r - bit_at_r);
-  if bv_final_claim != expected {
-    return Err(SpartanError::InvalidSumcheckProof);
+  // 2. Multi-witness LogUp membership: every chunk (and shifted top) in
+  //    [0, 2^16). Its reduced claims become batched-open claims.
+  let claims = arg.logup.verify(CHUNK_BITS, &expected_depths, &mut sub)?;
+  let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); metas.len()];
+  for (bi, (point, eval)) in claims.wit_claims.iter().take(metas.len()).enumerate() {
+    chunk_claims[bi].push(point.clone(), *eval);
+  }
+  for (ti, &bi) in top_batches.iter().enumerate() {
+    let d = &dims[bi];
+    let (point, eval) = &claims.wit_claims[metas.len() + ti];
+    let ext: Vec<t256::Scalar> = point
+      .iter()
+      .copied()
+      .chain(bool_point_of_index(d.numchunks - 1, d.log_stride))
+      .collect();
+    chunk_claims[bi].push(ext, *eval - t256::Scalar::from(d.top_shift()));
+  }
+  let mut mult_claims = OpenClaims::default();
+  mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
+
+  // 3. Per batch: r_v squeeze, claimed `V(r_v)` absorbed and recorded as
+  //    a claim on the batch's target, reconstruction sumcheck verified
+  //    against it, and the final integrand check
+  //    `w(r_b)·chunk(r_v, r_b) == final claim` using the claimed chunk
+  //    evaluation (itself a claim on the chunk commitment).
+  let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
+    Vec::with_capacity(metas.len());
+  for (bi, (m, d)) in metas.iter().zip(dims.iter()).enumerate() {
+    let b = &arg.batches[bi];
+    let r_v: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
+      .map(|_| sub.squeeze(b"range_rv"))
+      .collect::<Result<Vec<_>, _>>()?;
+    sub.absorb_bytes(b"rc_value_ev", b.value_eval.to_repr().as_ref());
+    value_claims.push((m.target, r_v.clone(), b.value_eval));
+
+    let (vr_final_claim, r_b) =
+      b.value_reconstr_sumcheck
+        .verify(b.value_eval, d.log_stride, 2, &mut sub)?;
+    sub.absorb_bytes(b"rc_reconstr_ev", b.reconstr_eval.to_repr().as_ref());
+
+    let mut w_poly = crate::polys::multilinear::MultilinearPolynomial::new(chunk_weight_vector(
+      m.log_bound,
+      d.stride,
+    ));
+    for r in &r_b {
+      w_poly.bind_poly_var_top(r);
+    }
+    let w_at_rb = w_poly.into_vec()[0];
+    if vr_final_claim != w_at_rb * b.reconstr_eval {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+
+    let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
+    chunk_claims[bi].push(combined, b.reconstr_eval);
   }
 
-  // 5. Squeeze r_v = (poly-index ++ within), fold the value commitments
-  //    by `eq(r_v_poly, p)` (matching the prover), and verify the single
-  //    folded open. Its evaluation is V(r_v) = Σ_p eq(r_v_poly,p)·value_p.
-  let r_v: Vec<t256::Scalar> = (0..(log_np + log_nv))
-    .map(|_| sub.squeeze(b"range_rv"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let r_v_poly = &r_v[..log_np];
-  let r_v_within = &r_v[log_np..];
-  let eq_weights = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
-  let w = &eq_weights[..num_polys];
-  let comms_owned: Vec<_> = value_comms.iter().map(|c| (*c).clone()).collect();
-  let combined_comm = Hyrax::fold_commitments(&comms_owned, w)?;
-  hyrax_verify_open(
-    vk,
-    ck_eval,
-    &mut sub,
-    &combined_comm,
-    r_v_within,
-    &arg.value_open_at_rv,
-  )?;
-  let value_at_rv = arg.value_open_at_rv.f_y;
-
-  // 6. Value-reconstruction sumcheck (claim = V(r_v), degree 2,
-  //    log_log_bound rounds).
-  let (vr_final_claim, r_b) =
-    arg
-      .value_reconstr_sumcheck
-      .verify(value_at_rv, log_log_bound, 2, &mut sub)?;
-
-  // 7. Verify bit_poly open at (r_v ++ r_b).
-  let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
-  hyrax_verify_open(
-    vk,
-    ck_eval,
-    &mut sub,
-    &arg.bit_comm,
-    &combined,
-    &arg.bit_open_reconstr_final,
-  )?;
-
-  // 8. Reconstruct integrand at r_b: w(r_b)·bit(r_v, r_b).
-  let mut w_poly =
-    crate::polys::multilinear::MultilinearPolynomial::new(range_weight_vector(log_bound, stride));
-  for r in &r_b {
-    w_poly.bind_poly_var_top(r);
-  }
-  let w_at_rb = w_poly.into_vec()[0];
-  let bit_at_rv_rb = arg.bit_open_reconstr_final.f_y;
-  let expected_vr = w_at_rb * bit_at_rv_rb;
-  if vr_final_claim != expected_vr {
-    return Err(SpartanError::InvalidSumcheckProof);
-  }
-
-  Ok(())
+  Ok(RcVerifyClaims {
+    value_claims,
+    chunk_claims,
+    mult_claims,
+  })
 }
 
 /// Absorb a `BigInt` into a `ByteTranscript` as `(sign_byte, LE
@@ -2588,10 +2719,11 @@ mod tests {
     assert_eq!(numlimb(33, 16), 3); // log_t_f not divisible by log_t
   }
 
-  /// `bit_decompose_value` is invertible by `sum_i 2^i · bit[i]`.
+  /// `chunk_decompose_value` is invertible by `sum_c 2^(16c) · chunk[c]`
+  /// and every chunk lies in `[0, 2^16)`.
   #[test]
-  fn bit_decompose_round_trips() {
-    for (v, num_bits) in [
+  fn chunk_decompose_round_trips() {
+    for (v, log_bound) in [
       (BigUint::from(0u32), 8),
       (BigUint::from(1u32), 1),
       (BigUint::from(0xffu32), 8),
@@ -2599,38 +2731,34 @@ mod tests {
       (BigUint::from(0xdeadbeefu32), 32),
       (BigUint::from(0xffff_ffff_ffff_ffffu64), 64),
       (BigUint::from(0x7fff_ffffu32), 31), // odd bit count, top-bit-zero
+      ((BigUint::one() << 227) - BigUint::one(), 227), // b_j-style width
     ] {
-      let bits = bit_decompose_value(&v, num_bits);
-      assert_eq!(bits.len(), num_bits);
-      for b in &bits {
-        assert!(*b == 0 || *b == 1);
+      let chunks = chunk_decompose_value(&v, log_bound);
+      assert_eq!(chunks.len(), log_bound.div_ceil(CHUNK_BITS));
+      let rem = log_bound - CHUNK_BITS * (chunks.len() - 1);
+      for (c, ch) in chunks.iter().enumerate() {
+        assert!(*ch < 1u64 << CHUNK_BITS);
+        if c == chunks.len() - 1 {
+          assert!(*ch < 1u64 << rem, "top chunk exceeds 2^{rem}");
+        }
       }
       let mut acc = BigUint::zero();
-      for (i, b) in bits.iter().enumerate() {
-        if *b == 1 {
-          acc += BigUint::one() << i;
-        }
+      for (c, ch) in chunks.iter().enumerate() {
+        acc += BigUint::from(*ch) << (CHUNK_BITS * c);
       }
       assert_eq!(acc, v, "decomp of 0x{v:x} doesn't round-trip");
     }
   }
 
-  /// `bit_decompose_polynomial` lays out `values.len() · num_bits`
-  /// bits contiguously, with value `i`'s bits in slots `[i·num_bits,
-  /// (i+1)·num_bits)`.
+  /// `bool_point_of_index` selects the right slot: binding an MLE's
+  /// variables to `bits(idx)` evaluates the dense table at `idx`.
   #[test]
-  fn bit_decompose_polynomial_layout() {
-    let values = vec![
-      BigUint::from(0b1010u32),
-      BigUint::from(0b0011u32),
-      BigUint::from(0b1100u32),
-    ];
-    let bits = bit_decompose_polynomial(&values, 4);
-    assert_eq!(bits.len(), 12);
-    // LE order: value[0] = 0b1010 = bits [0, 1, 0, 1]
-    assert_eq!(&bits[0..4], &[0u8, 1, 0, 1]);
-    assert_eq!(&bits[4..8], &[1u8, 1, 0, 0]);
-    assert_eq!(&bits[8..12], &[0u8, 0, 1, 1]);
+  fn bool_point_selects_index() {
+    let table: Vec<t256::Scalar> = (0..8u64).map(|i| t256::Scalar::from(100 + i)).collect();
+    for idx in 0..8usize {
+      let pt = bool_point_of_index(idx, 3);
+      assert_eq!(mle_evaluate_fq(&table, &pt), table[idx]);
+    }
   }
 
   /// `split_value_into_limbs` is invertible: reconstruct from limbs.
@@ -2746,6 +2874,33 @@ mod tests {
       let expected = BigInt::from(100 * ((k >> 1) & 1) + 10 * (k & 1) + 3);
       assert_eq!(g[k as usize], expected);
     }
+  }
+
+  /// `integer_mle_evaluate`'s fold matches the naive chi-product sum
+  /// (the pre-optimization definition), pinning the variable bit-order.
+  #[test]
+  fn integer_mle_evaluate_matches_naive() {
+    let num_vars = 5usize;
+    let n = 1usize << num_vars;
+    let poly: Vec<BigUint> = (0..n).map(|k| BigUint::from((k * k + 7) as u64)).collect();
+    let point: Vec<BigUint> = (0..num_vars)
+      .map(|i| BigUint::from((1u64 << 40) + 31 * i as u64 + 5))
+      .collect();
+
+    // Naive: sum_k chi(point, k) · poly[k], variable i ↔ bit num_vars−1−i.
+    let point_int: Vec<BigInt> = point.iter().map(|x| BigInt::from(x.clone())).collect();
+    let one = BigInt::one();
+    let mut naive = BigInt::zero();
+    for (k, poly_k) in poly.iter().enumerate() {
+      let mut chi = one.clone();
+      for (i, pi) in point_int.iter().enumerate() {
+        let bit = (k >> (num_vars - 1 - i)) & 1;
+        chi *= if bit == 1 { pi.clone() } else { &one - pi };
+      }
+      naive += chi * BigInt::from(poly_k.clone());
+    }
+
+    assert_eq!(integer_mle_evaluate(&poly, &point), naive);
   }
 
   /// `explicit` rejects a config whose Soundness Bound 1 fails: a small
@@ -3027,16 +3182,10 @@ mod tests {
     )
     .unwrap();
 
-    // Confirm we actually exercised t=2 (j=1 batched + j=2 individual).
+    // Confirm we actually exercised t=2 (two stacked layers, two layer
+    // batched opens: f + ab_1 + ab_2 + chunks + mult).
     assert_eq!(arg.chains[0].iterations.len(), 2, "expected t=2");
-    assert!(
-      arg.chains[0].iterations[0].open_a_prev.is_none(),
-      "j=1 a_prev is batched"
-    );
-    assert!(
-      arg.chains[0].iterations[1].open_a_prev.is_some(),
-      "j=2 a_prev is individual"
-    );
+    assert_eq!(arg.ab_comms.len(), 2, "expected 2 stacked layer comms");
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
     <MP as ModPCSEngineTrait<ME>>::verify(
@@ -3098,32 +3247,43 @@ mod tests {
     )
     .unwrap();
 
-    // Three groups (f_limb, a_1, b_1) — the config must produce them.
+    // Three batches (f_limb, a_1, b_1) — the config must produce them.
     assert_eq!(
-      arg.range_checks.len(),
+      arg.range_check.batches.len(),
       3,
-      "expected f_limb + a_1 + b_1 groups"
+      "expected f_limb + a_1 + b_1 batches"
     );
 
-    // Tampering each group's bit opening (in turn) must be rejected
-    // (the Hyrax opening check or the bit-validity integrand check fires,
+    // Tampering each batch's chunk opening (in turn) must be rejected
+    // (the Hyrax opening check or the LogUp wit-eval check fires,
     // depending on which trips first).
-    for gi in 0..arg.range_checks.len() {
+    for gi in 0..arg.range_check.batches.len() {
       let mut bad = arg.clone();
-      bad.range_checks[gi].bit_open_validity_final.f_y += t256::Scalar::ONE;
+      bad.range_check.batches[gi].value_eval += t256::Scalar::ONE;
       let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
       assert!(
         <MP as ModPCSEngineTrait<ME>>::verify(
           &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &bad,
         )
         .is_err(),
-        "group {gi} tamper not rejected"
+        "batch {gi} tamper not rejected"
       );
     }
 
-    // Dropping a group (count mismatch) must also be rejected.
+    // Tampering a batched open's final evaluation must be rejected.
+    let mut bad = arg.clone();
+    bad.batched_opens[0].f_open.f_y += t256::Scalar::ONE;
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
+    assert!(
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &bad,
+      )
+      .is_err()
+    );
+
+    // Dropping a batch (count mismatch) must also be rejected.
     let mut short = arg.clone();
-    short.range_checks.pop();
+    short.range_check.batches.pop();
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
       <MP as ModPCSEngineTrait<ME>>::verify(

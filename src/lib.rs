@@ -50,6 +50,7 @@ pub mod imod_r1cs; // Integer Mod-R1CS relation (paper Def 5.4)
 pub mod imod_r1cs_modp; // Phase-2 IntMod-R1CS over a ModEngine (dynamic prime)
 pub mod imod_spartan; // Spartan over Integer Mod-R1CS
 pub mod imod_spartan_modp; // Phase-2 SNARK driver over a ModEngine
+pub mod logup_gkr; // LogUp-GKR range proof (16-bit range check via fractional-sum GKR)
 pub mod neutronnova_zk; // NeutronNova with zero-knowledge
 pub mod spartan; // Spartan without zero-knowledge
 pub mod spartan_relaxed; // Spartan for relaxed R1CS (non-ZK)
