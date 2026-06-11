@@ -122,6 +122,21 @@ pub struct HyraxBlind<E: Engine> {
   blind: Vec<E::Scalar>,
 }
 
+impl<E: Engine> HyraxBlind<E>
+where
+  E::GE: DlogGroup,
+{
+  /// All-zero blind for `n` coefficients. Used when the underlying eval
+  /// is sent in the clear and hiding adds no value, so a deterministic
+  /// commitment `G^{f_y}` is recoverable on the verifier from `f_y` alone.
+  pub fn zero(ck: &HyraxCommitmentKey<E>, n: usize) -> Self {
+    let num_rows = div_ceil(n, ck.num_cols);
+    HyraxBlind {
+      blind: vec![E::Scalar::ZERO; num_rows],
+    }
+  }
+}
+
 /// Provides a commitment engine
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HyraxPCS<E: Engine> {

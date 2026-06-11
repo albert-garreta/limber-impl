@@ -32,7 +32,9 @@ use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
   provider::{
-    T256DynPrimeEngine, T256HyraxEngine, keccak::Keccak256Transcript, pcs::hyrax_pc::HyraxPCS,
+    T256DynPrimeEngine, T256HyraxEngine,
+    keccak::Keccak256Transcript,
+    pcs::hyrax_pc::{HyraxBlind, HyraxPCS},
     pt256::t256,
   },
   start_span,
@@ -397,18 +399,16 @@ pub struct IntegerModBlind {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
 }
 
-/// One per-small-prime opening: the F-side evaluation `F_y^(i)`, the
-/// blind used to commit it, and the Hyrax evaluation argument for the
-/// opening at the small-prime-reduced point.
+/// One per-small-prime opening: the F-side evaluation `F_y^(i)` and the
+/// Hyrax evaluation argument. The eval commitment `comm_eval = G^{f_y}`
+/// is deterministic in `f_y` (zero-blind), so the verifier reconstructs
+/// it locally — no `blind_eval` shipped.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SmallPrimeOpening {
   /// F_y^(i) = f_F(r mod p_i), the F-evaluation at the small-prime-
   /// reduced point. Sent in the clear; verifier checks it for the
   /// CRT congruence `to_int(F_y^(i)) ≡ int_v' (mod p_i)`.
   pub f_y: t256::Scalar,
-  /// Blind used to commit `f_y`. Verifier reconstructs `comm_eval_i`
-  /// from `(f_y, blind_eval)` and feeds it to `Hyrax::verify`.
-  pub blind_eval: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
   /// Hyrax evaluation argument for the opening at `r mod p_i`.
   pub hyrax_arg: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::EvaluationArgument,
 }
@@ -1113,7 +1113,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         reason: "IntegerModPCS::prove: empty point".to_string(),
       })?;
 
-    let (_red_span, red_t) = start_span!("imod_pcs_reduction");
+    let (_red_span, red_t) = start_span!("imod_pcs_reduction_sc");
     // 0. Limb-split f → f_limb. For numlimb=1 this is a literal pass-
     //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
     //    coefficients (and 2^numlimb_var slots per original coefficient,
@@ -1588,7 +1588,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         reason: "IntegerModPCS::verify: empty point".to_string(),
       })?;
 
-    let (_vred_span, vred_t) = start_span!("imod_pcs_verify_reduction");
+    let (_vred_span, vred_t) = start_span!("imod_pcs_verify_reduction_sc");
     if arg.chains.len() != params.s {
       return Err(SpartanError::InvalidSumcheckProof);
     }
@@ -1670,7 +1670,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let n = num_vars;
     let k = params.k;
     let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
-    info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction");
+    info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction_sc");
 
     let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
     // 3. Phase 1 mirror: re-sample all `s` primes, absorb the stacked
@@ -1937,7 +1937,12 @@ fn hyrax_open_at<T: ByteTranscript>(
   point: &[t256::Scalar],
 ) -> Result<SmallPrimeOpening, SpartanError> {
   let f_y = mle_evaluate_fq(poly_fq, point);
-  let blind_eval = Hyrax::blind(ck_eval, 1);
+  // f_y is sent in the clear in the proof, so the IPA's eval commitment
+  // gains nothing from hiding. Use a zero blind and a deterministic
+  // `comm_eval = G^{f_y}` that the verifier reconstructs locally; this
+  // removes the per-open `Hyrax::blind` + 1-elem MSM and lets us drop
+  // `blind_eval` from `SmallPrimeOpening`.
+  let blind_eval = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
   let comm_eval = Hyrax::commit(ck_eval, &[f_y], &blind_eval, false)?;
   let arg = Hyrax::prove(
     ck,
@@ -1952,14 +1957,13 @@ fn hyrax_open_at<T: ByteTranscript>(
   )?;
   Ok(SmallPrimeOpening {
     f_y,
-    blind_eval,
     hyrax_arg: arg,
   })
 }
 
 /// Mirror of `hyrax_open_at` on the verifier side: reconstruct
-/// `comm_eval` from the prover-sent `(f_y, blind_eval)` and verify the
-/// Hyrax argument against the polynomial commitment `comm` at `point`.
+/// `comm_eval = G^{f_y}` (zero blind) and verify the Hyrax argument
+/// against the polynomial commitment `comm` at `point`.
 fn hyrax_verify_open<T: ByteTranscript>(
   vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
   ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
@@ -1968,7 +1972,8 @@ fn hyrax_verify_open<T: ByteTranscript>(
   point: &[t256::Scalar],
   opening: &SmallPrimeOpening,
 ) -> Result<(), SpartanError> {
-  let comm_eval = Hyrax::commit(ck_eval, &[opening.f_y], &opening.blind_eval, false)?;
+  let zero_blind = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
+  let comm_eval = Hyrax::commit(ck_eval, &[opening.f_y], &zero_blind, false)?;
   Hyrax::verify(
     vk,
     ck_eval,
@@ -2184,6 +2189,7 @@ fn prove_combined_batch_open(
 
   // 1. Per commitment: bind claims, squeeze λ, build W and the combined
   //    running claim.
+  let (_bw_span, bw_t) = start_span!("bo_w_build");
   let mut fs = Vec::with_capacity(m);
   let mut ws = Vec::with_capacity(m);
   let mut run = Vec::with_capacity(m);
@@ -2201,6 +2207,8 @@ fn prove_combined_batch_open(
     nv.push(poly.len().trailing_zeros() as usize);
   }
   let n_max = *nv.iter().max().expect("non-empty targets");
+  info!(elapsed_ms = %bw_t.elapsed().as_millis(), m = %m, "bo_w_build");
+  let (_bs_span, bs_t) = start_span!("bo_interleaved_sc");
 
   // 2. Interleaved, tail-aligned sumcheck rounds: per global round, all
   //    active instances absorb their round polynomial, then ONE shared
@@ -2253,6 +2261,8 @@ fn prove_combined_batch_open(
     challenges.push(r_g);
   }
 
+  info!(elapsed_ms = %bs_t.elapsed().as_millis(), "bo_interleaved_sc");
+
   // 3. Send the per-commitment final evaluations, then μ.
   let final_evals: Vec<t256::Scalar> = fs.iter().map(|f| f[0]).collect();
   for y in &final_evals {
@@ -2261,6 +2271,7 @@ fn prove_combined_batch_open(
   let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
   let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
 
+  let (_bm_span, bm_t) = start_span!("bo_merged_ipa");
   // 4. Merge every column-width-or-larger commitment into ONE same-column
   //    IPA; open the rest (test sizes) individually.
   let width = Hyrax::key_num_cols(ck);
@@ -2286,16 +2297,21 @@ fn prove_combined_batch_open(
   let merged = if big_items.is_empty() {
     None
   } else {
-    let blind_eval = Hyrax::blind(ck_eval, 1);
+    // `y_star` is recomputed by the verifier from the in-clear
+    // `final_evals`, so the eval commitment needs no hiding: use the
+    // deterministic zero-blind `G^{y_star}` (same treatment as
+    // `hyrax_open_at`).
+    let blind_eval = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
     let comm_eval = Hyrax::commit(ck_eval, &[y_star], &blind_eval, false)?;
     let arg =
       Hyrax::prove_same_column_batch(ck, ck_eval, sub, &big_items, mu, &comm_eval, &blind_eval)?;
     Some(SmallPrimeOpening {
       f_y: y_star,
-      blind_eval,
       hyrax_arg: arg,
     })
   };
+
+  info!(elapsed_ms = %bm_t.elapsed().as_millis(), "bo_merged_ipa");
 
   Ok(CombinedBatchOpen {
     round_polys,
@@ -2428,7 +2444,8 @@ fn verify_combined_batch_open(
     if merged.f_y != y_star {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    let comm_eval = Hyrax::commit(ck_eval, &[merged.f_y], &merged.blind_eval, false)?;
+    let zero_blind = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
+    let comm_eval = Hyrax::commit(ck_eval, &[merged.f_y], &zero_blind, false)?;
     Hyrax::verify_same_column_batch(
       vk,
       ck_eval,
@@ -2605,6 +2622,7 @@ fn prove_shared_range_check(
   //    Index `((p·n_values + within)·stride + c)`. Padding polys
   //    (`p ≥ num_polys`) and slots `c ≥ numchunks` stay zero (zero is in
   //    the table, and those slots carry zero weight).
+  let (_rcc_span, rcc_t) = start_span!("rc_chunk_commit");
   let mut chunk_vals_all: Vec<Vec<u64>> = Vec::with_capacity(batches.len());
   let mut chunk_fq_all: Vec<Vec<t256::Scalar>> = Vec::with_capacity(batches.len());
   let mut chunk_blinds: Vec<HB> = Vec::with_capacity(batches.len());
@@ -2651,6 +2669,8 @@ fn prove_shared_range_check(
     chunk_comms.push(comm);
   }
 
+  info!(elapsed_ms = %rcc_t.elapsed().as_millis(), "rc_chunk_commit");
+
   // 2. Shifted top chunks of the non-16-aligned batches: `top + (2^16 −
   //    2^rem)` is in the 2^16 table iff `top < 2^rem`. These become extra
   //    LogUp witness trees; no extra commitment (their MLE is the chunk
@@ -2675,6 +2695,7 @@ fn prove_shared_range_check(
     .map(|v| v.as_slice())
     .chain(top_vals_all.iter().map(|(_, v)| v.as_slice()))
     .collect();
+  let (_rcm_span, rcm_t) = start_span!("rc_mult_commit");
   let mult = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::multiplicities(
     CHUNK_BITS,
     &witness_refs,
@@ -2682,12 +2703,14 @@ fn prove_shared_range_check(
   let mult_fq: Vec<t256::Scalar> = mult.iter().map(|&m| t256::Scalar::from(m)).collect();
   let mult_blind = Hyrax::blind(ck, mult_fq.len());
   let mult_comm = Hyrax::commit(ck, &mult_fq, &mult_blind, true)?;
+  info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "rc_mult_commit");
 
   // 4. Sub-transcript bound to (parent, chunk comms, mult comm).
   let mut sub = spawn_shared_range_subtranscript(parent, chunk_comms.iter(), &mult_comm)?;
 
   // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
   //    [0, 2^16). Its reduced claims become batched-open claims.
+  let (_rcl_span, rcl_t) = start_span!("rc_logup_gkr");
   let (logup, claims) = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::prove(
     CHUNK_BITS,
     &chunk_vals_all
@@ -2697,6 +2720,7 @@ fn prove_shared_range_check(
       .collect::<Vec<_>>(),
     &mut sub,
   )?;
+  info!(elapsed_ms = %rcl_t.elapsed().as_millis(), "rc_logup_gkr");
   let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); batches.len()];
   for (bi, (point, eval)) in claims.wit_claims.iter().take(batches.len()).enumerate() {
     chunk_claims[bi].push(point.clone(), *eval);
@@ -2719,6 +2743,7 @@ fn prove_shared_range_check(
   //    Σ_p eq(r_v_poly, p)·value_p(r_v_within)` is sent as a claim on the
   //    batch's target commitment, and the sumcheck's final chunk
   //    evaluation is a claim on the chunk commitment.
+  let (_rcr_span, rcr_t) = start_span!("rc_reconstr");
   let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
     Vec::with_capacity(batches.len());
   let mut batch_data: Vec<RangeCheckBatchData> = Vec::with_capacity(batches.len());
@@ -2774,6 +2799,8 @@ fn prove_shared_range_check(
       value_reconstr_sumcheck,
     });
   }
+
+  info!(elapsed_ms = %rcr_t.elapsed().as_millis(), "rc_reconstr");
 
   let chunk_data: Vec<(Vec<t256::Scalar>, HB, OpenClaims)> = chunk_fq_all
     .into_iter()
