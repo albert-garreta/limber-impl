@@ -75,12 +75,15 @@ work. Estimated: GKR sumcheck −30–40%, end-to-end prove ~1.25 → ~1.15 s
 multithreaded, single-threaded ~4.5 → ~4.1 s. Verifier: +`3·2^ℓ` field
 elements per tree in proof size, small constant extra verify work.
 
-Given the modest end-to-end delta, do this only after (or together with)
-the bigger structural item: `log_t = 16` limbs, which would make the
-committed limb polynomials coincide with the 16-bit chunk polynomials,
-deleting the separate chunk commitments and roughly halving GKR leaves —
-that change *increases* the relative value of this one (the leaf layer
-becomes a larger fraction of what remains).
+**Correction (measured 2026-06-11):** the previously-suggested
+`log_t = 16` companion change is a clear LOSS — measured +57% prove
+(1.25 → 1.96 s at k=10 on MultiSwap). Halving the limb width doubles the
+IntEval polynomial (2^19 → 2^20 limbs for the w-open), which doubles the
+chains, the stacked layers, the reduction, and the f-side opens, while
+the f_limb chunk tree it would eliminate is already only ~2^20 leaves
+(and the naive version doesn't even eliminate it: the min-stride padding
+keeps a 2x chunk poly). `log_t = 32` stays. This makes the univariate
+skip the primary remaining GKR lever on its own.
 
 ## Implementation steps
 
