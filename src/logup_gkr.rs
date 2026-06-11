@@ -245,20 +245,20 @@ fn gkr_prove<E: Engine>(
     // round j uses suffix[j+1]). The emitted s(0..3) are exactly the
     // same field elements as the unfactored evaluation, so the
     // transcript and verifier are unchanged.
-    let mut suffix: Vec<Vec<E::Scalar>> = vec![Vec::new(); k + 1];
-    suffix[k] = vec![E::Scalar::ONE];
-    for j in (1..k).rev() {
-      let prev = &suffix[j + 1];
-      let c = point[j];
-      let mut tbl = vec![E::Scalar::ZERO; prev.len() * 2];
-      let (lo, hi) = tbl.split_at_mut(prev.len());
-      let one_minus_c = E::Scalar::ONE - c;
-      for (i, &p) in prev.iter().enumerate() {
-        lo[i] = one_minus_c * p;
-        hi[i] = c * p;
-      }
-      suffix[j] = tbl;
-    }
+    // Dao–Thaler split: instead of materializing every suffix table
+    // (Σ 2^j work, serial), factor eq(ρ_{>j}, x) = eq(ρ_{j+1..m}, x_hi)
+    // · eq(ρ_{m..k}, x_lo) with m ≈ k/2. The lo table is built once per
+    // layer; the hi tables shrink per round and cost O(2^{k/2}) total.
+    // Since h(0)/h(∞) are linear in the weight, the hi factor is hoisted
+    // out of the inner loop (one mult per block), so per-index cost is
+    // unchanged and the emitted round polynomials are identical.
+    let m = (k + 1) / 2;
+    let lo_tbl: Vec<E::Scalar> = if m < k {
+      EqPolynomial::evals_from_points(&point[m..k])
+    } else {
+      vec![E::Scalar::ONE]
+    };
+    let lo_len = lo_tbl.len();
 
     let mut e_pref = E::Scalar::ONE;
     let mut claim = claim_p + lambda * claim_q;
@@ -267,37 +267,75 @@ fn gkr_prove<E: Engine>(
 
     for round in 0..k {
       let h = b0.len() / 2;
-      let w = &suffix[round + 1];
-      debug_assert_eq!(w.len(), h);
       let c = point[round];
+      // Per-round hi table (eq over ρ_{round+1..m}); for late rounds the
+      // remaining suffix lives entirely in the lo part, so build it
+      // directly (small, ≤ 2^{k-m}).
+      let (hi_tbl, blk_len) = if round + 1 < m {
+        (
+          EqPolynomial::<E::Scalar>::evals_from_points(&point[round + 1..m]),
+          lo_len,
+        )
+      } else {
+        let direct = if round + 1 < k {
+          EqPolynomial::<E::Scalar>::evals_from_points(&point[round + 1..k])
+        } else {
+          vec![E::Scalar::ONE]
+        };
+        let l = direct.len();
+        (direct, l)
+      };
+      let lo: &[E::Scalar] = if round + 1 < m { &lo_tbl } else { &hi_tbl };
+      let hi: &[E::Scalar] = if round + 1 < m { &hi_tbl } else { &[] };
+      debug_assert_eq!(
+        if hi.is_empty() {
+          blk_len
+        } else {
+          hi.len() * blk_len
+        },
+        h
+      );
 
-      // Accumulate h(0) and h(∞) (the quadratic coefficient of h).
-      let eval_at = |i: usize| -> [E::Scalar; 2] {
+      // Unweighted per-index integrand values (g(0), g(∞)).
+      let g_at = |i: usize| -> [E::Scalar; 2] {
         let b0d = b0[i + h] - b0[i];
         let b1d = b1[i + h] - b1[i];
         if leaf_ones {
           let g0 = b0[i] + b1[i] + lambda * (b0[i] * b1[i]);
           let ginf = lambda * (b0d * b1d);
-          return [w[i] * g0, w[i] * ginf];
+          return [g0, ginf];
         }
         let a0d = a0[i + h] - a0[i];
         let a1d = a1[i + h] - a1[i];
         let g0 = a0[i] * b1[i] + a1[i] * b0[i] + lambda * (b0[i] * b1[i]);
         let ginf = a0d * b1d + a1d * b0d + lambda * (b0d * b1d);
-        [w[i] * g0, w[i] * ginf]
+        [g0, ginf]
       };
       let add2 = |mut a: [E::Scalar; 2], b: [E::Scalar; 2]| {
         a[0] += b[0];
         a[1] += b[1];
         a
       };
-      let [h0, hinf] = if h >= PAR_THRESHOLD {
-        (0..h)
+      // One lo-weighted block, then the hi factor applied once per block.
+      let block = |bh: usize, hi_w: E::Scalar| -> [E::Scalar; 2] {
+        let base = bh * blk_len;
+        let mut s = [E::Scalar::ZERO; 2];
+        for (il, lw) in lo[..blk_len].iter().enumerate() {
+          let g = g_at(base + il);
+          s[0] += *lw * g[0];
+          s[1] += *lw * g[1];
+        }
+        [hi_w * s[0], hi_w * s[1]]
+      };
+      let [h0, hinf] = if hi.is_empty() {
+        block(0, E::Scalar::ONE)
+      } else if h >= PAR_THRESHOLD {
+        (0..hi.len())
           .into_par_iter()
-          .fold(|| [E::Scalar::ZERO; 2], |acc, i| add2(acc, eval_at(i)))
+          .map(|bh| block(bh, hi[bh]))
           .reduce(|| [E::Scalar::ZERO; 2], add2)
       } else {
-        (0..h).fold([E::Scalar::ZERO; 2], |acc, i| add2(acc, eval_at(i)))
+        (0..hi.len()).fold([E::Scalar::ZERO; 2], |acc, bh| add2(acc, block(bh, hi[bh])))
       };
 
       // s(t) = E_pref·E(t)·h(t), E(t) = (1−t)(1−c) + t·c.
@@ -310,9 +348,18 @@ fn gkr_prove<E: Engine>(
       let h1 = match Option::<E::Scalar>::from(e1.invert()) {
         Some(e1_inv) => s1 * e1_inv,
         None => {
+          let w_full = if round + 1 < k {
+            EqPolynomial::<E::Scalar>::evals_from_points(&point[round + 1..k])
+          } else {
+            vec![E::Scalar::ONE]
+          };
           let acc = |i: usize| {
-            w[i]
-              * (a0[i + h] * b1[i + h] + a1[i + h] * b0[i + h] + lambda * (b0[i + h] * b1[i + h]))
+            let g = if leaf_ones {
+              b0[i + h] + b1[i + h] + lambda * (b0[i + h] * b1[i + h])
+            } else {
+              a0[i + h] * b1[i + h] + a1[i + h] * b0[i + h] + lambda * (b0[i + h] * b1[i + h])
+            };
+            w_full[i] * g
           };
           (0..h).fold(E::Scalar::ZERO, |s, i| s + acc(i))
         }
