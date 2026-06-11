@@ -889,24 +889,33 @@ fn integer_mle_evaluate(poly: &[BigUint], point: &[BigUint]) -> BigInt {
   debug_assert_eq!(1 << num_vars, n);
   debug_assert_eq!(point.len(), num_vars);
 
-  // Pre-lift point components to BigInt.
-  let point_int: Vec<BigInt> = point.iter().map(|x| BigInt::from(x.clone())).collect();
-  let one = BigInt::one();
-
-  // Walk all 2^num_vars hypercube points. Bit-order matches
-  // `EqPolynomial::evals_from_points`: variable `i ∈ [0, num_vars)`
-  // corresponds to bit `num_vars - 1 - i` of `k`.
-  let mut acc = BigInt::zero();
-  for (k, poly_k) in poly.iter().enumerate().take(n) {
-    let mut chi = one.clone();
-    for (i, pi) in point_int.iter().enumerate().take(num_vars) {
-      let bit = (k >> (num_vars - 1 - i)) & 1;
-      let factor = if bit == 1 { pi.clone() } else { &one - pi };
-      chi *= factor;
-    }
-    acc += chi * BigInt::from(poly_k.clone());
+  // Bind variables one at a time (top variable first), folding the table
+  // in half per round over ℤ: out[i] = lo[i] + r·(hi[i] − lo[i]). The
+  // bit-order matches `EqPolynomial::evals_from_points` / `bind_poly_var_top`:
+  // variable `i` corresponds to bit `num_vars - 1 - i` of the index, so
+  // `point[0]` splits the table into its two halves. Entry widths grow by
+  // ~|r| bits per round while the count halves, so the total bigint work
+  // is dominated by the early (narrow) rounds — far cheaper than
+  // materializing the 2^n chi table at full width, and each round is
+  // embarrassingly parallel.
+  let mut cur: Vec<BigInt> = poly.par_iter().map(|x| BigInt::from(x.clone())).collect();
+  for r in point {
+    let r_int = BigInt::from(r.clone());
+    let h = cur.len() / 2;
+    let (lo, hi) = cur.split_at(h);
+    cur = if h >= 1 << 10 {
+      lo.par_iter()
+        .zip(hi.par_iter())
+        .map(|(a, b)| a + &r_int * (b - a))
+        .collect()
+    } else {
+      lo.iter()
+        .zip(hi.iter())
+        .map(|(a, b)| a + &r_int * (b - a))
+        .collect()
+    };
   }
-  acc
+  cur.pop().expect("non-empty table")
 }
 
 /// Rejection-sample a small prime in `[2^{log_p - 1}, 2^{log_p})` from
@@ -3037,6 +3046,33 @@ mod tests {
       let expected = BigInt::from(100 * ((k >> 1) & 1) + 10 * (k & 1) + 3);
       assert_eq!(g[k as usize], expected);
     }
+  }
+
+  /// `integer_mle_evaluate`'s fold matches the naive chi-product sum
+  /// (the pre-optimization definition), pinning the variable bit-order.
+  #[test]
+  fn integer_mle_evaluate_matches_naive() {
+    let num_vars = 5usize;
+    let n = 1usize << num_vars;
+    let poly: Vec<BigUint> = (0..n).map(|k| BigUint::from((k * k + 7) as u64)).collect();
+    let point: Vec<BigUint> = (0..num_vars)
+      .map(|i| BigUint::from((1u64 << 40) + 31 * i as u64 + 5))
+      .collect();
+
+    // Naive: sum_k chi(point, k) · poly[k], variable i ↔ bit num_vars−1−i.
+    let point_int: Vec<BigInt> = point.iter().map(|x| BigInt::from(x.clone())).collect();
+    let one = BigInt::one();
+    let mut naive = BigInt::zero();
+    for (k, poly_k) in poly.iter().enumerate() {
+      let mut chi = one.clone();
+      for (i, pi) in point_int.iter().enumerate() {
+        let bit = (k >> (num_vars - 1 - i)) & 1;
+        chi *= if bit == 1 { pi.clone() } else { &one - pi };
+      }
+      naive += chi * BigInt::from(poly_k.clone());
+    }
+
+    assert_eq!(integer_mle_evaluate(&poly, &point), naive);
   }
 
   /// `explicit` rejects a config whose Soundness Bound 1 fails: a small
