@@ -2196,7 +2196,7 @@ fn prove_batched_open(
   debug_assert!(!claims.points.is_empty());
   absorb_batch_claims(sub, comm, claims);
   let lambda = sub.squeeze(b"bo_lambda")?;
-  let (w, claim) = aprev_batch_weight(&claims.points, &claims.evals, lambda, poly_fq.len());
+  let (w, claim) = batch_weight(&claims.points, &claims.evals, lambda, poly_fq.len());
   let num_vars = poly_fq.len().trailing_zeros() as usize;
   let mut poly_f = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.to_vec());
   let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(w);
@@ -2248,25 +2248,113 @@ fn verify_batched_open(
   Ok(())
 }
 
-/// Build `W = Σ_c λ^c · eq(z_c, ·)` as length-`n` evals (the public
-/// multi-point batch weight), and the combined claim `Σ_c λ^c · y_c`.
-/// Used by both the prover and verifier of the `a_prev` batch.
-fn aprev_batch_weight(
+/// Build `W = Σ_i λ^i·eq(z_i, ·)` (length `n`) and the combined claim
+/// `Σ_i λ^i·y_i` for a batched open, exploiting claim-point structure so
+/// the cost is far below the naive `#claims · n`:
+///
+/// - **Boolean head**: a claim whose leading coordinates are exactly
+///   `0/1` (stacked-layer points `(role, bits(chain), ·)`, role-prefixed
+///   range-check points) has `eq(z, ·)` supported on a single block —
+///   write `λ^i·eq(tail)` into that block, cost `2^(n_vars − h)`.
+/// - **Shared random prefix**: consecutive claims sharing a common
+///   prefix (the `j=1` a_prev points `(γ_prefix, r^(c))`) are
+///   tensor-combined: `eq(prefix) ⊗ Σ_c λ^c·eq(tail_c)` — one full-size
+///   pass per *group* instead of per claim.
+///
+/// The output is bit-identical to the naive construction (the structure
+/// only changes how the same table is assembled), so the transcript and
+/// verifier are unaffected.
+fn batch_weight(
   points: &[Vec<t256::Scalar>],
   evals: &[t256::Scalar],
   lambda: t256::Scalar,
   n: usize,
 ) -> (Vec<t256::Scalar>, t256::Scalar) {
+  let n_vars = n.trailing_zeros() as usize;
+  debug_assert_eq!(1usize << n_vars, n);
   let mut w = vec![t256::Scalar::ZERO; n];
   let mut claim = t256::Scalar::ZERO;
   let mut lam_pow = t256::Scalar::ONE;
-  for (z_c, &y_c) in points.iter().zip(evals.iter()) {
-    let eq_c = EqPolynomial::<t256::Scalar>::evals_from_points(z_c);
-    for (wj, &e) in w.iter_mut().zip(eq_c.iter()) {
-      *wj += lam_pow * e;
+
+  // Length of the leading run of exactly-boolean coordinates.
+  let bool_head = |z: &[t256::Scalar]| -> usize {
+    z.iter()
+      .take_while(|c| **c == t256::Scalar::ZERO || **c == t256::Scalar::ONE)
+      .count()
+  };
+  // Longest common prefix of two points.
+  let lcp = |a: &[t256::Scalar], b: &[t256::Scalar]| -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+  };
+
+  let mut i = 0;
+  while i < points.len() {
+    let z = &points[i];
+    debug_assert_eq!(z.len(), n_vars);
+    let h = bool_head(z);
+    if h > 0 {
+      // Block write: λ^i·eq(z[h..]) into the block selected by z[..h].
+      let mut block = 0usize;
+      for c in &z[..h] {
+        block = (block << 1) | usize::from(*c == t256::Scalar::ONE);
+      }
+      let tail = EqPolynomial::<t256::Scalar>::evals_from_points(&z[h..]);
+      let bs = tail.len();
+      let lam = lam_pow;
+      w[block * bs..(block + 1) * bs]
+        .par_iter_mut()
+        .zip(tail.par_iter())
+        .for_each(|(wj, e)| *wj += lam * e);
+      claim += lam_pow * evals[i];
+      lam_pow *= lambda;
+      i += 1;
+      continue;
     }
-    claim += lam_pow * y_c;
+
+    // Group consecutive claims sharing a (random) prefix with z. Distinct
+    // protocol points never collide by accident over a 256-bit field, so
+    // any LCP > 0 identifies genuinely shared structure.
+    let mut j = i + 1;
+    let mut p = n_vars;
+    while j < points.len() && lcp(z, &points[j]) > 0 {
+      p = p.min(lcp(z, &points[j]));
+      j += 1;
+    }
+    if j > i + 1 && p > 0 && p < n_vars {
+      // Tensor: eq(z[..p]) ⊗ Σ_c λ^c·eq(z_c[p..]).
+      let tail_len = 1usize << (n_vars - p);
+      let mut small = vec![t256::Scalar::ZERO; tail_len];
+      for c in i..j {
+        debug_assert_eq!(&points[c][..p], &z[..p]);
+        let tail = EqPolynomial::<t256::Scalar>::evals_from_points(&points[c][p..]);
+        let lam = lam_pow;
+        for (sj, e) in small.iter_mut().zip(tail.iter()) {
+          *sj += lam * e;
+        }
+        claim += lam_pow * evals[c];
+        lam_pow *= lambda;
+      }
+      let pref = EqPolynomial::<t256::Scalar>::evals_from_points(&z[..p]);
+      w.par_chunks_mut(tail_len)
+        .zip(pref.par_iter())
+        .for_each(|(chunk, pe)| {
+          for (wj, sj) in chunk.iter_mut().zip(small.iter()) {
+            *wj += *pe * sj;
+          }
+        });
+      i = j;
+      continue;
+    }
+
+    // Singleton: one full-size accumulate.
+    let eq_c = EqPolynomial::<t256::Scalar>::evals_from_points(z);
+    let lam = lam_pow;
+    w.par_iter_mut()
+      .zip(eq_c.par_iter())
+      .for_each(|(wj, e)| *wj += lam * e);
+    claim += lam_pow * evals[i];
     lam_pow *= lambda;
+    i += 1;
   }
   (w, claim)
 }
@@ -2748,6 +2836,56 @@ mod tests {
       }
       assert_eq!(acc, v, "decomp of 0x{v:x} doesn't round-trip");
     }
+  }
+
+  /// `batch_weight`'s structured assembly (boolean-head blocks, shared-
+  /// prefix tensor groups, singletons) matches the naive Σ λ^i·eq(z_i,·).
+  #[test]
+  fn batch_weight_matches_naive() {
+    let n_vars = 6usize;
+    let n = 1usize << n_vars;
+    let rnd = |s: u64| t256::Scalar::from(s * s + 3);
+    // Mixed structure: two boolean-head claims, a shared-prefix group of
+    // three, and an unrelated singleton.
+    let shared: Vec<t256::Scalar> = (0..3).map(|i| rnd(40 + i)).collect();
+    let mut points: Vec<Vec<t256::Scalar>> = vec![
+      bool_point_of_index(5, 3)
+        .into_iter()
+        .chain((0..3).map(|i| rnd(7 + i)))
+        .collect(),
+      bool_point_of_index(2, 2)
+        .into_iter()
+        .chain((0..4).map(|i| rnd(11 + i)))
+        .collect(),
+    ];
+    for c in 0..3u64 {
+      points.push(
+        shared
+          .iter()
+          .copied()
+          .chain((0..3).map(|i| rnd(100 * (c + 1) + i)))
+          .collect(),
+      );
+    }
+    points.push((0..6).map(|i| rnd(900 + i)).collect());
+    let evals: Vec<t256::Scalar> = (0..points.len() as u64).map(|i| rnd(70 + i)).collect();
+    let lambda = rnd(31337);
+
+    let (w, claim) = batch_weight(&points, &evals, lambda, n);
+
+    let mut w_naive = vec![t256::Scalar::ZERO; n];
+    let mut claim_naive = t256::Scalar::ZERO;
+    let mut lam = t256::Scalar::ONE;
+    for (z, y) in points.iter().zip(evals.iter()) {
+      let eq = EqPolynomial::<t256::Scalar>::evals_from_points(z);
+      for (wj, e) in w_naive.iter_mut().zip(eq.iter()) {
+        *wj += lam * e;
+      }
+      claim_naive += lam * y;
+      lam *= lambda;
+    }
+    assert_eq!(w, w_naive);
+    assert_eq!(claim, claim_naive);
   }
 
   /// `bool_point_of_index` selects the right slot: binding an MLE's
