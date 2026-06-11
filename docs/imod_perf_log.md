@@ -218,6 +218,24 @@ independent (confirmed: 434.0 → 428.4 ms, within noise band).
 | prove  | **428.44 ms** | 16.60 ms | **26×** |
 | verify | **37.57 ms**  | 6.58 ms  | **5.7×** |
 
+**Timing-scope fix (2026-06-11):** the imod prove benches previously
+created `IntModR1CSWitnessModp` (which commits w and q) in criterion's
+untimed setup closure, while the plain-Spartan baseline's `prove`
+synthesizes + commits its witness inside the timed region. All imod
+prove benches now time witness creation too; msshape additionally
+times the witness *generation* (per-gate divmods for c and the
+quotient advice), matching the baseline's scope.
+
+| prove (criterion median) | old scope | new scope |
+|---|---|---|
+| c2^6_v2^8   | 118.91 ms | 120.65 ms |
+| c2^8_v2^10  | 158.33 ms | 156.68 ms |
+| c2^10_v2^12 | 197.41 ms | 206.14 ms |
+| msshape     | 428.44 ms | **470.86 ms** (witgen ~17 + wq commit ~22) |
+
+Corrected headline ratio at msshape, k=7: **470.9 / 16.6 ≈ 28×**
+prove (verify unchanged, 5.7×; at k=8, 3.2×).
+
 `IMOD_K` sweep at msshape (w-poly has 13+3=16 total vars, so k=7 forces
 `t=2`; k≥8 collapses both opens to `t=1`):
 

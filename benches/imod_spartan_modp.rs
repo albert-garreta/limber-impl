@@ -86,7 +86,7 @@ fn setup_for(
 /// this statement — natively it would need limb-decomposition gadgets
 /// (~10²-10³ constraints per gate) — so the ratio reads as "machinery
 /// overhead vs what the same shape costs natively", not same-statement.
-fn make_msshape_shape_and_witness() -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
+fn make_msshape_shape_and_operands() -> (IntModR1CSShapeModp<M>, Vec<(BigUint, BigUint)>) {
   let num_real: usize = 2730;
   let num_cons = num_real.next_power_of_two(); // 2^12
   let num_vars = (3 * num_real).next_power_of_two(); // 2^13
@@ -111,19 +111,38 @@ fn make_msshape_shape_and_witness() -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Ve
   )
   .unwrap();
 
+  let operands: Vec<(BigUint, BigUint)> = (0..num_real)
+    .map(|_| (rng.gen_biguint_below(&n), rng.gen_biguint_below(&n)))
+    .collect();
+  (shape, operands)
+}
+
+/// Witness generation for the msshape config: the per-gate divmods
+/// producing `c = a·b mod p` and the quotient advice `q = a·b div p`.
+/// Counted inside the timed prove region (the plain-Spartan baseline's
+/// witness synthesis is likewise inside its `prove`).
+fn msshape_witness(
+  shape: &IntModR1CSShapeModp<M>,
+  operands: &[(BigUint, BigUint)],
+) -> (Vec<BigUint>, Vec<BigUint>) {
+  let n = t256_base_modulus();
   let zero = BigUint::from(0u32);
-  let mut w = vec![zero.clone(); num_vars];
-  let mut q = vec![zero; num_cons];
-  for i in 0..num_real {
-    let a = rng.gen_biguint_below(&n);
-    let b = rng.gen_biguint_below(&n);
-    let ab = &a * &b;
+  let mut w = vec![zero.clone(); shape.num_vars()];
+  let mut q = vec![zero; shape.num_cons()];
+  for (i, (a, b)) in operands.iter().enumerate() {
+    let ab = a * b;
     q[i] = &ab / &n;
-    w[3 * i] = a;
-    w[3 * i + 1] = b;
+    w[3 * i] = a.clone();
+    w[3 * i + 1] = b.clone();
     w[3 * i + 2] = &ab % &n;
   }
+  (w, q)
+}
 
+/// Convenience wrapper (one-shot + verify-bench setup paths).
+fn make_msshape_shape_and_witness() -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
+  let (shape, operands) = make_msshape_shape_and_operands();
+  let (w, q) = msshape_witness(&shape, &operands);
   (shape, w, q)
 }
 
@@ -254,16 +273,19 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
       );
     });
 
+    // The timed region includes the witness commitment
+    // (`IntModR1CSWitnessModp::new` commits w and q) — the plain-Spartan
+    // baseline's prove likewise synthesizes + commits its witness.
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
           let (shape, w, q) = make_shape_and_witness(num_cons, num_vars);
           let (pk, _vk) = setup_for(shape.clone());
+          (pk, shape, w, q)
+        },
+        |(pk, shape, w, q)| {
           let (witness, instance) =
             IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
-          (pk, instance, witness)
-        },
-        |(pk, instance, witness)| {
           let _ = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
         },
         BatchSize::LargeInput,
@@ -294,16 +316,21 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
   // `spartan_synthetic/.../msshape` native baseline.
   {
     let tag = "msshape_c2^12_v2^13";
+    // Timed region = witness generation (per-gate divmods producing c
+    // and the quotient advice) + witness commitment + prove, matching
+    // the plain-Spartan baseline whose prove synthesizes and commits
+    // its witness internally.
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, w, q) = make_msshape_shape_and_witness();
+          let (shape, operands) = make_msshape_shape_and_operands();
           let (pk, _vk) = setup_msshape(shape.clone());
+          (pk, shape, operands)
+        },
+        |(pk, shape, operands)| {
+          let (w, q) = msshape_witness(&shape, &operands);
           let (witness, instance) =
             IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
-          (pk, instance, witness)
-        },
-        |(pk, instance, witness)| {
           let _ = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
         },
         BatchSize::LargeInput,
