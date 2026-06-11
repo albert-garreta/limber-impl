@@ -202,8 +202,8 @@ shape and padding pattern as MultiSwap k=0 (2715 real rows), with
 `log_t_f = 256` → numlimb 8, `t = 2` IntEval iterations. Because the
 gate modulus is the native field modulus, plain Spartan proves the
 identical statement as one native constraint per gate (`wide` values,
-`is_small = false` — claiming small with wide values mis-commits and
-fails verification; found the hard way).
+`is_small = false` — claiming small with wide values produces an
+invalid commitment and fails verification; found the hard way).
 
 **Update (same day):** gate modulus switched from the scalar field `q`
 to the T256 **base field** `p` — a foreign modulus the native system

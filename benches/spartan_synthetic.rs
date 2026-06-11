@@ -113,6 +113,22 @@ fn spartan_synthetic_benches(c: &mut Criterion) {
   // may be slightly larger than N.
   let configs: &[usize] = &[1 << 6, 1 << 8, 1 << 10, 1 << 12, 1 << 14];
 
+  // Per-part timing breakdown for the msshape config, gated on
+  // `RUST_LOG` (mirrors imod_spartan_modp): one setup/prove/verify with
+  // the library spans (witness commit, matvec, sumchecks, PCS opens)
+  // visible without criterion's iteration noise.
+  if std::env::var_os("RUST_LOG").is_some() {
+    let _ = tracing_subscriber::fmt()
+      .with_target(false)
+      .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+      .try_init();
+    let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new_wide(2730);
+    let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
+    let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), false).unwrap();
+    let (proof, _) = SpartanSNARK::<E>::prove(&pk, circuit, prep, false).unwrap();
+    proof.verify(&vk).unwrap();
+  }
+
   for &n in configs {
     let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new(n);
     let (pk, _vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
@@ -202,8 +218,8 @@ fn spartan_synthetic_benches(c: &mut Criterion) {
     let n = 2730usize;
     let tag = "msshape";
     // `is_small = false`: full-width witness values do NOT fit machine
-    // words; claiming otherwise mis-commits via the small-scalar MSM
-    // path and the proof fails verification.
+    // words; claiming otherwise produces an invalid commitment via the
+    // small-scalar MSM path and the proof fails verification.
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
