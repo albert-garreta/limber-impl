@@ -252,7 +252,10 @@ fn gkr_prove<E: Engine>(
     // Since h(0)/h(∞) are linear in the weight, the hi factor is hoisted
     // out of the inner loop (one mult per block), so per-index cost is
     // unchanged and the emitted round polynomials are identical.
-    let m = (k + 1) / 2;
+    // Asymmetric split: cap the lo table at 2^7 so the hi side keeps
+    // h/128 parallel blocks per round (parallel grain matters more than
+    // balancing the two table sizes — both builds are cheap either way).
+    let m = k.saturating_sub(7);
     let lo_tbl: Vec<E::Scalar> = if m < k {
       EqPolynomial::evals_from_points(&point[m..k])
     } else {
