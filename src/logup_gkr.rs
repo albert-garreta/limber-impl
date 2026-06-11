@@ -203,67 +203,112 @@ fn gkr_prove<E: Engine>(
     let lambda = transcript.squeeze(b"gkr_lambda")?;
     let half = 1usize << k; // size of the x-cube for this layer's sumcheck
 
-    let mut eq = EqPolynomial::evals_from_points(&point); // len 2^k
     let mut a0 = levels_p[k + 1][0..half].to_vec();
     let mut a1 = levels_p[k + 1][half..2 * half].to_vec();
     let mut b0 = levels_q[k + 1][0..half].to_vec();
     let mut b1 = levels_q[k + 1][half..2 * half].to_vec();
 
+    // Gruen eq-factoring: the integrand is eq(ρ; x)·g(x) with
+    // g = p0·q1 + p1·q0 + λ·q0·q1 of degree 2 per variable, and
+    // eq(ρ; (r_{<j}, t, x_rest)) = E_pref · E_j(t) · eq(ρ_{>j}, x_rest)
+    // where E_j(t) = (1−t)(1−ρ_j) + t·ρ_j is linear. So the round
+    // polynomial is s(t) = E_pref·E_j(t)·h(t) with h of degree 2: per
+    // index we only accumulate h(0) and the quadratic coefficient h(∞)
+    // (from table diffs), and recover h(1) from the running claim via
+    // s(0) + s(1) = claim. The eq table is never extrapolated or bound;
+    // the per-round weights are the suffix tables eq(ρ_{>j}, ·),
+    // precomputed here in one backward pass (suffix[j] covers ρ_{j..};
+    // round j uses suffix[j+1]). The emitted s(0..3) are exactly the
+    // same field elements as the unfactored evaluation, so the
+    // transcript and verifier are unchanged.
+    let mut suffix: Vec<Vec<E::Scalar>> = vec![Vec::new(); k + 1];
+    suffix[k] = vec![E::Scalar::ONE];
+    for j in (1..k).rev() {
+      let prev = &suffix[j + 1];
+      let c = point[j];
+      let mut tbl = vec![E::Scalar::ZERO; prev.len() * 2];
+      let (lo, hi) = tbl.split_at_mut(prev.len());
+      let one_minus_c = E::Scalar::ONE - c;
+      for (i, &p) in prev.iter().enumerate() {
+        lo[i] = one_minus_c * p;
+        hi[i] = c * p;
+      }
+      suffix[j] = tbl;
+    }
+
+    let mut e_pref = E::Scalar::ONE;
+    let mut claim = claim_p + lambda * claim_q;
     let mut round_polys = Vec::with_capacity(k);
     let mut challenges = Vec::with_capacity(k);
 
-    for _round in 0..k {
-      let l = eq.len();
-      let h = l / 2;
-      // Per-index contribution to the round polynomial's evaluations at
-      // t ∈ {0,1,2,3}: extrapolate each table linearly in the top variable
-      // and accumulate eq·(p0·q1 + p1·q0 + λ·q0·q1).
-      let eval_at = |i: usize| -> [E::Scalar; 4] {
-        let eq_lo = eq[i];
-        let eq_d = eq[i + h] - eq[i];
-        let a0_lo = a0[i];
-        let a0_d = a0[i + h] - a0[i];
-        let a1_lo = a1[i];
-        let a1_d = a1[i + h] - a1[i];
-        let b0_lo = b0[i];
-        let b0_d = b0[i + h] - b0[i];
-        let b1_lo = b1[i];
-        let b1_d = b1[i + h] - b1[i];
-        let mut out = [E::Scalar::ZERO; 4];
-        for (ti, t) in [0u64, 1, 2, 3].into_iter().enumerate() {
-          let tf = E::Scalar::from(t);
-          let eqv = eq_lo + tf * eq_d;
-          let a0v = a0_lo + tf * a0_d;
-          let a1v = a1_lo + tf * a1_d;
-          let b0v = b0_lo + tf * b0_d;
-          let b1v = b1_lo + tf * b1_d;
-          out[ti] = eqv * (a0v * b1v + a1v * b0v + lambda * (b0v * b1v));
-        }
-        out
+    for round in 0..k {
+      let h = a0.len() / 2;
+      let w = &suffix[round + 1];
+      debug_assert_eq!(w.len(), h);
+      let c = point[round];
+
+      // Accumulate h(0) and h(∞) (the quadratic coefficient of h).
+      let eval_at = |i: usize| -> [E::Scalar; 2] {
+        let a0d = a0[i + h] - a0[i];
+        let a1d = a1[i + h] - a1[i];
+        let b0d = b0[i + h] - b0[i];
+        let b1d = b1[i + h] - b1[i];
+        let g0 = a0[i] * b1[i] + a1[i] * b0[i] + lambda * (b0[i] * b1[i]);
+        let ginf = a0d * b1d + a1d * b0d + lambda * (b0d * b1d);
+        [w[i] * g0, w[i] * ginf]
       };
-      let add4 = |mut a: [E::Scalar; 4], b: [E::Scalar; 4]| {
-        for (x, y) in a.iter_mut().zip(b.iter()) {
-          *x += *y;
-        }
+      let add2 = |mut a: [E::Scalar; 2], b: [E::Scalar; 2]| {
+        a[0] += b[0];
+        a[1] += b[1];
         a
       };
-      let s = if h >= PAR_THRESHOLD {
+      let [h0, hinf] = if h >= PAR_THRESHOLD {
         (0..h)
           .into_par_iter()
-          .fold(|| [E::Scalar::ZERO; 4], |acc, i| add4(acc, eval_at(i)))
-          .reduce(|| [E::Scalar::ZERO; 4], add4)
+          .fold(|| [E::Scalar::ZERO; 2], |acc, i| add2(acc, eval_at(i)))
+          .reduce(|| [E::Scalar::ZERO; 2], add2)
       } else {
-        (0..h).fold([E::Scalar::ZERO; 4], |acc, i| add4(acc, eval_at(i)))
+        (0..h).fold([E::Scalar::ZERO; 2], |acc, i| add2(acc, eval_at(i)))
       };
+
+      // s(t) = E_pref·E(t)·h(t), E(t) = (1−t)(1−c) + t·c.
+      let e0 = e_pref * (E::Scalar::ONE - c);
+      let e1 = e_pref * c;
+      let s0 = e0 * h0;
+      let s1 = claim - s0;
+      // h(1) from the claim; direct evaluation as a (negligible-
+      // probability) fallback when E_pref·c isn't invertible.
+      let h1 = match Option::<E::Scalar>::from(e1.invert()) {
+        Some(e1_inv) => s1 * e1_inv,
+        None => {
+          let acc = |i: usize| {
+            w[i]
+              * (a0[i + h] * b1[i + h] + a1[i + h] * b0[i + h] + lambda * (b0[i + h] * b1[i + h]))
+          };
+          (0..h).fold(E::Scalar::ZERO, |s, i| s + acc(i))
+        }
+      };
+      // h(t) = h0 + b·t + c2·t².
+      let c2 = hinf;
+      let bq = h1 - h0 - c2;
+      let two = E::Scalar::from(2);
+      let three = E::Scalar::from(3);
+      let h2 = h0 + two * bq + E::Scalar::from(4) * c2;
+      let h3 = h0 + three * bq + E::Scalar::from(9) * c2;
+      let e2 = e_pref * (three * c - E::Scalar::ONE);
+      let e3 = e_pref * (E::Scalar::from(5) * c - two);
+      let s = [s0, s1, e2 * h2, e3 * h3];
+
       for v in &s {
         transcript.absorb(b"gkr_rp", v);
       }
       let ri = transcript.squeeze(b"gkr_chal")?;
-      bind_top(&mut eq, ri);
       bind_top(&mut a0, ri);
       bind_top(&mut a1, ri);
       bind_top(&mut b0, ri);
       bind_top(&mut b1, ri);
+      claim = eval_cubic::<E::Scalar>(&s, ri);
+      e_pref *= (E::Scalar::ONE - c) * (E::Scalar::ONE - ri) + c * ri;
       round_polys.push(s);
       challenges.push(ri);
     }
