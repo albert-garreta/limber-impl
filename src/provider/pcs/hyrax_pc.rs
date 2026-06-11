@@ -138,6 +138,170 @@ where
   ipa: InnerProductArgumentLinear<E>,
 }
 
+impl<E: Engine> HyraxPCS<E>
+where
+  E::GE: DlogGroupExt,
+  E::Scalar: TranscriptReprTrait,
+{
+  /// Prove openings of several `(commitment, poly, blind, point)` whose
+  /// points all share the same column coordinates (the last
+  /// `log2(num_cols)` entries): each polynomial's rows are eq-folded by
+  /// its own row point, the folded vectors are μ-RLC'd, and a SINGLE
+  /// inner-product argument proves `⟨Σ_j μ^j·LZ_j, R⟩ = Σ_j μ^j·y_j`
+  /// against `comm_eval` (a commitment to that combined value). The
+  /// caller is responsible for binding the per-item claimed values and μ
+  /// into the transcript beforehand.
+  #[allow(clippy::type_complexity)]
+  pub fn prove_same_column_batch(
+    ck: &HyraxCommitmentKey<E>,
+    ck_eval: &HyraxCommitmentKey<E>,
+    transcript: &mut impl ByteTranscript,
+    items: &[(
+      &HyraxCommitment<E>,
+      &[E::Scalar],
+      &HyraxBlind<E>,
+      Vec<E::Scalar>,
+    )],
+    mu: E::Scalar,
+    comm_eval: &HyraxCommitment<E>,
+    blind_eval: &HyraxBlind<E>,
+  ) -> Result<HyraxEvaluationArgument<E>, SpartanError> {
+    let num_cols = ck.num_cols;
+    let col_vars = num_cols.log_2();
+    let r_col = {
+      let p0 = &items[0].3;
+      p0[p0.len() - col_vars..].to_vec()
+    };
+    let r_vec = EqPolynomial::new(r_col.clone()).evals();
+
+    let mut lz_star = vec![E::Scalar::ZERO; num_cols];
+    let mut r_lz_star = E::Scalar::ZERO;
+    let mut mu_pow = E::Scalar::ONE;
+    for (comm, poly, blind, point) in items {
+      transcript.absorb(b"poly_com", *comm);
+      let n = poly.len();
+      if n != (2usize).pow(point.len() as u32)
+        || n < num_cols
+        || point[point.len() - col_vars..] != r_col[..]
+      {
+        return Err(SpartanError::InvalidInputLength {
+          reason: "same-column batch: point/size mismatch".to_string(),
+        });
+      }
+      let num_rows = div_ceil(n, num_cols);
+      let num_vars_rows = num_rows.log_2();
+      let (lz, r_lz) = if num_vars_rows == 0 {
+        (poly.to_vec(), blind.blind[0])
+      } else {
+        let l = EqPolynomial::new(point[..num_vars_rows].to_vec()).evals();
+        let lz = bind_with_delayed(poly, &l, num_cols);
+        let r_lz = l
+          .iter()
+          .zip(blind.blind.iter())
+          .map(|(li, b)| *li * *b)
+          .fold(E::Scalar::ZERO, |acc, x| acc + x);
+        (lz, r_lz)
+      };
+      for (o, v) in lz_star.iter_mut().zip(lz.iter()) {
+        *o += mu_pow * v;
+      }
+      r_lz_star += mu_pow * r_lz;
+      mu_pow *= mu;
+    }
+
+    let h_table = ck
+      .h_table
+      .get_or_init(|| FixedBaseMul::precompute(&ck.h, 8));
+    let comm_lz_star = E::GE::vartime_multiscalar_mul(&lz_star, &ck.ck[..lz_star.len()], true)?
+      + h_table.mul(&r_lz_star);
+
+    let ipa_instance = InnerProductInstance::<E>::new(&comm_lz_star, &r_vec, &comm_eval.comm[0]);
+    let ipa_witness = InnerProductWitness::<E>::new(&lz_star, &r_lz_star, &blind_eval.blind[0]);
+    let ipa = InnerProductArgumentLinear::<E>::prove(
+      &ck.ck,
+      &ck.h,
+      &ck_eval.ck[0],
+      &ck_eval.h,
+      &ipa_instance,
+      &ipa_witness,
+      transcript,
+    )?;
+    Ok(HyraxEvaluationArgument { ipa })
+  }
+
+  /// Verifier mirror of [`Self::prove_same_column_batch`]: all row folds
+  /// and the μ-RLC collapse into ONE multi-scalar multiplication over the
+  /// concatenated row commitments, followed by a single IPA verification.
+  pub fn verify_same_column_batch(
+    vk: &HyraxVerifierKey<E>,
+    ck_eval: &HyraxCommitmentKey<E>,
+    transcript: &mut impl ByteTranscript,
+    items: &[(&HyraxCommitment<E>, Vec<E::Scalar>)],
+    mu: E::Scalar,
+    comm_eval: &HyraxCommitment<E>,
+    arg: &HyraxEvaluationArgument<E>,
+  ) -> Result<(), SpartanError> {
+    let num_cols = vk.num_cols;
+    let col_vars = num_cols.log_2();
+    let r_col = {
+      let p0 = &items[0].1;
+      p0[p0.len() - col_vars..].to_vec()
+    };
+    let r_vec = EqPolynomial::new(r_col.clone()).evals();
+
+    // One MSM over all items' row commitments: scalars μ^j·L_j.
+    let mut scalars: Vec<E::Scalar> = Vec::new();
+    let mut bases = Vec::new();
+    let mut mu_pow = E::Scalar::ONE;
+    for (comm, point) in items {
+      transcript.absorb(b"poly_com", *comm);
+      let n = (2usize).pow(point.len() as u32);
+      if n < num_cols || point[point.len() - col_vars..] != r_col[..] {
+        return Err(SpartanError::InvalidInputLength {
+          reason: "same-column batch: point/size mismatch".to_string(),
+        });
+      }
+      let num_rows = div_ceil(n, num_cols);
+      if comm.comm.len() != num_rows {
+        return Err(SpartanError::InvalidCommitmentLength {
+          reason: "same-column batch: row count mismatch".to_string(),
+        });
+      }
+      let num_vars_rows = num_rows.log_2();
+      let l = if num_vars_rows == 0 {
+        vec![E::Scalar::ONE]
+      } else {
+        EqPolynomial::new(point[..num_vars_rows].to_vec()).evals()
+      };
+      scalars.extend(l.into_iter().map(|li| mu_pow * li));
+      bases.extend(comm.comm.iter().map(|c| c.affine()));
+      mu_pow *= mu;
+    }
+    let comm_lz_star = E::GE::vartime_multiscalar_mul(&scalars, &bases, true)?;
+
+    let ipa_instance = InnerProductInstance::<E>::new(&comm_lz_star, &r_vec, &comm_eval.comm[0]);
+    arg.ipa.verify(
+      &vk.ck,
+      &vk.h,
+      &ck_eval.ck[0],
+      &ck_eval.h,
+      r_vec.len(),
+      &ipa_instance,
+      transcript,
+    )
+  }
+
+  /// Number of matrix columns this key commits with.
+  pub fn key_num_cols(ck: &HyraxCommitmentKey<E>) -> usize {
+    ck.num_cols
+  }
+
+  /// Number of matrix columns this verifier key expects.
+  pub fn vk_num_cols(vk: &HyraxVerifierKey<E>) -> usize {
+    vk.num_cols
+  }
+}
+
 impl<E: Engine> PCSEngineTrait<E> for HyraxPCS<E>
 where
   E::GE: DlogGroupExt,

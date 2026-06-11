@@ -476,23 +476,38 @@ pub struct IntEvalArgument {
   /// all sharing one multiplicity table and one table-side GKR. See
   /// [`prove_shared_range_check`].
   pub(crate) range_check: SharedRangeCheck,
-  /// One batched multi-point opening per commitment, in canonical order:
+  /// ONE combined opening discharging every evaluation claim made
+  /// anywhere in the protocol, over all commitments in canonical order:
   /// the input `f`, the stacked layers `ab_1..ab_t`, the `1+2t` chunk
-  /// commitments, and the multiplicity table. Every evaluation claim made
-  /// anywhere in the protocol is discharged here.
-  pub(crate) batched_opens: Vec<BatchedOpen>,
+  /// commitments, and the multiplicity table.
+  pub(crate) combined_open: CombinedBatchOpen,
 }
 
-/// One batched multi-point opening: all claims `f(z_i) = y_i` against a
-/// single commitment are RLC-combined — `Σ_i λ^i·y_i = Σ_x f(x)·W(x)`
-/// with `W = Σ_i λ^i·eq(z_i,·)` — and reduced by one degree-2 sumcheck to
-/// a single Hyrax opening of `f` at the sumcheck challenge.
+/// ONE combined multi-point opening for ALL commitments of a Mod-PCS
+/// open. Per commitment, its claims are RLC-combined (`Σ_i λ^i·y_i =
+/// Σ_x f(x)·W(x)`); the per-commitment degree-2 sumchecks then run
+/// INTERLEAVED with shared, tail-aligned challenges (every round all
+/// active instances absorb their round polynomials before the one shared
+/// challenge is squeezed — shorter instances join late). Each
+/// commitment's final point is therefore the last `n_j` shared
+/// challenges, so all final points share the same column coordinates and
+/// the openings collapse into a single μ-RLC'd inner-product argument
+/// ([`HyraxPCS::prove_same_column_batch`]). Sub-column-width commitments
+/// (test sizes) fall back to individual opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchedOpen {
-  /// Degree-2 sumcheck on `f(x)·W(x)`, over the Hyrax base field.
-  pub(crate) sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
-  /// Opening of the commitment at the sumcheck challenge `r`.
-  pub(crate) f_open: SmallPrimeOpening,
+pub struct CombinedBatchOpen {
+  /// Per-commitment compressed sumcheck round polynomials, tail-aligned
+  /// to the shared challenge vector (entry `j` has `n_j` rounds).
+  pub(crate) round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<t256::Scalar>>>,
+  /// Per-commitment claimed final evaluation `f_j(r_j)`.
+  pub(crate) final_evals: Vec<t256::Scalar>,
+  /// The merged same-column opening (`f_y` is the μ-combined value
+  /// `Σ μ^pos·f_j(r_j)` over the merged commitments). `None` iff no
+  /// commitment reaches the column width.
+  pub(crate) merged: Option<SmallPrimeOpening>,
+  /// Individual fallback opens for sub-column-width commitments, in
+  /// canonical order.
+  pub(crate) small_opens: Vec<SmallPrimeOpening>,
 }
 
 /// Chunk width (bits) for the LogUp range checks: values are decomposed
@@ -1508,51 +1523,39 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       }
     }
 
-    // 8. Batched opens — one per commitment, canonical order: `f`, the
-    //    stacked layers, the chunk commitments, the multiplicity table.
+    // 8. ONE combined opening over all commitments, canonical order: `f`,
+    //    the stacked layers, the chunk commitments, the multiplicity
+    //    table. Interleaved tail-aligned sumchecks + a single merged
+    //    same-column IPA.
     let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
     let mut bsub = spawn_batch_subtranscript(transcript)?;
-    let mut batched_opens: Vec<BatchedOpen> = Vec::with_capacity(1 + t + (1 + 2 * t) + 1);
-    batched_opens.push(prove_batched_open(
-      &ck.inner,
-      &ck_eval.inner,
-      &mut bsub,
-      &comm.inner,
-      &poly_fq,
-      &blind.inner,
-      &f_claims,
-    )?);
+    let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &OpenClaims)> =
+      Vec::with_capacity(1 + t + (1 + 2 * t) + 1);
+    bo_targets.push((&comm.inner, poly_fq.as_slice(), &blind.inner, &f_claims));
     for j in 0..t_layers {
-      batched_opens.push(prove_batched_open(
-        &ck.inner,
-        &ck_eval.inner,
-        &mut bsub,
+      bo_targets.push((
         &ab_comms[j],
-        &ab_polys[j],
+        ab_polys[j].as_slice(),
         &ab_blinds[j],
         &ab_claims[j],
-      )?);
+      ));
     }
     for (bi, (chunk_fq, chunk_blind, claims)) in rc_art.chunk_data.iter().enumerate() {
-      batched_opens.push(prove_batched_open(
-        &ck.inner,
-        &ck_eval.inner,
-        &mut bsub,
+      bo_targets.push((
         &range_check.batches[bi].chunk_comm,
-        chunk_fq,
+        chunk_fq.as_slice(),
         chunk_blind,
         claims,
-      )?);
+      ));
     }
-    batched_opens.push(prove_batched_open(
-      &ck.inner,
-      &ck_eval.inner,
-      &mut bsub,
+    bo_targets.push((
       &range_check.mult_comm,
-      &rc_art.mult_fq,
+      rc_art.mult_fq.as_slice(),
       &rc_art.mult_blind,
       &rc_art.mult_claims,
-    )?);
+    ));
+    let combined_open =
+      prove_combined_batch_open(&ck.inner, &ck_eval.inner, &mut bsub, &bo_targets)?;
     info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
 
@@ -1562,7 +1565,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       chains,
       ab_comms,
       range_check,
-      batched_opens,
+      combined_open,
     })
   }
 
@@ -1845,56 +1848,39 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     }
     info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
 
-    // 6. Verify the batched opens — one per commitment, same canonical
-    //    order as the prover. Each enforces every collected claim.
+    // 6. Verify the ONE combined opening over all commitments, same
+    //    canonical order as the prover.
     let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
-    let expected_opens = 1 + t + (1 + 2 * t) + 1;
-    if arg.batched_opens.len() != expected_opens {
-      return Err(SpartanError::InvalidSumcheckProof);
-    }
     let mut bsub = spawn_batch_subtranscript(transcript)?;
-    let mut bo_iter = arg.batched_opens.iter();
-    verify_batched_open(
-      &vk.inner,
-      &ck_eval.inner,
-      &mut bsub,
-      &comm.inner,
-      num_vars,
-      &f_claims,
-      bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
-    )?;
-    for (j, (ab_comm, claims)) in arg.ab_comms.iter().zip(ab_claims.iter()).enumerate() {
+    let mut bo_targets: Vec<(
+      &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+      usize,
+      &OpenClaims,
+    )> = Vec::with_capacity(1 + t + (1 + 2 * t) + 1);
+    bo_targets.push((&comm.inner, num_vars, &f_claims));
+    for (j, ab_comm) in arg.ab_comms.iter().enumerate() {
       let m_vars = num_vars - (j + 1) * params.k;
-      verify_batched_open(
-        &vk.inner,
-        &ck_eval.inner,
-        &mut bsub,
-        ab_comm,
-        1 + log_spad + m_vars,
-        claims,
-        bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
-      )?;
+      bo_targets.push((ab_comm, 1 + log_spad + m_vars, &ab_claims[j]));
     }
     for (bi, meta) in rc_metas.iter().enumerate() {
       let d = BatchDims::new(meta.num_polys, meta.n_values, meta.log_bound);
-      verify_batched_open(
-        &vk.inner,
-        &ck_eval.inner,
-        &mut bsub,
+      bo_targets.push((
         &arg.range_check.batches[bi].chunk_comm,
         ceil_log2(d.n_chunks.max(1)),
         &rc_claims.chunk_claims[bi],
-        bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
-      )?;
+      ));
     }
-    verify_batched_open(
-      &vk.inner,
-      &ck_eval.inner,
-      &mut bsub,
+    bo_targets.push((
       &arg.range_check.mult_comm,
       CHUNK_BITS,
       &rc_claims.mult_claims,
-      bo_iter.next().ok_or(SpartanError::InvalidSumcheckProof)?,
+    ));
+    verify_combined_batch_open(
+      &vk.inner,
+      &ck_eval.inner,
+      &mut bsub,
+      &bo_targets,
+      &arg.combined_open,
     )?;
     info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
 
@@ -2180,70 +2166,278 @@ fn absorb_batch_claims(
   }
 }
 
-/// Prove one batched multi-point opening: RLC-combine all claims
-/// `f(z_i) = y_i` (`Σ_i λ^i·y_i = Σ_x f(x)·W(x)`, `W = Σ_i λ^i·eq(z_i,·)`)
-/// and reduce by one degree-2 sumcheck to a single Hyrax opening at the
-/// sumcheck challenge.
-fn prove_batched_open(
+/// Prove the combined multi-point opening (see [`CombinedBatchOpen`]).
+/// `targets` are `(commitment, poly, blind, claims)` in canonical order.
+fn prove_combined_batch_open(
   ck: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  poly_fq: &[t256::Scalar],
-  blind: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-  claims: &OpenClaims,
-) -> Result<BatchedOpen, SpartanError> {
-  debug_assert!(!claims.points.is_empty());
-  absorb_batch_claims(sub, comm, claims);
-  let lambda = sub.squeeze(b"bo_lambda")?;
-  let (w, claim) = batch_weight(&claims.points, &claims.evals, lambda, poly_fq.len());
-  let num_vars = poly_fq.len().trailing_zeros() as usize;
-  let mut poly_f = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.to_vec());
-  let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(w);
-  let (sumcheck, r, _claims) = crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
-    &claim,
-    num_vars,
-    &mut poly_f,
-    &mut poly_w,
-    sub,
-  )?;
-  let f_open = hyrax_open_at(ck, ck_eval, sub, comm, poly_fq, blind, &r)?;
-  Ok(BatchedOpen { sumcheck, f_open })
+  targets: &[(
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+    &[t256::Scalar],
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+    &OpenClaims,
+  )],
+) -> Result<CombinedBatchOpen, SpartanError> {
+  use crate::polys::univariate::UniPoly;
+  let m = targets.len();
+
+  // 1. Per commitment: bind claims, squeeze λ, build W and the combined
+  //    running claim.
+  let mut fs = Vec::with_capacity(m);
+  let mut ws = Vec::with_capacity(m);
+  let mut run = Vec::with_capacity(m);
+  let mut nv = Vec::with_capacity(m);
+  for (comm, poly, _, claims) in targets {
+    debug_assert!(!claims.points.is_empty());
+    absorb_batch_claims(sub, comm, claims);
+    let lambda = sub.squeeze(b"bo_lambda")?;
+    let (w, c) = batch_weight(&claims.points, &claims.evals, lambda, poly.len());
+    fs.push(crate::polys::multilinear::MultilinearPolynomial::new(
+      poly.to_vec(),
+    ));
+    ws.push(crate::polys::multilinear::MultilinearPolynomial::new(w));
+    run.push(c);
+    nv.push(poly.len().trailing_zeros() as usize);
+  }
+  let n_max = *nv.iter().max().expect("non-empty targets");
+
+  // 2. Interleaved, tail-aligned sumcheck rounds: per global round, all
+  //    active instances absorb their round polynomial, then ONE shared
+  //    challenge is squeezed and binds them all.
+  let mut round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<t256::Scalar>>> =
+    vec![Vec::new(); m];
+  let mut challenges: Vec<t256::Scalar> = Vec::with_capacity(n_max);
+  for g in 0..n_max {
+    let mut staged: Vec<(usize, UniPoly<t256::Scalar>)> = Vec::new();
+    for j in 0..m {
+      if g < n_max - nv[j] {
+        continue; // joins later
+      }
+      let len = fs[j].Z.len();
+      let h = len / 2;
+      let (e0, e2) = if h >= 1 << 12 {
+        (0..h)
+          .into_par_iter()
+          .map(|i| {
+            let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
+            let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
+            (f0 * w0, (f1 + f1 - f0) * (w1 + w1 - w0))
+          })
+          .reduce(
+            || (t256::Scalar::ZERO, t256::Scalar::ZERO),
+            |a, b| (a.0 + b.0, a.1 + b.1),
+          )
+      } else {
+        let mut e0 = t256::Scalar::ZERO;
+        let mut e2 = t256::Scalar::ZERO;
+        for i in 0..h {
+          let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
+          let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
+          e0 += f0 * w0;
+          e2 += (f1 + f1 - f0) * (w1 + w1 - w0);
+        }
+        (e0, e2)
+      };
+      let uni = UniPoly::from_evals(&[e0, run[j] - e0, e2])?;
+      sub.absorb(b"cbo_p", &uni);
+      staged.push((j, uni));
+    }
+    let r_g = sub.squeeze(b"cbo_c")?;
+    for (j, uni) in staged {
+      run[j] = uni.evaluate(&r_g);
+      round_polys[j].push(uni.compress());
+      fs[j].bind_poly_var_top(&r_g);
+      ws[j].bind_poly_var_top(&r_g);
+    }
+    challenges.push(r_g);
+  }
+
+  // 3. Send the per-commitment final evaluations, then μ.
+  let final_evals: Vec<t256::Scalar> = fs.iter().map(|f| f[0]).collect();
+  for y in &final_evals {
+    sub.absorb_bytes(b"cbo_fe", y.to_repr().as_ref());
+  }
+  let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
+  let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
+
+  // 4. Merge every column-width-or-larger commitment into ONE same-column
+  //    IPA; open the rest (test sizes) individually.
+  let width = Hyrax::key_num_cols(ck);
+  let mut small_opens = Vec::new();
+  let mut big_items: Vec<(
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+    &[t256::Scalar],
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+    Vec<t256::Scalar>,
+  )> = Vec::new();
+  let mut y_star = t256::Scalar::ZERO;
+  let mut mu_pow = t256::Scalar::ONE;
+  for (j, (comm, poly, blind, _)) in targets.iter().enumerate() {
+    let r_j = challenges[n_max - nv[j]..].to_vec();
+    if poly.len() >= width {
+      y_star += mu_pow * final_evals[j];
+      mu_pow *= mu;
+      big_items.push((comm, poly, blind, r_j));
+    } else {
+      small_opens.push(hyrax_open_at(ck, ck_eval, sub, comm, poly, blind, &r_j)?);
+    }
+  }
+  let merged = if big_items.is_empty() {
+    None
+  } else {
+    let blind_eval = Hyrax::blind(ck_eval, 1);
+    let comm_eval = Hyrax::commit(ck_eval, &[y_star], &blind_eval, false)?;
+    let arg =
+      Hyrax::prove_same_column_batch(ck, ck_eval, sub, &big_items, mu, &comm_eval, &blind_eval)?;
+    Some(SmallPrimeOpening {
+      f_y: y_star,
+      blind_eval,
+      hyrax_arg: arg,
+    })
+  };
+
+  Ok(CombinedBatchOpen {
+    round_polys,
+    final_evals,
+    merged,
+    small_opens,
+  })
 }
 
-/// Verify one batched multi-point opening against `claims`, with the
-/// commitment's variable count pinned to `num_vars`. The verifier
-/// recomputes `W(r) = Σ_i λ^i·eq(z_i, r)` in closed form (O(#claims·n)).
-fn verify_batched_open(
+/// Verifier mirror of [`prove_combined_batch_open`]. `targets` are
+/// `(commitment, num_vars, claims)` in canonical order; every claim's
+/// point length is pinned to its commitment's variable count.
+fn verify_combined_batch_open(
   vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
   ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-  num_vars: usize,
-  claims: &OpenClaims,
-  arg: &BatchedOpen,
+  targets: &[(
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+    usize,
+    &OpenClaims,
+  )],
+  arg: &CombinedBatchOpen,
 ) -> Result<(), SpartanError> {
-  if claims.points.is_empty() || claims.points.iter().any(|z| z.len() != num_vars) {
+  let m = targets.len();
+  if arg.round_polys.len() != m || arg.final_evals.len() != m {
     return Err(SpartanError::InvalidSumcheckProof);
   }
-  absorb_batch_claims(sub, comm, claims);
-  let lambda = sub.squeeze(b"bo_lambda")?;
-  let mut claim = t256::Scalar::ZERO;
-  let mut lam_pow = t256::Scalar::ONE;
-  for y in &claims.evals {
-    claim += lam_pow * y;
-    lam_pow *= lambda;
+  let mut lambdas = Vec::with_capacity(m);
+  let mut run = Vec::with_capacity(m);
+  let mut nv = Vec::with_capacity(m);
+  for (j, (comm, num_vars, claims)) in targets.iter().enumerate() {
+    if claims.points.is_empty() || claims.points.iter().any(|z| z.len() != *num_vars) {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    if arg.round_polys[j].len() != *num_vars {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    absorb_batch_claims(sub, comm, claims);
+    let lambda = sub.squeeze(b"bo_lambda")?;
+    let mut c = t256::Scalar::ZERO;
+    let mut lam_pow = t256::Scalar::ONE;
+    for y in &claims.evals {
+      c += lam_pow * y;
+      lam_pow *= lambda;
+    }
+    lambdas.push(lambda);
+    run.push(c);
+    nv.push(*num_vars);
   }
-  let (final_claim, r) = arg.sumcheck.verify(claim, num_vars, 2, sub)?;
-  hyrax_verify_open(vk, ck_eval, sub, comm, &r, &arg.f_open)?;
-  let mut w_at_r = t256::Scalar::ZERO;
-  let mut lam_pow = t256::Scalar::ONE;
-  for z in &claims.points {
-    w_at_r += lam_pow * EqPolynomial::<t256::Scalar>::new(z.clone()).evaluate(&r);
-    lam_pow *= lambda;
+  let n_max = *nv.iter().max().expect("non-empty targets");
+
+  let mut challenges: Vec<t256::Scalar> = Vec::with_capacity(n_max);
+  for g in 0..n_max {
+    let mut staged: Vec<(usize, crate::polys::univariate::UniPoly<t256::Scalar>)> = Vec::new();
+    for j in 0..m {
+      if g < n_max - nv[j] {
+        continue;
+      }
+      let uni = arg.round_polys[j][g - (n_max - nv[j])].decompress(&run[j]);
+      if uni.degree() != 2 {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+      sub.absorb(b"cbo_p", &uni);
+      staged.push((j, uni));
+    }
+    let r_g = sub.squeeze(b"cbo_c")?;
+    for (j, uni) in staged {
+      run[j] = uni.evaluate(&r_g);
+    }
+    challenges.push(r_g);
   }
-  if final_claim != arg.f_open.f_y * w_at_r {
+
+  // Final sumcheck checks: run_j == f_j(r_j)·W_j(r_j), with W_j(r_j)
+  // recomputed in closed form.
+  for (j, (_, _, claims)) in targets.iter().enumerate() {
+    let r_j = &challenges[n_max - nv[j]..];
+    let mut w_at_r = t256::Scalar::ZERO;
+    let mut lam_pow = t256::Scalar::ONE;
+    for z in &claims.points {
+      w_at_r += lam_pow * EqPolynomial::<t256::Scalar>::new(z.clone()).evaluate(r_j);
+      lam_pow *= lambdas[j];
+    }
+    if run[j] != arg.final_evals[j] * w_at_r {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+  }
+
+  for y in &arg.final_evals {
+    sub.absorb_bytes(b"cbo_fe", y.to_repr().as_ref());
+  }
+  let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
+  let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
+
+  let width = Hyrax::vk_num_cols(vk);
+  let mut small_iter = arg.small_opens.iter();
+  let mut big_items: Vec<(
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+    Vec<t256::Scalar>,
+  )> = Vec::new();
+  let mut y_star = t256::Scalar::ZERO;
+  let mut mu_pow = t256::Scalar::ONE;
+  for (j, (comm, num_vars, _)) in targets.iter().enumerate() {
+    let r_j = challenges[n_max - nv[j]..].to_vec();
+    if (1usize << num_vars) >= width {
+      y_star += mu_pow * arg.final_evals[j];
+      mu_pow *= mu;
+      big_items.push((comm, r_j));
+    } else {
+      let open = small_iter
+        .next()
+        .ok_or(SpartanError::InvalidSumcheckProof)?;
+      hyrax_verify_open(vk, ck_eval, sub, comm, &r_j, open)?;
+      if open.f_y != arg.final_evals[j] {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+    }
+  }
+  if small_iter.next().is_some() {
     return Err(SpartanError::InvalidSumcheckProof);
+  }
+  if big_items.is_empty() {
+    if arg.merged.is_some() {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+  } else {
+    let merged = arg
+      .merged
+      .as_ref()
+      .ok_or(SpartanError::InvalidSumcheckProof)?;
+    if merged.f_y != y_star {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    let comm_eval = Hyrax::commit(ck_eval, &[merged.f_y], &merged.blind_eval, false)?;
+    Hyrax::verify_same_column_batch(
+      vk,
+      ck_eval,
+      sub,
+      &big_items,
+      mu,
+      &comm_eval,
+      &merged.hyrax_arg,
+    )?;
   }
   Ok(())
 }
@@ -3410,7 +3604,7 @@ mod tests {
 
     // Tampering a batched open's final evaluation must be rejected.
     let mut bad = arg.clone();
-    bad.batched_opens[0].f_open.f_y += t256::Scalar::ONE;
+    bad.combined_open.final_evals[0] += t256::Scalar::ONE;
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
       <MP as ModPCSEngineTrait<ME>>::verify(
