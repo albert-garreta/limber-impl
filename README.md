@@ -7,10 +7,6 @@ integer moduli — built as a fork of
 implements the protocol from the accompanying *SNARKs for Integers*
 paper (Def. 5.4) on top of Spartan's sum-check pipeline.
 
-**Status:** research code. Not audited, not constant-time, and the
-integer witness handling currently assumes non-negative bounded
-values. Use for benchmarking and experimentation only.
-
 ## Why integer Mod-R1CS
 
 Standard R1CS forces all arithmetic into one fixed prime field, so a
@@ -26,40 +22,6 @@ A·z ∘ B·z = C·z + m ∘ q        (over Z, with bounded norms)
 so one row *is* one modular multiplication `LC_A · LC_B ≡ LC_C (mod m_i)`,
 regardless of how wide `m_i` is. The sum-check is then run modulo a
 random prime `p` sampled by the verifier via Fiat–Shamir.
-
-## What's implemented
-
-The integer-proving work is staged; both phases live side by side:
-
-- **Phase 1 — [`imod_spartan`](src/imod_spartan.rs) over
-  [`imod_r1cs`](src/imod_r1cs/mod.rs).** The IntMod-R1CS relation
-  proved entirely in the curve scalar field (`p = q`). Single witness
-  segment, no limb decomposition, no range checks — the simplest
-  version that exercises every structural change relative to plain
-  Spartan.
-
-- **Phase 2 — [`imod_spartan_modp`](src/imod_spartan_modp.rs) over
-  [`imod_r1cs_modp`](src/imod_r1cs_modp/mod.rs).** Shapes, witnesses,
-  and matrix entries are integer-valued (`BigUint`); the sum-check
-  prime `p` is sampled from the transcript by Miller–Rabin rejection
-  sampling and the protocol runs in the runtime-modulus field
-  [`DynPrime`](src/dyn_prime.rs). The driver is generic over a
-  `ModEngine` whose **Mod-PCS** commits integer polynomials and opens
-  them at `Z_p` points (current instantiation:
-  [`integer_modpcs`](src/provider/pcs/integer_modpcs.rs) with the
-  `T256DynPrimeEngine` provider). A parallel sum-check / polynomial
-  stack ([`sumcheck_modp`](src/sumcheck_modp.rs),
-  [`polys_modp/`](src/polys_modp/)) keeps this independent of the
-  field-generic code paths.
-
-- **[`logup_gkr`](src/logup_gkr.rs)** — a LogUp-GKR range proof
-  (fractional-sum GKR over the logarithmic-derivative lookup identity)
-  for `[0, 2^bits)` range checks, reduced to two PCS openings.
-
-Planned next phases (dual fields `p ≠ q` end-to-end, limb-split with
-range checks pushed into the PCS) are tracked in
-[docs/imod_r1cs_plan.md](docs/imod_r1cs_plan.md) and
-[docs/imod_followups.md](docs/imod_followups.md).
 
 ## The base library
 
@@ -124,14 +86,6 @@ Measured results and analysis are logged in
 [Spartan: Efficient and general-purpose zkSNARKs without trusted setup](https://eprint.iacr.org/2019/550) \
 Srinath Setty \
 CRYPTO 2020
-
-[NeutronNova: Folding everything that reduces to zero-check](https://eprint.iacr.org/2024/1606) \
-Abhiram Kothapalli, Srinath Setty \
-IACR ePrint 2024/1606
-
-[Vega: Low-latency zero-knowledge proofs over existing credentials](https://eprint.iacr.org/2025/2094) \
-Darya Kaviani, Srinath Setty \
-IEEE S&P 2026
 
 [Scaling Verifiable Computation Using Efficient Set Accumulators](https://eprint.iacr.org/2019/1494) \
 Alex Ozdemir, Riad S. Wahby, Barry Whitehat, Dan Boneh \
