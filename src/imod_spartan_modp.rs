@@ -781,6 +781,109 @@ mod tests {
     proof.verify(&vk, &U).unwrap();
   }
 
+  /// Wired circuit: the output of row 0 feeds into the input of row 1.
+  /// w[2] is shared between C of row 0 and A of row 1.
+  #[test]
+  fn imod_modp_wired_two_row_roundtrip() {
+    let one = BigUint::from(1u32);
+    let num_cons = 4usize;
+    let num_vars = 8usize;
+    let num_io = 0usize;
+
+    // Row 0: w[0]*w[1] = w[2] (mod 14) → 3*5 = 15 = 1 + 14*1
+    // Row 1: w[2]*w[3] = w[4] (mod 14) → 1*4 =  4 = 4 + 14*0
+    // w[2] is SHARED: output of row 0, input to row 1.
+    let mat_a = vec![(0, 0, one.clone()), (1, 2, one.clone())];
+    let mat_b = vec![(0, 1, one.clone()), (1, 3, one.clone())];
+    let mat_c = vec![(0, 2, one.clone()), (1, 4, one.clone())];
+    let mods = vec![
+      BigUint::from(14u32),
+      BigUint::from(14u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+    ];
+
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+        .unwrap();
+
+    let w: Vec<BigUint> = [3u32, 5, 1, 4, 4, 0, 0, 0]
+      .iter()
+      .map(|x| BigUint::from(*x))
+      .collect();
+    let q: Vec<BigUint> = [1u32, 0, 0, 0].iter().map(|x| BigUint::from(*x)).collect();
+
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &instance, &witness).unwrap();
+
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+  }
+
+  /// Wired circuit at 2048-bit width with setup_with_params, matching the
+  /// multiswap_modp bench configuration: RSA-2048 modulus, numlimb=64.
+  #[test]
+  fn imod_modp_wired_rsa2048_roundtrip() {
+    use crate::provider::pcs::integer_modpcs::IntEvalParams;
+    use num_integer::Integer;
+
+    let one = BigUint::from(1u32);
+    let n_hex = "c7970ceedcc3b0754490201a7aa613cd73911081c790f5f1a8726f463550bb5b\
+                 7ff0db8e1ea1189ec72f93d1650011bd721aeeacc2acde32a04107f0648c2813\
+                 a31f5b0b7765ff8b44b4b6ffc93384b646eb09c7cf5e8592d40ea33c80039f35\
+                 b4f14a04b51f7bfd781be4d1673164ba8eb991c2c4d730bbbe35f592bdef524a\
+                 f7e8daefd26c66fc02c479af89d64d373f442709439de66ceb955f3ea37d5159\
+                 f6135809f85334b5cb1813addc80cd05609f10ac6a95ad65872c909525bdad32\
+                 bc729592642920f24c61dc5b3c3b7923e56b16a4d9d373d8721f24a3fc0f1b31\
+                 31f55615172866bccc30f95054c824e733a5eb6817f7bc16399d48c6361cc7e5";
+    let n = BigUint::parse_bytes(n_hex.as_bytes(), 16).unwrap();
+
+    let num_cons = 4usize;
+    let num_vars = 8usize;
+    let num_io = 0usize;
+
+    // Row 0: w[0]*w[1] = w[2] (mod N)
+    // Row 1: w[2]*w[3] = w[4] (mod N) — w[2] is SHARED (wired)
+    let mat_a = vec![(0, 0, one.clone()), (1, 2, one.clone())];
+    let mat_b = vec![(0, 1, one.clone()), (1, 3, one.clone())];
+    let mat_c = vec![(0, 2, one.clone()), (1, 4, one.clone())];
+    let mods = vec![n.clone(), n.clone(), BigUint::from(2u32), BigUint::from(2u32)];
+
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
+        .unwrap();
+
+    // a0, b0 close to N; c0 = a0*b0 mod N; then c0*b1 mod N.
+    let a0 = &n - BigUint::from(3u32);
+    let b0 = &n - BigUint::from(7u32);
+    let prod0 = &a0 * &b0;
+    let (q0, c0) = prod0.div_rem(&n);
+    let b1 = &n - BigUint::from(11u32);
+    let prod1 = &c0 * &b1;
+    let (q1, c1) = prod1.div_rem(&n);
+
+    let mut w: Vec<BigUint> = vec![BigUint::from(0u32); num_vars];
+    w[0] = a0;
+    w[1] = b0;
+    w[2] = c0;
+    w[3] = b1;
+    w[4] = c1;
+    let q: Vec<BigUint> = vec![q0, q1, BigUint::from(0u32), BigUint::from(0u32)];
+
+    let log_n = (num_vars.max(num_cons) as u64).ilog2() as usize;
+    let params = IntEvalParams::derive(2048, 32, 10, log_n).unwrap();
+
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &instance, &witness).unwrap();
+
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+  }
+
   /// End-to-end SNARK roundtrip that triggers the IntEval partial-eval
   /// iteration path (step C) on the W open. With `num_vars = 256`, the
   /// Mod-PCS opens W at a point of length `log_2(256) = 8 > k = 7`

@@ -20,10 +20,11 @@
 //! representation is a single imod row here. This bench measures exactly
 //! that collapse.
 //!
-//! Fidelity (see docs/multiswap_modp_bench_plan.md): the arithmetic
-//! **core** is real — real RSA-2048 `N`, a real 352-bit `ℓ`, real values
-//! < the row modulus, correct quotients — so the Phase-3 D5 range checks
-//! run at true ~2048-bit width (numlimb ≈ 64). The hashes (`H`, `Hp`,
+//! Fidelity (see docs/multiswap_modp_bench_plan.md): the 4 group
+//! exponentiations are **real wired square-and-multiply chains** with
+//! witness exponents, bit decomposition, and reconstruction constraints.
+//! The bases are fixed constants baked into matrix coefficients (avoiding
+//! a degree-3 conditional-multiply decomposition). The hashes (`H`, `Hp`,
 //! `H∆`) and RSA group structure are *modeled by operation count*, not
 //! faithful crypto circuits, and are flagged as such.
 //!
@@ -51,71 +52,66 @@ use tracing_subscriber::EnvFilter;
 
 type M = T256DynPrimeEngine;
 
-/// Limb bound (bits) for the IntEval range checks. Smaller limbs keep the
-/// Partial-Eval-Norm ceiling on `log P` high at the cost of more limbs
-/// (`numlimb = ⌈log_t_f / log_t⌉`); see the bound discussion in
-/// docs/multiswap_modp_bench_plan.md.
+/// Limb bound (bits) for the IntEval range checks.
 const LOG_T: usize = 32;
 
-/// Base-hash model: imod rows charged per `H` invocation. The base hash
-/// is field arithmetic mod a fixed prime; in the imod metric it does *not*
-/// blow up (unlike the paper's F_p limb-split representation). This is a
-/// modeling knob, not a faithful Poseidon circuit.
+/// Base-hash model: imod rows charged per `H` invocation.
 const H_ROWS: usize = 8;
 
-/// Hash-to-prime (`Hp`) / Pocklington model: imod rows for the prime
-/// challenge generation, charged once per MultiSwap proof. Modeled at
-/// `ℓ`-width (the dominant final Pocklington exponentiation is mod a
-/// ~322-bit prime).
+/// Hash-to-prime (`Hp`) / Pocklington model rows.
 const HP_ROWS: usize = 600;
 
-/// Number of group exponentiations per MultiSwap proof (paper Fig. 3:
-/// `4·c_eG(|ℓ|)`): ⟦S⟧^e_ins, Q_ins^ℓ, ⟦S'⟧^e_rm, Q_rm^ℓ.
+/// Number of group exponentiations per MultiSwap proof.
 const N_GROUP_EXPS: usize = 4;
-/// Group mults per MultiSwap proof (paper Fig. 3: `2·c_×G`).
+/// Group mults per MultiSwap proof.
 const N_GROUP_MULS: usize = 2;
 
-/// Per-exponentiation modular-multiply count for a `|ℓ|`-bit exponent via
-/// square-and-multiply (`≈ 1.5·|ℓ|`: |ℓ| squarings + ~|ℓ|/2 multiplies).
-fn exp_len(ell_bits: usize) -> usize {
-  ell_bits + ell_bits / 2
-}
+/// Exponent bit-length for the Fiat-Shamir prime challenge `ℓ`.
+const ELL_BITS: usize = 352;
 
-/// Structural dimensions of the modeled MultiSwap circuit. Pulled into a
-/// struct so the smoke test can shrink every axis while exercising the
-/// identical (real 2048-bit) arithmetic path.
 #[derive(Clone, Copy)]
 struct Dims {
-  /// Batch size (number of swaps).
   k: usize,
-  /// Modular multiplies per group exponentiation.
-  exp_len: usize,
-  /// Number of group exponentiations (mod N).
+  ell_bits: usize,
   n_group_exps: usize,
-  /// Group mults (mod N).
   n_group_muls: usize,
-  /// Hash-to-prime model rows (mod ℓ).
   hp_rows: usize,
-  /// Base-hash model rows per invocation (mod p_hash).
   h_rows: usize,
 }
 
 impl Dims {
-  /// Real MultiSwap profile for batch size `k`, with `|ℓ| = 352`.
   fn multiswap(k: usize) -> Self {
     Self {
       k,
-      exp_len: exp_len(352),
+      ell_bits: ELL_BITS,
       n_group_exps: N_GROUP_EXPS,
       n_group_muls: N_GROUP_MULS,
       hp_rows: HP_ROWS,
       h_rows: H_ROWS,
     }
   }
+
+  fn rows_per_exp(&self) -> usize {
+    3 * self.ell_bits + 1
+  }
+
+  fn cols_per_exp(&self) -> usize {
+    3 * self.ell_bits + 1
+  }
+
+  fn non_exp_rows(&self) -> usize {
+    self.n_group_muls + self.hp_rows + (2 * self.k + 1) + 2 * self.k * self.h_rows
+  }
+
+  fn num_real_rows(&self) -> usize {
+    self.n_group_exps * self.rows_per_exp() + self.non_exp_rows()
+  }
+
+  fn num_real_cols(&self) -> usize {
+    self.n_group_exps * self.cols_per_exp() + 3 * self.non_exp_rows()
+  }
 }
 
-/// RSA-2048 challenge number `N` (paper Appendix B) — the ~2048-bit group
-/// modulus for the `mod N` group operations.
 fn modulus_n() -> BigUint {
   let hex = "c7970ceedcc3b0754490201a7aa613cd73911081c790f5f1a8726f463550bb5b\
              7ff0db8e1ea1189ec72f93d1650011bd721aeeacc2acde32a04107f0648c2813\
@@ -128,127 +124,253 @@ fn modulus_n() -> BigUint {
   BigUint::parse_bytes(hex.as_bytes(), 16).expect("valid RSA-2048 hex")
 }
 
-/// A real 352-bit modulus modeling the Fiat-Shamir prime challenge `ℓ`.
-/// The IntMod-R1CS relation `a·b = c + m·q` is valid for any modulus, so
-/// `ℓ` need not be prime here — only its ~352-bit width matters for the
-/// range-check cost.
 fn modulus_ell() -> BigUint {
-  // 44 bytes = 352 bits, value 0xC3C3…C3 (odd: low byte 0xC3).
   BigUint::from_bytes_be(&[0xc3u8; 44])
 }
 
-/// BLS12-381 scalar field prime (paper Appendix B) — the ~255-bit field
-/// modeling the base hash `H`'s arithmetic.
 fn modulus_p_hash() -> BigUint {
   let hex = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
   BigUint::parse_bytes(hex.as_bytes(), 16).expect("valid BLS12-381 scalar hex")
 }
 
-/// Build the per-row modulus list for the modeled MultiSwap circuit, in a
-/// fixed canonical order: group exponentiations (mod N), group mults
-/// (mod N), Hp/Pocklington (mod ℓ), per-swap ∏H∆ reductions (mod ℓ), the
-/// one ∆-reduction (mod ℓ), then the base-hash blocks (mod p_hash).
-fn multiswap_row_moduli(d: Dims) -> Vec<BigUint> {
+fn exp_bases() -> [BigUint; 4] {
+  let n = modulus_n();
+  core::array::from_fn(|i| &n - BigUint::from(37u64 * i as u64 + 3))
+}
+
+fn exp_exponents(ell_bits: usize) -> [BigUint; 4] {
+  core::array::from_fn(|i| {
+    let seed = (i as u64 + 1) * 0x0123_4567_89AB_CDEFu64;
+    let mut bytes = vec![0u8; (ell_bits + 7) / 8];
+    for (k, b) in bytes.iter_mut().enumerate() {
+      *b = ((seed.wrapping_mul(k as u64 + 1).wrapping_add(0xDEAD)) & 0xFF) as u8;
+    }
+    if ell_bits % 8 != 0 {
+      bytes[0] &= (1u8 << (ell_bits % 8)) - 1;
+    }
+    let msb_byte = (ell_bits - 1) / 8;
+    let msb_bit = (ell_bits - 1) % 8;
+    let msb_idx = bytes.len() - 1 - msb_byte;
+    bytes[msb_idx] |= 1u8 << msb_bit;
+    BigUint::from_bytes_be(&bytes)
+  })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_exp_circuit(
+  base: &BigUint,
+  exponent: &BigUint,
+  n: &BigUint,
+  ell_bits: usize,
+  row_base: usize,
+  col_base: usize,
+  const_col: usize,
+  a_entries: &mut Vec<(usize, usize, BigUint)>,
+  b_entries: &mut Vec<(usize, usize, BigUint)>,
+  c_entries: &mut Vec<(usize, usize, BigUint)>,
+  mods: &mut Vec<BigUint>,
+  w: &mut [BigUint],
+  q: &mut [BigUint],
+) -> usize {
+  let one = BigUint::from(1u32);
+  let g_minus_1 = base - &one;
+
+  let bit_col = |j: usize| col_base + j;
+  let exp_col = col_base + ell_bits;
+  let acc_col = |j: usize| col_base + ell_bits + 1 + j;
+  let sq_col = |j: usize| col_base + 2 * ell_bits + 1 + j;
+
+  let bits: Vec<u8> = (0..ell_bits)
+    .map(|j| {
+      let bit_pos = ell_bits - 1 - j;
+      u8::from(exponent.bit(bit_pos as u64))
+    })
+    .collect();
+
+  for j in 0..ell_bits {
+    w[bit_col(j)] = BigUint::from(bits[j]);
+  }
+  w[exp_col] = exponent.clone();
+
+  let mut row = row_base;
+  for j in 0..ell_bits {
+    let acc_val = if j == 0 {
+      one.clone()
+    } else {
+      w[acc_col(j - 1)].clone()
+    };
+
+    // Square row
+    let sq_prod = &acc_val * &acc_val;
+    let (sq_q, sq_val) = sq_prod.div_rem(n);
+    w[sq_col(j)] = sq_val.clone();
+    q[row] = sq_q;
+
+    let acc_j_col = if j == 0 { const_col } else { acc_col(j - 1) };
+    a_entries.push((row, acc_j_col, one.clone()));
+    b_entries.push((row, acc_j_col, one.clone()));
+    c_entries.push((row, sq_col(j), one.clone()));
+    mods.push(n.clone());
+    row += 1;
+
+    // Conditional-multiply row
+    let b_val = BigUint::from(bits[j]) * &g_minus_1 + &one;
+    let cm_prod = &sq_val * &b_val;
+    let (cm_q, acc_next) = cm_prod.div_rem(n);
+    w[acc_col(j)] = acc_next;
+    q[row] = cm_q;
+
+    a_entries.push((row, sq_col(j), one.clone()));
+    b_entries.push((row, bit_col(j), g_minus_1.clone()));
+    b_entries.push((row, const_col, one.clone()));
+    c_entries.push((row, acc_col(j), one.clone()));
+    mods.push(n.clone());
+    row += 1;
+  }
+
+  // Binary constraints
+  for j in 0..ell_bits {
+    a_entries.push((row, bit_col(j), one.clone()));
+    b_entries.push((row, bit_col(j), one.clone()));
+    c_entries.push((row, bit_col(j), one.clone()));
+    q[row] = BigUint::from(0u32);
+    mods.push(n.clone());
+    row += 1;
+  }
+
+  // Reconstruction
+  for j in 0..ell_bits {
+    let power = BigUint::from(1u32) << (ell_bits - 1 - j);
+    a_entries.push((row, bit_col(j), power));
+  }
+  b_entries.push((row, const_col, one.clone()));
+  c_entries.push((row, exp_col, one.clone()));
+  q[row] = BigUint::from(0u32);
+  mods.push(n.clone());
+  row += 1;
+
+  let expected = base.modpow(exponent, n);
+  assert_eq!(
+    w[acc_col(ell_bits - 1)],
+    expected,
+    "exponentiation circuit witness mismatch"
+  );
+
+  row - row_base
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_witness_advice(
+  bases: &[BigUint; 4],
+  exponents: &[BigUint; 4],
+  n: &BigUint,
+  ell: &BigUint,
+  p_hash: &BigUint,
+  d: Dims,
+) -> Vec<BigUint> {
+  let one = BigUint::from(1u32);
+  let mut out = Vec::new();
+
+  for i in 0..d.n_group_exps {
+    let g_minus_1 = &bases[i] - &one;
+    let mut acc = one.clone();
+    for j in 0..d.ell_bits {
+      let bit_pos = d.ell_bits - 1 - j;
+      let bit = u8::from(exponents[i].bit(bit_pos as u64));
+      let sq = (&acc * &acc).div_rem(n).1;
+      let b_val = BigUint::from(bit) * &g_minus_1 + &one;
+      acc = (&sq * &b_val).div_rem(n).1;
+    }
+    out.push(acc);
+  }
+
+  let groups: &[(&BigUint, usize)] = &[
+    (n, d.n_group_muls),
+    (ell, d.hp_rows),
+    (ell, 2 * d.k + 1),
+    (p_hash, 2 * d.k * d.h_rows),
+  ];
+  let mut r = 0usize;
+  for &(m, count) in groups {
+    for _ in 0..count {
+      let a = m - BigUint::from((r as u64 % 17) + 1);
+      let b = m - BigUint::from(((r as u64 * 7) % 19) + 2);
+      out.push((&a * &b).div_rem(m).1);
+      r += 1;
+    }
+  }
+
+  out
+}
+
+fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
   let n = modulus_n();
   let ell = modulus_ell();
   let p_hash = modulus_p_hash();
+  let bases = exp_bases();
+  let exponents = exp_exponents(d.ell_bits);
 
-  let mut mods = Vec::new();
-  // 4 group exponentiations + 2 group mults, all mod N.
-  for _ in 0..(d.n_group_exps * d.exp_len + d.n_group_muls) {
-    mods.push(n.clone());
-  }
-  // Hash-to-prime / Pocklington, mod ℓ.
-  for _ in 0..d.hp_rows {
-    mods.push(ell.clone());
-  }
-  // Per-swap ∏ H∆ mod ℓ for insertion + removal, plus one ∆ mod ℓ.
-  for _ in 0..(2 * d.k + 1) {
-    mods.push(ell.clone());
-  }
-  // Base hash H per element (insertion + removal), modeled as h_rows
-  // modular multiplies mod p_hash each.
-  for _ in 0..(2 * d.k * d.h_rows) {
-    mods.push(p_hash.clone());
-  }
-  mods
-}
-
-/// Operand scaffolding for the modeled circuit: one `(aᵣ, bᵣ, mᵣ)` triple
-/// per real row, with `aᵣ, bᵣ` just below the row modulus `mᵣ` (large,
-/// distinct, `< mᵣ`). This is cheap bookkeeping (subtractions only) — the
-/// expensive multiprecision work lives in [`compute_advice`].
-fn multiswap_operands(d: Dims) -> Vec<(BigUint, BigUint, BigUint)> {
-  multiswap_row_moduli(d)
-    .into_iter()
-    .enumerate()
-    .map(|(r, m)| {
-      let a = &m - BigUint::from((r as u64 % 17) + 1);
-      let b = &m - BigUint::from(((r as u64 * 7) % 19) + 2);
-      (a, b, m)
-    })
-    .collect()
-}
-
-/// Multiprecision **advice** generation: per row compute the product
-/// `prod = aᵣ·bᵣ` and divide to get `(qᵣ, cᵣ)` with `prod = qᵣ·mᵣ + cᵣ`,
-/// `0 ≤ cᵣ < mᵣ`. Returns `(c values, q values)`.
-///
-/// This is the imod analog of MultiSwap's witness advice (paper §4.3-4.4):
-/// the quotient divisions, and — for the `mod ℓ` rows — the `∏ H∆ mod ℓ`
-/// product/reduction steps. It is the prover work that *precedes* the
-/// SNARK proof and is excluded from the `prove` timing, so the `advice`
-/// benchmark measures it on its own. (One big-int multiply + one divmod
-/// per row; `~2048×2048→4096`-bit for the `mod N` rows.)
-fn compute_advice(operands: &[(BigUint, BigUint, BigUint)]) -> (Vec<BigUint>, Vec<BigUint>) {
-  operands
-    .iter()
-    .map(|(a, b, m)| {
-      let prod = a * b;
-      let (qi, c) = prod.div_rem(m); // prod = qi·m + c, 0 ≤ c < m
-      (c, qi)
-    })
-    .unzip()
-}
-
-/// Build a valid IntMod-R1CS instance for the modeled MultiSwap circuit
-/// from the operand scaffolding ([`multiswap_operands`]) and the
-/// multiprecision advice ([`compute_advice`]). Each real row `r` is one
-/// modular multiply `aᵣ·bᵣ = cᵣ + mᵣ·qᵣ` over Z. Witness columns are laid
-/// out `w = [a_0,b_0,c_0, a_1,b_1,c_1, …]` padded to a power of two;
-/// `num_cons` is the next power of two ≥ the real row count, padding rows
-/// being the trivial `0 = 0`.
-fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
-  let operands = multiswap_operands(d);
-  let (cs, qs) = compute_advice(&operands);
-  let num_real = operands.len();
-  let num_cons = num_real.next_power_of_two();
-  let num_vars = (3 * num_real).next_power_of_two();
+  let num_cons = d.num_real_rows().next_power_of_two();
+  let num_vars = d.num_real_cols().next_power_of_two();
   let num_io = 0;
+  let const_col = num_vars;
 
-  let mut a_entries = Vec::with_capacity(num_real);
-  let mut b_entries = Vec::with_capacity(num_real);
-  let mut c_entries = Vec::with_capacity(num_real);
+  let mut a_entries = Vec::new();
+  let mut b_entries = Vec::new();
+  let mut c_entries = Vec::new();
+  let mut mods = Vec::new();
   let mut w = vec![BigUint::from(0u32); num_vars];
+  let mut q = vec![BigUint::from(0u32); num_cons];
   let one = BigUint::from(1u32);
 
-  for (r, ((a, b, _m), c)) in operands.iter().zip(cs.iter()).enumerate() {
-    let (ca, cb, cc) = (3 * r, 3 * r + 1, 3 * r + 2);
-    a_entries.push((r, ca, one.clone()));
-    b_entries.push((r, cb, one.clone()));
-    c_entries.push((r, cc, one.clone()));
-    w[ca] = a.clone();
-    w[cb] = b.clone();
-    w[cc] = c.clone();
+  for i in 0..d.n_group_exps {
+    build_exp_circuit(
+      &bases[i],
+      &exponents[i],
+      &n,
+      d.ell_bits,
+      i * d.rows_per_exp(),
+      i * d.cols_per_exp(),
+      const_col,
+      &mut a_entries,
+      &mut b_entries,
+      &mut c_entries,
+      &mut mods,
+      &mut w,
+      &mut q,
+    );
   }
 
-  // q holds one quotient per real row; pad to num_cons (padding rows are
-  // the trivial `0 = 0`).
-  let mut q = qs;
-  q.resize(num_cons, BigUint::from(0u32));
+  let mut row = d.n_group_exps * d.rows_per_exp();
+  let mut col = d.n_group_exps * d.cols_per_exp();
 
-  // Per-row moduli, padded to num_cons (padding rows valid for any modulus).
-  let mut mods: Vec<BigUint> = operands.into_iter().map(|(_, _, m)| m).collect();
+  let groups: Vec<(&BigUint, usize)> = vec![
+    (&n, d.n_group_muls),
+    (&ell, d.hp_rows),
+    (&ell, 2 * d.k + 1),
+    (&p_hash, 2 * d.k * d.h_rows),
+  ];
+  let mut r = 0usize;
+  for (m, count) in &groups {
+    for _ in 0..*count {
+      let a_val = *m - BigUint::from((r as u64 % 17) + 1);
+      let b_val = *m - BigUint::from(((r as u64 * 7) % 19) + 2);
+      let prod = &a_val * &b_val;
+      let (qi, ci) = prod.div_rem(m);
+      w[col] = a_val;
+      w[col + 1] = b_val;
+      w[col + 2] = ci;
+      q[row] = qi;
+      a_entries.push((row, col, one.clone()));
+      b_entries.push((row, col + 1, one.clone()));
+      c_entries.push((row, col + 2, one.clone()));
+      mods.push((*m).clone());
+      row += 1;
+      col += 3;
+      r += 1;
+    }
+  }
+
   mods.resize(num_cons, BigUint::from(2u32));
 
   let shape = IntModR1CSShapeModp::<M>::new(
@@ -259,31 +381,25 @@ fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>
   (shape, w, q)
 }
 
-/// Derive IntEval params sized for the shape's committed-value width
-/// (~2048-bit `mod N` operands → `log_t_f = 2048`) and vector length.
 fn params_for(shape: &IntModR1CSShapeModp<M>, int_k: usize) -> IntEvalParams {
   let n = shape.num_vars().max(shape.num_cons());
-  let log_n = (n as u64).ilog2() as usize; // n is a power of two
+  let log_n = (n as u64).ilog2() as usize;
   IntEvalParams::derive(2048, LOG_T, int_k, log_n).expect("IntEval params satisfy bounds")
 }
 
-/// Paper Fig. 3 analytical F_p constraint count for MultiSwap at batch
-/// size `k`, for the headline imod-vs-xJsnark ratio. Per-op (×2 for
-/// insert+remove) plus the fixed per-proof overhead.
 fn paper_fp_constraints(k: usize) -> u64 {
-  // Parameter values from Fig. 3 (Poseidon hash: c_He = c_Hin ≈ 316).
-  let f = 255u64; // field width
-  let b_h_delta = 2048u64; // division-intractable hash output bits
-  let ell_bits = 352u64; // |ℓ|
-  let c_he = 316; // multiset item hash → F (Poseidon)
-  let c_hin = 316; // full-input hash per op
+  let f = 255u64;
+  let b_h_delta = 2048u64;
+  let ell_bits = 352u64;
+  let c_he = 316;
+  let c_hin = 316;
   let c_split = 388;
-  let c_add_ell = 16 + f; // c_+ℓ(f)
-  let c_mul_ell = 479; // c_×ℓ
-  let c_e_g = 7044 * ell_bits; // c_eG(|ℓ|)
+  let c_add_ell = 16 + f;
+  let c_mul_ell = 479;
+  let c_e_g = 7044 * ell_bits;
   let c_x_g = 7563;
   let c_hp = 217703;
-  let c_mod_ell = 16 + b_h_delta; // c_mod_ℓ(b_H∆)
+  let c_mod_ell = 16 + b_h_delta;
 
   let per_op = 2 * (c_he + c_hin + c_split + c_add_ell + c_mul_ell);
   let per_proof = 4 * c_e_g + 2 * c_x_g + c_hp + c_mod_ell;
@@ -291,17 +407,8 @@ fn paper_fp_constraints(k: usize) -> u64 {
 }
 
 fn multiswap_modp_benches(c: &mut Criterion) {
-  // Bench only k = 0: the pure fixed per-proof overhead of the two
-  // Wesolowski proofs (4 group exponentiations + 2 group mults mod N, plus
-  // the prime hash Hp), with no per-swap rows. This isolates the cost a
-  // MultiSwap pays before any swaps are amortized — the constant that sets
-  // its break-even point vs. Merkle trees. Lands at num_cons = 2^12.
   let ks: &[usize] = &[0];
 
-  // Per-part timing breakdown, gated on `RUST_LOG` (mirrors
-  // imod_spartan_modp.rs): one full setup/prove/verify per config so the
-  // D5 range-check spans (at numlimb ≈ 64) are visible, with an `is_sat`
-  // correctness gate.
   if std::env::var_os("RUST_LOG").is_some() {
     let _ = tracing_subscriber::fmt()
       .with_target(false)
@@ -310,27 +417,28 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     for &k in ks {
       let dims = Dims::multiswap(k);
       let (shape, w, q) = multiswap_shape_and_witness(dims);
-      // Sweep the IntEval per-iteration parameter `int_k` (distinct from the
-      // MultiSwap batch size `k`) to see how it trades off `s`/iterations
-      // against prove/verify cost under the prime-counting Soundness-1 bound.
       for int_k in 7..=10usize {
         let params = params_for(&shape, int_k);
         println!(
-          "=== IntEval k={int_k}: log_p={} s={} numlimb={} numlimb_var={} (batch k={k}) ===",
-          params.log_p, params.s, params.numlimb, params.numlimb_var
+          "=== IntEval k={int_k}: log_p={} s={} numlimb={} numlimb_var={} (batch k={k}, cons=2^{}, vars=2^{}) ===",
+          params.log_p, params.s, params.numlimb, params.numlimb_var,
+          (shape.num_cons() as u64).ilog2(),
+          (shape.num_vars() as u64).ilog2(),
         );
         let (pk, vk) =
           IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
         let (witness, instance) =
           IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
         shape.is_sat(pk.ck(), &instance, &witness).unwrap();
+        println!("is_sat passed");
         let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+        println!("prove passed");
         proof.verify(&vk, &instance).unwrap();
+        println!("verify passed");
       }
     }
   }
 
-  // Report shape sizes + the paper's analytical F_p count alongside.
   for &k in ks {
     let dims = Dims::multiswap(k);
     let (shape, _w, _q) = multiswap_shape_and_witness(dims);
@@ -366,23 +474,24 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       );
     });
 
-    // Multiprecision advice generation alone (per-row product + divmod →
-    // c, q). The imod analog of the paper's witness advice (Fig. 6's
-    // "witness computation", minus the accumulator-digest exponentiation
-    // we don't model). Excluded from `prove` — measured here on its own.
     g.bench_function(format!("advice/{tag}"), |b| {
       b.iter_batched(
-        || multiswap_operands(dims),
-        |operands| {
-          let _ = compute_advice(&operands);
+        || {
+          (
+            exp_bases(),
+            exp_exponents(dims.ell_bits),
+            modulus_n(),
+            modulus_ell(),
+            modulus_p_hash(),
+          )
+        },
+        |(bases, exponents, n, ell, p_hash)| {
+          let _ = compute_witness_advice(&bases, &exponents, &n, &ell, &p_hash, dims);
         },
         BatchSize::LargeInput,
       );
     });
 
-    // Witness commitment alone (blind + commit w/q). This is the portion
-    // of `prove` contributed by `IntModR1CSWitnessModp::new`; subtract it
-    // from `prove` to isolate proof generation.
     g.bench_function(format!("commit_witness/{tag}"), |b| {
       b.iter_batched(
         || {
@@ -409,14 +518,6 @@ fn multiswap_modp_benches(c: &mut Criterion) {
           (pk, shape, w, q)
         },
         |(pk, shape, w, q)| {
-          // Time the witness commitment together with proof generation,
-          // to match the paper's Fig. 6 ("witness computation + proof
-          // generation"). `IntModR1CSWitnessModp::new` blinds and commits
-          // w/q to the PCS — a real prover cost. NOTE: the paper's
-          // witness-computation term is dominated by the RSA
-          // accumulator-digest exponentiation (§4.4, ~43 s at 2^20),
-          // which this synthetic instance does not build; only the
-          // commitment portion of witness work is captured here.
           let (witness, instance) =
             IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
           let _ = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();

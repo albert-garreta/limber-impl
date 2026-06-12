@@ -126,15 +126,32 @@ impl<const LIMBS: usize> SumcheckField for DynPrime<LIMBS> {
   }
 
   fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self {
-    // Take up to LIMBS*8 bytes (little-endian), build a Uint, and let
-    // `DynPrime::new` reduce it mod the modulus. See the bias note on the
-    // trait method.
     let n = Uint::<LIMBS>::BYTES;
-    let take = bytes.len().min(n);
-    let mut buf = vec![0u8; n];
-    buf[..take].copy_from_slice(&bytes[..take]);
-    let value = Uint::<LIMBS>::from_le_slice(&buf);
-    Self::new(value, params)
+    if bytes.len() <= n {
+      let mut buf = vec![0u8; n];
+      buf[..bytes.len()].copy_from_slice(bytes);
+      let value = Uint::<LIMBS>::from_le_slice(&buf);
+      return Self::new(value, params);
+    }
+    // Value exceeds LIMBS limbs — Horner reduction over n-byte chunks.
+    // V = c_0 + c_1·B + c_2·B² + …  where B = 2^(n·8).
+    let two_32 = Self::from_u64(params, 1u64 << 32);
+    let two_64 = two_32 * two_32;
+    let mut shift = Self::one(params);
+    for _ in 0..LIMBS {
+      shift *= two_64;
+    }
+    let num_chunks = bytes.len().div_ceil(n);
+    let mut acc = Self::zero(params);
+    for ci in (0..num_chunks).rev() {
+      let start = ci * n;
+      let end = (start + n).min(bytes.len());
+      let mut buf = vec![0u8; n];
+      buf[..end - start].copy_from_slice(&bytes[start..end]);
+      let chunk_value = Uint::<LIMBS>::from_le_slice(&buf);
+      acc = acc * shift + Self::new(chunk_value, params);
+    }
+    acc
   }
 }
 
@@ -198,5 +215,21 @@ mod tests {
     let p = test_params();
     let zero = DynPrime::<4>::zero(&p);
     assert!(zero.invert().is_none());
+  }
+
+  #[test]
+  fn from_bytes_reduce_handles_wide_values() {
+    let p = test_params();
+    // 64-byte value (512 bits) — wider than Uint<4> (256 bits).
+    let mut bytes = vec![0u8; 64];
+    bytes[32] = 1; // represents 2^256
+    let result = DynPrime::<4>::from_bytes_reduce(&p, &bytes);
+    // Verify by computing 2^256 mod p via repeated squaring in DynPrime
+    let two = DynPrime::<4>::from_u64(&p, 2);
+    let mut pow = DynPrime::<4>::one(&p);
+    for _ in 0..256 {
+      pow *= two;
+    }
+    assert_eq!(result, pow, "from_bytes_reduce should correctly reduce values wider than LIMBS");
   }
 }
