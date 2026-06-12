@@ -311,6 +311,121 @@ impl IntEvalParams {
 
     Ok(())
   }
+
+  /// Coarse prover-cost estimate for these params on a `num_vars`-variable
+  /// polynomial, in "committed scalar" units (one unit ≈ the amortized
+  /// per-scalar cost of a Hyrax commit plus its share of the batched
+  /// open). This is a *ranking heuristic* for `derive_optimized`, not a
+  /// performance guarantee — soundness is enforced independently by
+  /// `validate`, so a mis-ranked candidate costs time, never security.
+  ///
+  /// Terms, mirroring the prove path:
+  ///   - `f_limb` commit/open plus its `T`-bound 16-bit-chunk range
+  ///     checks: `2^{n_tot} · (2 + ⌈log T / 16⌉)`;
+  ///   - per iteration layer `j` (`m_j = 2^{n_tot − j·k}` slots): the
+  ///     stacked `(a_j, b_j)` commit/open (`2 · s_pad · m_j`), the LogUp
+  ///     chunk commitments for the shifted `a_j` (width `log P + 1`) and
+  ///     `b_j` (width `log q − log P + 1`), and the integer
+  ///     partial-evaluation work (`s` chains × `m_j · 2^k` bigint
+  ///     mult-adds of `⌈(k·(log P + 1) + log T)/64⌉`-word operands);
+  ///   - eq-tensor weight assembly for the `s` per-chain claims of the
+  ///     final batched opens: `s · 2^{n_tot}` field ops.
+  pub fn estimated_prover_cost(&self, num_vars: usize) -> f64 {
+    /// One 256-bit field op, in committed-scalar units.
+    const FIELD_OP: f64 = 0.05;
+    /// One 64-bit bigint word op, in committed-scalar units.
+    const BIGINT_WORD: f64 = 0.02;
+
+    let two = |e: usize| (e as f64).exp2();
+    let n_tot = num_vars + self.numlimb_var;
+    let s = self.s as f64;
+    let s_pad = self.s.next_power_of_two() as f64;
+
+    // f_limb commit/open + T-bound chunk range checks.
+    let f_chunks = self.log_t.div_ceil(CHUNK_BITS) as f64;
+    let mut cost = two(n_tot) * (2.0 + f_chunks);
+
+    // Iteration layers (none when n_tot <= k).
+    let t_layers = n_tot.saturating_sub(self.k).div_ceil(self.k);
+    let ab_chunks = ((self.log_p + 1).div_ceil(CHUNK_BITS)
+      + (LOG_Q - self.log_p + 1).div_ceil(CHUNK_BITS)) as f64;
+    let words = (self.k * (self.log_p + 1) + self.log_t).div_ceil(64) as f64;
+    for j in 1..=t_layers {
+      let m = two(n_tot - j * self.k);
+      // Stacked commit/open + LogUp chunk commitments.
+      cost += m * (2.0 * s_pad + s * ab_chunks);
+      // Integer partial evaluation: input size m · 2^k per chain.
+      cost += BIGINT_WORD * s * m * two(self.k) * words;
+    }
+
+    // Per-claim eq-tensor weights in the batched opens.
+    cost += FIELD_OP * s * two(n_tot);
+    cost
+  }
+
+  /// Derive params *optimized for the given input length*: search over
+  /// the per-iteration variable count `k` and the limb bound `log T`,
+  /// deriving the dependent `(log P, s)` for each candidate via
+  /// [`Self::derive`], and return the candidate minimizing
+  /// [`Self::estimated_prover_cost`] (ties broken by smaller `s`, i.e.
+  /// cheaper verifier and smaller proofs, then smaller `numlimb`).
+  ///
+  /// The search space is tiny — `k ∈ [1, num_vars + numlimb_var]` per
+  /// limb candidate, and limb candidates halve `log T` from `log T_f`
+  /// down to the 16-bit range-check chunk width — so this is cheap
+  /// enough to run at every setup. Every candidate passes through
+  /// `derive`'s `validate`, so the optimizer can only affect
+  /// performance, never soundness.
+  pub fn derive_optimized(log_t_f: usize, num_vars: usize) -> Result<Self, SpartanError> {
+    // Limb candidates: numlimb = 2^v, log T = ⌈log T_f / 2^v⌉. Splitting
+    // below one range-check chunk (16 bits) cannot reduce the per-value
+    // chunk count further, so stop there.
+    let mut log_t_candidates: Vec<usize> = Vec::new();
+    for v in 0..=24usize {
+      let log_t = log_t_f.div_ceil(1usize << v).max(1);
+      if log_t_candidates.last() != Some(&log_t) {
+        log_t_candidates.push(log_t);
+      }
+      if log_t <= CHUNK_BITS {
+        break;
+      }
+    }
+
+    let mut best: Option<(f64, Self)> = None;
+    let mut last_err: Option<SpartanError> = None;
+    for &log_t in &log_t_candidates {
+      let nlv = numlimb_var(numlimb(log_t_f, log_t));
+      // k > n_tot behaves like k = n_tot (zero iterations) but only
+      // tightens the norm bounds, so cap the search there.
+      let k_max = (num_vars + nlv).max(1);
+      for k in 1..=k_max {
+        match Self::derive(log_t_f, log_t, k, num_vars) {
+          Ok(p) => {
+            let cost = p.estimated_prover_cost(num_vars);
+            let better = match &best {
+              None => true,
+              Some((bc, bp)) => {
+                cost < *bc || (cost == *bc && (p.s, p.numlimb) < (bp.s, bp.numlimb))
+              }
+            };
+            if better {
+              best = Some((cost, p));
+            }
+          }
+          Err(e) => last_err = Some(e),
+        }
+      }
+    }
+
+    best.map(|(_, p)| p).ok_or_else(|| {
+      last_err.unwrap_or(SpartanError::InvalidInputLength {
+        reason: format!(
+          "IntEvalParams::derive_optimized: no valid (k, log T) candidate for \
+           log_t_f={log_t_f}, num_vars={num_vars}"
+        ),
+      })
+    })
+  }
 }
 
 /// Ceiling `log_2`. `ceil_log2(0)` returns 0 (callers guard with `.max(1)`).
@@ -998,6 +1113,31 @@ impl IntegerModPCS {
       },
     ))
   }
+
+  /// Like the trait `setup`, but instead of the fixed application
+  /// defaults `(DEFAULT_LOG_T_F, DEFAULT_K)` it derives params
+  /// *optimized for this input length* via
+  /// [`IntEvalParams::derive_optimized`]: `(k, log T, log P, s)` are
+  /// chosen to minimize the estimated prover cost for an `n`-coefficient
+  /// polynomial with coefficients bounded by `2^log_t_f`. The chosen
+  /// params still pass the full §4.4 `validate`, so this never trades
+  /// soundness for speed.
+  pub fn setup_optimized(
+    label: &'static [u8],
+    n: usize,
+    width: usize,
+    log_t_f: usize,
+  ) -> Result<
+    (
+      <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::CommitmentKey,
+      <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::VerifierKey,
+    ),
+    SpartanError,
+  > {
+    let num_vars = ceil_log2(n.max(1));
+    let params = IntEvalParams::derive_optimized(log_t_f, num_vars)?;
+    Self::setup_with_params(label, n, width, params)
+  }
 }
 
 impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
@@ -1007,18 +1147,19 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   type Blind = IntegerModBlind;
   type EvaluationArgument = IntEvalArgument;
 
-  /// Trait-driven setup: derive `IntEvalParams` from the application
-  /// defaults `(DEFAULT_LAMBDA, DEFAULT_LOG_T_F)` and the polynomial
-  /// size. Panics if the derivation fails (which only happens for
-  /// pathologically small `n`); callers that need control over the
-  /// security or norm-bound parameters should use `setup_with_params`.
+  /// Trait-driven setup: derive `IntEvalParams` optimized for this
+  /// polynomial size via [`IntEvalParams::derive_optimized`], with the
+  /// application-default norm bound `DEFAULT_LOG_T_F`. Panics if the
+  /// derivation fails (which only happens for pathologically small `n`);
+  /// callers that need control over the security or norm-bound
+  /// parameters should use `setup_with_params`.
   fn setup(
     label: &'static [u8],
     n: usize,
     width: usize,
   ) -> (Self::CommitmentKey, Self::VerifierKey) {
     let num_vars = ceil_log2(n.max(1));
-    let params = IntEvalParams::derive_no_limb_split(DEFAULT_LOG_T_F, DEFAULT_K, num_vars).expect(
+    let params = IntEvalParams::derive_optimized(DEFAULT_LOG_T_F, num_vars).expect(
       "default IntEvalParams derivation must satisfy the paper's bounds; \
          override with `setup_with_params` to use tighter parameters",
     );
@@ -2994,6 +3135,112 @@ mod tests {
         "derive(log_T_f={}, k={}, n={}) → log_P={}, s={}",
         p.log_t_f, p.k, num_vars, p.log_p, p.s
       );
+    }
+  }
+
+  /// `derive_optimized` returns valid params for every input length and
+  /// norm bound we care about, and never ranks worse than the fixed
+  /// defaults (which are inside its search space whenever they derive).
+  #[test]
+  fn derive_optimized_valid_and_never_worse_than_default() {
+    for log_t_f in [32usize, 64, 256, 2048] {
+      for num_vars in [1usize, 2, 4, 8, 12, 16, 20, 25] {
+        let opt = IntEvalParams::derive_optimized(log_t_f, num_vars).unwrap();
+        opt.validate(num_vars).unwrap();
+        if let Ok(default) = IntEvalParams::derive_no_limb_split(log_t_f, DEFAULT_K, num_vars) {
+          assert!(
+            opt.estimated_prover_cost(num_vars) <= default.estimated_prover_cost(num_vars),
+            "optimized params cost more than defaults for log_t_f={log_t_f}, n={num_vars}"
+          );
+        }
+      }
+    }
+  }
+
+  /// Human-readable record of what `derive_optimized` picks versus the
+  /// fixed defaults, with the cost model's ratio. Documents the
+  /// optimizer's behavior; the printed values are the point.
+  #[test]
+  fn derive_optimized_prints_table() {
+    for log_t_f in [32usize, 256, 2048] {
+      for num_vars in [4usize, 8, 12, 16, 20, 25] {
+        let opt = IntEvalParams::derive_optimized(log_t_f, num_vars).unwrap();
+        let opt_cost = opt.estimated_prover_cost(num_vars);
+        let default_str = match IntEvalParams::derive_no_limb_split(log_t_f, DEFAULT_K, num_vars) {
+          Ok(d) => format!(
+            "default(k={}, log_P={}, s={}) cost={:.0}, ratio={:.2}",
+            d.k,
+            d.log_p,
+            d.s,
+            d.estimated_prover_cost(num_vars),
+            d.estimated_prover_cost(num_vars) / opt_cost
+          ),
+          Err(_) => "default: invalid".to_string(),
+        };
+        eprintln!(
+          "log_T_f={log_t_f} n={num_vars}: opt(k={}, log_P={}, s={}, log_T={}, numlimb={}) cost={opt_cost:.0} | {default_str}",
+          opt.k, opt.log_p, opt.s, opt.log_t, opt.numlimb
+        );
+      }
+    }
+  }
+
+  /// End-to-end prove/verify with `setup_optimized`-chosen params, both
+  /// at a size where the optimizer can skip iterations and at one where
+  /// the chain/iteration machinery runs.
+  #[test]
+  fn prove_verify_roundtrips_optimized_params() {
+    for num_vars in [4usize, 8] {
+      let n = 1usize << num_vars;
+      let (ck, vk) =
+        IntegerModPCS::setup_optimized(b"inteval-opt", n, 256, DEFAULT_LOG_T_F).unwrap();
+      let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
+
+      let dyn_params = small_dyn_params();
+      let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
+      let point: Vec<DP> = (0..num_vars)
+        .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+        .collect();
+
+      let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+      let int_v = integer_mle_evaluate(&poly, &int_point);
+      let p: BigUint = BigUint::from(37u32);
+      let eval = int_v
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap();
+
+      let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+      let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+      let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
+      let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
+        &ck_eval,
+        std::slice::from_ref(&eval),
+        &blind_eval,
+        false,
+      )
+      .unwrap();
+
+      let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+      let arg = <MP as ModPCSEngineTrait<ME>>::prove(
+        &ck,
+        &ck_eval,
+        &mut pt,
+        &comm,
+        &poly,
+        &blind,
+        &point,
+        &eval,
+        &comm_eval,
+        &blind_eval,
+      )
+      .unwrap();
+
+      let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+      <MP as ModPCSEngineTrait<ME>>::verify(
+        &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
+      )
+      .unwrap();
     }
   }
 
