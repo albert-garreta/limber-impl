@@ -36,12 +36,6 @@ builds on and benchmarks against:
   and BN254 are provided). Zero-knowledge is obtained via Nova's
   folding scheme.
 
-- **NeutronNova zkSNARK** — non-recursive
-  [NeutronNova](https://eprint.iacr.org/2024/1606) folding for uniform
-  computations: many instances of one step circuit are multi-folded
-  into a single R1CS instance proved with Spartan, amortizing the
-  prover across the batch.
-
 - **Precomputable / online witness split** — both protocols expose
   `setup` → `prep_prove` → `prove`, so witness material known ahead of
   time is synthesized and committed once and reused across proofs.
@@ -66,7 +60,6 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 | `multiswap_modp` | MultiSwap (RSA-accumulator swap batches, [OWWB20](https://eprint.iacr.org/2019/1494)) with wired 2048-bit square-and-multiply chains — one imod row per `mod N` multiply |
 | `logup_gkr` | LogUp-GKR range proof in isolation |
 | `sha256_spartan` | Spartan over SHA-256 (1–2 KiB messages) |
-| `sha256_neutronnova` | NeutronNova over 32 SHA-256 step circuits |
 
 Override thread counts with `BENCH_THREADS` (comma-separated):
 
