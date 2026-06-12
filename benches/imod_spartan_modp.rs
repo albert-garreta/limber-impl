@@ -233,6 +233,8 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
     (1usize << 6, 1usize << 8),   // point.len=8 → t=1 IntEval iteration
     (1usize << 8, 1usize << 10),  // point.len=10 → t=1
     (1usize << 10, 1usize << 12), // point.len=12 → t=1
+    (1usize << 12, 1usize << 14), // point.len=14 → t=1
+    (1usize << 14, 1usize << 16), // point.len=16 → t=1
   ];
 
   // Per-part timing breakdown, gated entirely on `RUST_LOG` so a plain

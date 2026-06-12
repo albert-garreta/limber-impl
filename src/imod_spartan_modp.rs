@@ -960,14 +960,15 @@ mod tests {
   /// End-to-end SNARK roundtrip that triggers the IntEval partial-eval
   /// iteration path (step C) on the W open. With `num_vars = 256`, the
   /// Mod-PCS opens W at a point of length `log_2(256) = 8 > k = 7`
-  /// (default `IntEvalParams`), so `t = 1` partial-eval iteration runs
+  /// (pinned explicitly below), so `t = 1` partial-eval iteration runs
   /// per small prime. The Q open at length 1 still uses the step-B
   /// path (no iteration). Both must agree end-to-end through the
   /// SNARK protocol.
   ///
-  /// The smallest available SNARK trigger for step C — `num_vars = 128`
-  /// gives `point.len = 7 = k`, exactly at the no-iteration boundary,
-  /// so we go one power of two above to be sure.
+  /// `k = 7` is pinned via `setup_with_params` because the default
+  /// setup now optimizes params per input length and may pick
+  /// `k = point.len` here, which would silently skip the iteration
+  /// path this test exists to cover.
   #[test]
   fn imod_modp_snark_with_inteval_iteration() {
     let one = BigUint::from(1u32);
@@ -993,7 +994,14 @@ mod tests {
     w[2] = BigUint::from(1u32);
     let q: Vec<BigUint> = vec![BigUint::from(1u32), zero];
 
-    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    // Pin k = 7 < log_2(num_vars) = 8 so the iteration path runs.
+    let params = crate::provider::pcs::integer_modpcs::IntEvalParams::derive_no_limb_split(
+      crate::provider::pcs::integer_modpcs::DEFAULT_LOG_T_F,
+      7,
+      8,
+    )
+    .unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
     let (W, U) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
     shape.is_sat(&pk.ck, &U, &W).unwrap();
 
