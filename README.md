@@ -39,7 +39,6 @@ builds on and benchmarks against:
 - **Precomputable / online witness split** — both protocols expose
   `setup` → `prep_prove` → `prove`, so witness material known ahead of
   time is synthesized and committed once and reused across proofs.
-  This is the pattern [Vega](https://eprint.iacr.org/2025/2094) relies
   on for low-latency proving.
 
 ## Benchmarks
