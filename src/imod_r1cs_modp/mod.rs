@@ -34,6 +34,16 @@ type ModBlind<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Blind;
 /// Phase-2 IntMod-R1CS shape over `M: ModEngine`. Integer-valued
 /// matrices/mods; `p`-independent so the same shape can be used with any
 /// verifier-sampled prime.
+///
+/// Per-row modulus semantics (`mods[r]` in `Az∘Bz = Cz + m∘q`):
+/// - `m ≥ 2`: ordinary modular row, `LC_A·LC_B ≡ LC_C (mod m)` with the
+///   prover's quotient `q_r` as advice.
+/// - `m = 0`: **exact integer row** — the `m·q` term vanishes, so the row
+///   enforces `LC_A·LC_B = LC_C` over ℤ (congruence mod 0 is equality).
+///   Used for e.g. bit constraints `b·b = b`. The `q_r` slot is dead
+///   weight (multiplied by zero); conventionally set to 0.
+/// - `m = 1` is degenerate (everything is ≡ mod 1, so the quotient can
+///   absorb up to `T_f` of residual): avoid.
 #[derive(Clone, Debug)]
 pub struct IntModR1CSShapeModp<M: ModEngine> {
   pub(crate) num_cons: usize,

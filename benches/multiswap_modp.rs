@@ -141,11 +141,11 @@ fn exp_bases() -> [BigUint; 4] {
 fn exp_exponents(ell_bits: usize) -> [BigUint; 4] {
   core::array::from_fn(|i| {
     let seed = (i as u64 + 1) * 0x0123_4567_89AB_CDEFu64;
-    let mut bytes = vec![0u8; (ell_bits + 7) / 8];
+    let mut bytes = vec![0u8; ell_bits.div_ceil(8)];
     for (k, b) in bytes.iter_mut().enumerate() {
       *b = ((seed.wrapping_mul(k as u64 + 1).wrapping_add(0xDEAD)) & 0xFF) as u8;
     }
-    if ell_bits % 8 != 0 {
+    if !ell_bits.is_multiple_of(8) {
       bytes[0] &= (1u8 << (ell_bits % 8)) - 1;
     }
     let msb_byte = (ell_bits - 1) / 8;
@@ -228,13 +228,20 @@ fn build_exp_circuit(
     row += 1;
   }
 
-  // Binary constraints
+  // Binary constraints, as EXACT integer rows (modulus 0 ⇒ the m·q term
+  // vanishes, so the row enforces b² = b over ℤ, i.e. b ∈ {0,1},
+  // unconditionally). Modulus N is also computationally sound here
+  // (non-binary solutions within the range bound are benign lifts of
+  // 0/1 or nontrivial idempotents of Z_N, and exhibiting the latter
+  // factors N) — but mod-0 is assumption-free, costs the same, and stays
+  // sound if the pattern is reused for moduli with known factorization
+  // (e.g. mod-ℓ exponent bits in a future Hp gadget).
   for j in 0..ell_bits {
     a_entries.push((row, bit_col(j), one.clone()));
     b_entries.push((row, bit_col(j), one.clone()));
     c_entries.push((row, bit_col(j), one.clone()));
     q[row] = BigUint::from(0u32);
-    mods.push(n.clone());
+    mods.push(BigUint::from(0u32));
     row += 1;
   }
 
@@ -421,7 +428,10 @@ fn multiswap_modp_benches(c: &mut Criterion) {
         let params = params_for(&shape, int_k);
         println!(
           "=== IntEval k={int_k}: log_p={} s={} numlimb={} numlimb_var={} (batch k={k}, cons=2^{}, vars=2^{}) ===",
-          params.log_p, params.s, params.numlimb, params.numlimb_var,
+          params.log_p,
+          params.s,
+          params.numlimb,
+          params.numlimb_var,
           (shape.num_cons() as u64).ilog2(),
           (shape.num_vars() as u64).ilog2(),
         );

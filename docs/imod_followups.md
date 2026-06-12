@@ -141,25 +141,36 @@ size; promote into a phase plan when picked up.
   earlier and return `SpartanError::InvalidSumcheckProof` instead of
   panicking. Small.
 
-- **`DynPrime<4>::from_bytes_reduce` truncates to 32 bytes — CONFIRMED
-  LIVE COMPLETENESS BUG (2026-06-11).** Anything wider than 256 bits
-  silently loses its top bytes, so the Phase-2 Z_p layer binds the
-  *truncated* witness/moduli/quotients. An honest instance with random
-  >256-bit values fails to verify (`InvalidSumcheckProof`) — see
+- **`DynPrime<4>::from_bytes_reduce` truncation — FIXED (`063aab6`,
+  2026-06-11).** History: inputs wider than 256 bits were silently
+  truncated, so the Phase-2 Z_p layer bound the *truncated*
+  witness/moduli/quotients; honest instances with random >256-bit
+  values failed to verify, and the pre-fix MultiSwap bench only
+  roundtripped because its synthetic operands satisfied each row as a
+  polynomial identity in `m` (preserved by truncation). Fixed by
+  MSB-first Horner over 32-byte chunks with `2^256 mod p` weights.
+  Verified by the un-ignored regression test
   `tests/wide_value_probe.rs::wide_modulus_roundtrip_random_operands`
-  (`#[ignore]`d until fixed). **The MultiSwap bench only roundtrips
-  because its synthetic operands (`a = m − k₁`, `b = m − k₂`) satisfy
-  each row as a polynomial identity in `m`, which truncation
-  preserves** — its timing numbers are still width-representative, but
-  the wide path does not actually work for honest data, and a faithful
-  MultiSwap circuit (random intermediates) is blocked on this. Soundness
-  appears intact (the reduction-sumcheck glue catches the truncated-vs-
-  committed eval mismatch — that's exactly the failing check), but
-  deserves a focused review once fixed. **Fix:** iterative chunk-wise
-  reduction in `from_bytes_reduce` (fold 32-byte chunks with `2^256 mod
-  p` weights, like the Horner probe used to confirm the bug), then
-  un-ignore the regression test and re-bench MultiSwap. Medium, high
-  priority.
+  and the wired RSA-2048 roundtrip. Side benefit: 64-byte transcript
+  squeezes now reduce in full, satisfying the trait's challenge-bias
+  note. Remaining follow-up: the focused soundness review of the
+  pre-fix-era reasoning is moot, but the *exact-row convention* it led
+  to is now load-bearing — see next item.
+
+- **Exact-row (`m = 0`) convention + bit-gadget soundness note
+  (2026-06-11).** The wired exponentiation gadget's binary constraints
+  originally used `b·b = b (mod N)`, which admits non-binary solutions:
+  benign lifts of 0/1 (e.g. `b = N+1, q = N+1`) and — harmfully —
+  nontrivial idempotents of `Z_N`, though exhibiting those factors `N`,
+  so the mod-N variant is *computationally* sound for RSA moduli.
+  Switched to **modulus-0 exact rows** (`b² = b` over ℤ):
+  unconditional, same cost, and safe to reuse for moduli with known
+  factorization (the bench's `ℓ` is one — mod-ℓ exponent bits in a
+  future Hp gadget MUST use exact rows or bound-2 range segments).
+  Convention documented on `IntModR1CSShapeModp`; roundtrip + negative
+  tests added (`imod_modp_exact_row_mod_zero_roundtrip`,
+  `imod_modp_exact_bit_row_rejects_lift`). Note `m = 1` is the
+  degenerate modulus (vacuous row); consider a validation guard.
 
 - **`prove_with_iter` doesn't bind `p_i` into the iteration commits.** See
   the same item in Phase 3 follow-ups — applies to step C only, but it's

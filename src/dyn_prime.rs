@@ -230,6 +230,9 @@ mod tests {
     for _ in 0..256 {
       pow *= two;
     }
-    assert_eq!(result, pow, "from_bytes_reduce should correctly reduce values wider than LIMBS");
+    assert_eq!(
+      result, pow,
+      "from_bytes_reduce should correctly reduce values wider than LIMBS"
+    );
   }
 }

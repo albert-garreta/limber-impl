@@ -1,19 +1,16 @@
-//! Regression probes for the wide-value (>256-bit) reduction bug:
-//! `DynPrime::from_bytes_reduce` truncates its input to 32 bytes, so a
-//! value `v ≥ 2^256` reduces as `(v mod 2^256) mod p`, not `v mod p`
-//! (confirmed 2026-06-11; tracked in docs/imod_followups.md).
+//! Regression probes for the wide-value (>256-bit) reduction bug
+//! (FIXED in 063aab6): `DynPrime::from_bytes_reduce` used to truncate
+//! its input to 32 bytes, so a value `v ≥ 2^256` reduced as
+//! `(v mod 2^256) mod p`, not `v mod p`, and completeness failed for
+//! honest wide instances — UNLESS the instance satisfied the row
+//! relation as a polynomial identity in the modulus (e.g.
+//! `(m−5)(m−7) = 35 + m(m−12)`), which truncation preserves. The
+//! pre-fix MultiSwap bench's synthetic operands had exactly that
+//! structure, which is how the bug stayed hidden.
 //!
-//! Consequence: the Phase-2 SNARK's Z_p layer binds the TRUNCATED
-//! witness/moduli, and completeness fails for honest wide instances —
-//! UNLESS the instance satisfies the row relation as a polynomial
-//! identity in the modulus (e.g. `(m−5)(m−7) = 35 + m(m−12)`), which
-//! truncation preserves. The MultiSwap bench's synthetic operands have
-//! exactly that structure, which is why it roundtrips despite the bug.
-//!
-//! `wide_modulus_roundtrip` (structured operands) passes today;
-//! `wide_modulus_roundtrip_random_operands` is the honest case and is
-//! `#[ignore]`d until the chunked wide reduction lands — it must pass
-//! once the bug is fixed.
+//! `wide_modulus_roundtrip` keeps the structured-operand case;
+//! `wide_modulus_roundtrip_random_operands` is the honest general case
+//! that the truncation broke.
 
 use num_bigint::BigUint;
 use spartan2::{
@@ -32,10 +29,10 @@ fn wide_modulus_roundtrip() {
 
 /// Same instance but with operands that are NOT a polynomial identity in
 /// `m` — genuinely random wide values, i.e. the honest general case.
-/// Currently FAILS with `InvalidSumcheckProof` (the truncation bug);
-/// un-ignore when `from_bytes_reduce` gains chunked wide reduction.
+/// Regression test for the `from_bytes_reduce` truncation bug: this
+/// failed with `InvalidSumcheckProof` until the chunked wide reduction
+/// landed (063aab6).
 #[test]
-#[ignore = "KNOWN BUG: from_bytes_reduce truncates >256-bit values (docs/imod_followups.md)"]
 fn wide_modulus_roundtrip_random_operands() {
   wide_roundtrip_inner(true)
 }

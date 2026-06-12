@@ -781,6 +781,74 @@ mod tests {
     proof.verify(&vk, &U).unwrap();
   }
 
+  /// Modulus-0 rows are EXACT integer rows: the `m·q` term vanishes, so
+  /// the row enforces `LC_A·LC_B = LC_C` over ℤ. Roundtrips a shape
+  /// mixing an exact bit row (`b·b = b`, mod 0) with an ordinary mod-14
+  /// row, exercising the verifier's mods-MLE path with zero entries.
+  #[test]
+  fn imod_modp_exact_row_mod_zero_roundtrip() {
+    let one = BigUint::from(1u32);
+    let num_cons = 4usize;
+    let num_vars = 8usize;
+
+    // Row 0: w[0]*w[1] = w[2] (mod 14); row 1: w[3]*w[3] = w[3] (mod 0),
+    // the exact bit constraint.
+    let mat_a = vec![(0, 0, one.clone()), (1, 3, one.clone())];
+    let mat_b = vec![(0, 1, one.clone()), (1, 3, one.clone())];
+    let mat_c = vec![(0, 2, one.clone()), (1, 3, one.clone())];
+    let mods = vec![
+      BigUint::from(14u32),
+      BigUint::from(0u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+    ];
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods).unwrap();
+
+    let w: Vec<BigUint> = [3u32, 5, 1, 1, 0, 0, 0, 0]
+      .iter()
+      .map(|x| BigUint::from(*x))
+      .collect();
+    let q: Vec<BigUint> = [1u32, 0, 0, 0].iter().map(|x| BigUint::from(*x)).collect();
+
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &instance, &witness).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+  }
+
+  /// The exact bit row rejects non-binary values that a mod-N bit row
+  /// would accept: `b = N+1` satisfies `b² ≡ b (mod N)` with quotient
+  /// `q = N+1` (a benign lift), but `b² ≠ b` over ℤ, so the mod-0 row
+  /// is unsatisfiable.
+  #[test]
+  fn imod_modp_exact_bit_row_rejects_lift() {
+    let one = BigUint::from(1u32);
+    let n = BigUint::from(77u32); // stand-in composite "N"
+    let num_cons = 2usize;
+    let num_vars = 2usize;
+
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 0, one.clone())];
+    let mat_c = vec![(0, 0, one.clone())];
+    let mods = vec![BigUint::from(0u32), BigUint::from(2u32)];
+    let shape =
+      IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods).unwrap();
+
+    let (pk, _vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+
+    // b = N+1 with q = N+1 satisfies the mod-N version of this row; the
+    // mod-0 row must reject it regardless of the quotient.
+    let b = &n + &one;
+    let w = vec![b.clone(), BigUint::from(0u32)];
+    let q = vec![b, BigUint::from(0u32)];
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    assert!(shape.is_sat(&pk.ck, &instance, &witness).is_err());
+  }
+
   /// Wired circuit: the output of row 0 feeds into the input of row 1.
   /// w[2] is shared between C of row 0 and A of row 1.
   #[test]
@@ -849,7 +917,12 @@ mod tests {
     let mat_a = vec![(0, 0, one.clone()), (1, 2, one.clone())];
     let mat_b = vec![(0, 1, one.clone()), (1, 3, one.clone())];
     let mat_c = vec![(0, 2, one.clone()), (1, 4, one.clone())];
-    let mods = vec![n.clone(), n.clone(), BigUint::from(2u32), BigUint::from(2u32)];
+    let mods = vec![
+      n.clone(),
+      n.clone(),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+    ];
 
     let shape =
       IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, num_io, mat_a, mat_b, mat_c, mods)
