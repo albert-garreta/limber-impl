@@ -103,14 +103,22 @@ def plot_phase(phase: str, title: str, outname: str) -> bool:
                 color="#c0392b",
             )
 
-    ax.set_xlabel("constraints (log₂)")
+    ax.set_xlabel("Constraints")
     ax.set_ylabel(f"{title} time (ms)")
     ax.set_yscale("log")
     ax.set_xticks(SIZES)
     ax.set_xticklabels([f"$2^{{{lc}}}$" for lc in SIZES])
     ax.grid(True, which="both", linewidth=0.3, alpha=0.4)
-    ax.margins(y=0.18)  # headroom so ratio labels clear the frame
-    ax.legend(fontsize=8, loc="lower right")
+    ax.margins(y=0.15)  # headroom so ratio labels clear the frame
+    # Legend above the axes so it can never occlude either series.
+    ax.legend(
+        fontsize=8,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.0),
+        ncol=2,
+        frameon=False,
+        borderaxespad=0.2,
+    )
     fig.tight_layout()
 
     os.makedirs(OUTDIR, exist_ok=True)
@@ -190,6 +198,19 @@ def emit_pgfplots(phase: str, title: str, outname: str) -> bool:
             for lc, est in series[label]
         )
 
+    # Nice fixed-point y ticks (1/2/5 per decade within the data range) —
+    # avoids pgfplots' fractional-exponent ticks (e.g. 10^{1.5}) on
+    # narrow log ranges.
+    all_y = [est[0] for pts in series.values() for _, est in pts]
+    lo, hi = min(all_y) / 1.25, max(all_y) * 1.3
+    yticks = [
+        c * 10**k
+        for k in range(0, 7)
+        for c in (1, 2, 5)
+        if lo <= c * 10**k <= hi
+    ]
+    ytick_list = ",".join(str(t) for t in yticks)
+
     imod = dict(series["IntMod-Spartan"])
     base = dict(series["Spartan (native baseline)"])
     ratio_nodes = "\n".join(
@@ -216,10 +237,13 @@ def emit_pgfplots(phase: str, title: str, outname: str) -> bool:
         "    width=0.95\\linewidth, height=5.2cm,\n"
         "    ymode=log,\n"
         f"    xtick={{{ticks}}}, xticklabels={{{ticklabels}}},\n"
-        "    xlabel={constraints}, ylabel={" + title + " time (ms)},\n"
+        f"    ytick={{{ytick_list}}}, log ticks with fixed point,\n"
+        "    xlabel={Constraints}, ylabel={" + title + " time (ms)},\n"
         "    grid=both, grid style={gray!20},\n"
-        "    legend pos=south east, legend style={font=\\scriptsize},\n"
-        "    enlarge y limits={upper, value=0.35},\n"
+        "    % legend above the axes so it never occludes either series\n"
+        "    legend style={at={(0.5,1.03)}, anchor=south, legend columns=-1,\n"
+        "      font=\\scriptsize, draw=none, /tikz/every even column/.append style={column sep=8pt}},\n"
+        "    enlarge y limits={upper, value=0.2},\n"
         "    error bars/y dir=both, error bars/y explicit,\n"
         "  ]\n"
         "    \\addplot[ourscolor, thick, mark=*, mark size=1.8pt]\n"
@@ -242,11 +266,11 @@ def emit_pgfplots(phase: str, title: str, outname: str) -> bool:
 
 def main():
     ok = True
-    ok &= plot_phase("prove", "prover", "msshape_prove")
-    ok &= plot_phase("verify", "verifier", "msshape_verify")
+    ok &= plot_phase("prove", "Prover", "msshape_prove")
+    ok &= plot_phase("verify", "Verifier", "msshape_verify")
     ok &= emit_latex_table()
-    ok &= emit_pgfplots("prove", "prover", "msshape_prove_pgf")
-    ok &= emit_pgfplots("verify", "verifier", "msshape_verify_pgf")
+    ok &= emit_pgfplots("prove", "Prover", "msshape_prove_pgf")
+    ok &= emit_pgfplots("verify", "Verifier", "msshape_verify_pgf")
     if not ok:
         print(
             "\nmissing data — run:\n"
