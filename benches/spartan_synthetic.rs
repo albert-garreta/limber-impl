@@ -205,18 +205,17 @@ fn spartan_synthetic_benches(c: &mut Criterion) {
     });
   }
 
-  // MultiSwap-shaped *native baseline* for
-  // `imod_spartan_modp/.../msshape_c2^12_v2^13`: the same R1CS
-  // dimensions (2730 real gates → 2^12 cons / 2^13 vars) and full-width
-  // witness values, but native field gates — it does NOT express the
-  // imod side's mod-p (T256 base field) statement, which natively would
+  // MultiSwap-shaped *native baseline* sweep for
+  // `imod_spartan_modp/.../msshape_cN`: the same R1CS dimensions
+  // (gates → next-pow2 cons, 3·gates → vars) and full-width witness
+  // values, but native field gates — it does NOT express the imod
+  // side's mod-p (Tom-256 base field) statement, which natively would
   // need limb-decomposition gadgets. The ratio therefore reads as
   // "integer-machinery overhead vs the same shape natively". `wide`
   // keeps witness values full-width so the witness commit can't take
-  // the small-scalar MSM fast path.
-  {
-    let n = 2730usize;
-    let tag = "msshape";
+  // the small-scalar MSM fast path. Tags mirror the imod side.
+  for &n in &[682usize, 2730, 10922] {
+    let tag = format!("msshape_c{}", n.next_power_of_two().ilog2());
     // `is_small = false`: full-width witness values do NOT fit machine
     // words; claiming otherwise produces an invalid commitment via the
     // small-scalar MSM path and the proof fails verification.

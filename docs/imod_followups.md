@@ -141,11 +141,25 @@ size; promote into a phase plan when picked up.
   earlier and return `SpartanError::InvalidSumcheckProof` instead of
   panicking. Small.
 
-- **`DynPrime<4>::from_bytes_reduce` truncates to 32 bytes.** Anything
-  wider than 256 bits silently loses its top bytes. For our toy witnesses
-  (≤ 64-bit) we're fine, but if `T_f` ever exceeds 256 bits we'd be
-  silently producing wrong reductions. **Fix:** iterative chunk-wise reduction (or a
-  wider intermediate `Uint`). Medium.
+- **`DynPrime<4>::from_bytes_reduce` truncates to 32 bytes — CONFIRMED
+  LIVE COMPLETENESS BUG (2026-06-11).** Anything wider than 256 bits
+  silently loses its top bytes, so the Phase-2 Z_p layer binds the
+  *truncated* witness/moduli/quotients. An honest instance with random
+  >256-bit values fails to verify (`InvalidSumcheckProof`) — see
+  `tests/wide_value_probe.rs::wide_modulus_roundtrip_random_operands`
+  (`#[ignore]`d until fixed). **The MultiSwap bench only roundtrips
+  because its synthetic operands (`a = m − k₁`, `b = m − k₂`) satisfy
+  each row as a polynomial identity in `m`, which truncation
+  preserves** — its timing numbers are still width-representative, but
+  the wide path does not actually work for honest data, and a faithful
+  MultiSwap circuit (random intermediates) is blocked on this. Soundness
+  appears intact (the reduction-sumcheck glue catches the truncated-vs-
+  committed eval mismatch — that's exactly the failing check), but
+  deserves a focused review once fixed. **Fix:** iterative chunk-wise
+  reduction in `from_bytes_reduce` (fold 32-byte chunks with `2^256 mod
+  p` weights, like the Horner probe used to confirm the bug), then
+  un-ignore the regression test and re-bench MultiSwap. Medium, high
+  priority.
 
 - **`prove_with_iter` doesn't bind `p_i` into the iteration commits.** See
   the same item in Phase 3 follow-ups — applies to step C only, but it's

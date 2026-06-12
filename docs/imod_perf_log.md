@@ -236,6 +236,26 @@ quotient advice), matching the baseline's scope.
 Corrected headline ratio at msshape, k=7: **470.9 / 16.6 ≈ 28×**
 prove (verify unchanged, 5.7×; at k=8, 3.2×).
 
+### msshape size sweep + plots — 2026-06-11 (deadline run)
+
+Parameterized msshape over gates ∈ {682, 2730, 10922} → cons ∈
+{2^10, 2^12, 2^14}, with matching wide-value plain-Spartan baselines
+(tags `msshape_c{10,12,14}` on both benches).
+`scripts/plot_msshape.py` reads criterion JSON and writes
+`docs/plots/msshape_{prove,verify}.{pdf,png}`.
+
+| cons | imod prove | base prove | ratio | imod verify | base verify | ratio |
+|------|-----------|------------|-------|-------------|-------------|-------|
+| 2^10 | 268.4 ms  | 11.8 ms    | 23×   | 23.2 ms     | 5.87 ms     | 3.9×  |
+| 2^12 | 454.6 ms  | 16.9 ms    | 27×   | 38.4 ms     | 6.67 ms     | 5.9×  |
+| 2^14 | 860.9 ms  | 25.0 ms    | 35×   | 53.1 ms     | 7.63 ms     | 6.9×  |
+
+Both systems are strongly sublinear over this range (fixed costs
+dominate: imod grows 3.2× over a 16× size increase, the baseline
+2.1×); the ratio creeps up because the baseline's fixed costs
+amortize faster. All at default k=7 — the 2^14 w-poly has 17 total
+vars (t=2); a per-size k re-derivation would flatten the top end.
+
 `IMOD_K` sweep at msshape (w-poly has 13+3=16 total vars, so k=7 forces
 `t=2`; k≥8 collapses both opens to `t=1`):
 

@@ -86,10 +86,11 @@ fn setup_for(
 /// this statement — natively it would need limb-decomposition gadgets
 /// (~10²-10³ constraints per gate) — so the ratio reads as "machinery
 /// overhead vs what the same shape costs natively", not same-statement.
-fn make_msshape_shape_and_operands() -> (IntModR1CSShapeModp<M>, Vec<(BigUint, BigUint)>) {
-  let num_real: usize = 2730;
-  let num_cons = num_real.next_power_of_two(); // 2^12
-  let num_vars = (3 * num_real).next_power_of_two(); // 2^13
+fn make_msshape_shape_and_operands(
+  num_real: usize,
+) -> (IntModR1CSShapeModp<M>, Vec<(BigUint, BigUint)>) {
+  let num_cons = num_real.next_power_of_two();
+  let num_vars = (3 * num_real).next_power_of_two();
   let n = t256_base_modulus();
   let mut rng = rand::rngs::StdRng::seed_from_u64(0x6d73_7368);
 
@@ -140,11 +141,19 @@ fn msshape_witness(
 }
 
 /// Convenience wrapper (one-shot + verify-bench setup paths).
-fn make_msshape_shape_and_witness() -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
-  let (shape, operands) = make_msshape_shape_and_operands();
+fn make_msshape_shape_and_witness(
+  num_real: usize,
+) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
+  let (shape, operands) = make_msshape_shape_and_operands(num_real);
   let (w, q) = msshape_witness(&shape, &operands);
   (shape, w, q)
 }
+
+/// Gate counts for the msshape size sweep: `⌊2^v / 3⌋` gates fill
+/// `(2^(v−1) cons, 2^v vars)` with the 3-fresh-columns layout, mirroring
+/// MultiSwap k=0's padding (2715 real rows → 2^12/2^13). The middle
+/// entry is the MultiSwap k=0 shape itself.
+const MSSHAPE_GATES: &[usize] = &[682, 2730, 10922];
 
 /// Setup for the MultiSwap-shaped config: `log_t_f = 256` (limb-split
 /// into 8 limbs of 32 bits), honoring the `IMOD_K` override.
@@ -246,7 +255,7 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
       proof.verify(&vk, &instance).unwrap();
     }
     {
-      let (shape, w, q) = make_msshape_shape_and_witness();
+      let (shape, w, q) = make_msshape_shape_and_witness(2730);
       let (pk, vk) = setup_msshape(shape.clone());
       let (witness, instance) =
         IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
@@ -310,12 +319,13 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
     });
   }
 
-  // MultiSwap-shaped config: 2^12 cons / 2^13 vars, full-width gates
-  // mod the T256 base-field modulus (foreign to the native scalar
-  // field). Shape-matched against plain Spartan's
-  // `spartan_synthetic/.../msshape` native baseline.
-  {
-    let tag = "msshape_c2^12_v2^13";
+  // MultiSwap-shaped size sweep: full-width gates mod the T256 (Tom-256)
+  // base-field modulus, foreign to the native scalar field. Shape-matched
+  // against plain Spartan's `spartan_synthetic/.../msshape_cN` native
+  // baselines. Tag is `msshape_c{log2 cons}`.
+  for &gates in MSSHAPE_GATES {
+    let lc = gates.next_power_of_two().ilog2();
+    let tag = format!("msshape_c{lc}");
     // Timed region = witness generation (per-gate divmods producing c
     // and the quotient advice) + witness commitment + prove, matching
     // the plain-Spartan baseline whose prove synthesizes and commits
@@ -323,7 +333,7 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, operands) = make_msshape_shape_and_operands();
+          let (shape, operands) = make_msshape_shape_and_operands(gates);
           let (pk, _vk) = setup_msshape(shape.clone());
           (pk, shape, operands)
         },
@@ -340,7 +350,7 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
     g.bench_function(format!("verify/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, w, q) = make_msshape_shape_and_witness();
+          let (shape, w, q) = make_msshape_shape_and_witness(gates);
           let (pk, vk) = setup_msshape(shape.clone());
           let (witness, instance) =
             IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
