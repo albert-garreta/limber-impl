@@ -4,8 +4,9 @@
 
 //! Parallel sumcheck protocol bound on `SumcheckEngine`, used by Phase-2
 //! IntMod-Spartan. Lives alongside `src/sumcheck.rs` rather than
-//! replacing it — see [[project-phase2-parallel-sumcheck]] in memory
-//! for the rationale.
+//! replacing it, so the field-generic stack stays untouched and the two
+//! implementations can be differentially tested; a later unification
+//! remains possible.
 //!
 //! Deliberately minimal: no BDDT round-0 optimization, no Gruen
 //! eq-factoring, no delayed-reduction Montgomery accumulators. Just the

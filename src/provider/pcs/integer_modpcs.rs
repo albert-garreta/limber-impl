@@ -317,7 +317,7 @@ impl IntEvalParams {
   /// per-scalar cost of a Hyrax commit plus its share of the batched
   /// open). This is a *ranking heuristic* for `derive_optimized`, not a
   /// performance guarantee — soundness is enforced independently by
-  /// `validate`, so a mis-ranked candidate costs time, never security.
+  /// `validate`, so a misranked candidate costs time, never security.
   ///
   /// Terms, mirroring the prove path:
   ///   - `f_limb` commit/open plus its `T`-bound 16-bit-chunk range

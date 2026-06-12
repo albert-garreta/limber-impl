@@ -74,14 +74,9 @@ Override thread counts with `BENCH_THREADS` (comma-separated):
 BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spartan
 ```
 
-Measured results and analysis are logged in
-[docs/imod_perf_log.md](docs/imod_perf_log.md);
-[scripts/](scripts/) regenerates the MultiSwap shape plots.
-
 ## References
 
-*SNARKs for Integers* — the protocol this repository implements
-(see [docs/imod_r1cs_plan.md](docs/imod_r1cs_plan.md)).
+*SNARKs for Integers* — the protocol this repository implements.
 
 [Spartan: Efficient and general-purpose zkSNARKs without trusted setup](https://eprint.iacr.org/2019/550) \
 Srinath Setty \

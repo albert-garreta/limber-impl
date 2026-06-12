@@ -13,8 +13,7 @@
 //! `imod_spartan` need. Optimizations from `src/polys/` (zero-skip
 //! prefixes, delayed-reduction accumulators, fast bind paths) are
 //! omitted — they're either static-modulus-specific or can be added
-//! back later if benchmarks demand. See [[project-phase2-parallel-
-//! sumcheck]] in memory for the migration rationale.
+//! back later if benchmarks demand.
 
 pub mod eq;
 pub mod multilinear;

@@ -9,8 +9,7 @@
 //!
 //! Used by Phase-2 IntMod-Spartan when the SNARK arithmetic happens
 //! modulo a verifier-sampled ~128-bit prime that isn't known at compile
-//! time. See [[project-paper-revision-modpcs]] and
-//! [[project-phase2-parallel-sumcheck]] in memory for the broader plan.
+//! time.
 
 use crate::traits::{mod_engine::SumcheckField, transcript::TranscriptReprTrait};
 use crypto_bigint::{
