@@ -1,71 +1,125 @@
-# Spartan and NeutronNova: Fast client-side zero-knowledge proving systems
+# spartan-inteval: SNARKs for Integers on Spartan
 
-A client-side zkSNARK library built on the Spartan sum-check proof
-system and NeutronNova's folding scheme. Spartan2 powers
-[Vega](https://eprint.iacr.org/2025/2094).
+A research prototype of **Integer Mod-R1CS** proving — SNARKs whose
+constraints are modular arithmetic over arbitrary, per-constraint
+integer moduli — built as a fork of
+[Microsoft Spartan2](https://github.com/Microsoft/Spartan2). It
+implements the protocol from the accompanying *SNARKs for Integers*
+paper (Def. 5.4) on top of Spartan's sum-check pipeline.
 
-## What this library provides
+**Status:** research code. Not audited, not constant-time, and the
+integer witness handling currently assumes non-negative bounded
+values. Use for benchmarking and experimentation only.
 
-- **Spartan zkSNARK** — a PCS-generic Rust implementation of
-  [Spartan](https://eprint.iacr.org/2019/550), a sum-check-based zkSNARK
-  with a linear-time prover. Accepts R1CS circuits written with
-  [bellpepper](https://github.com/lurk-lab/bellpepper). Spartan is
-  PCS-agnostic and works with any multilinear polynomial commitment
-  scheme (Hyrax, HyperKZG, Binius, WHIR, BaseFold, Dory, PST13, …); the
-  choice determines field size, security model (pre- or post-quantum),
-  setup assumptions (transparent or universal), and commitment style
-  (hash- or curve-based). While Spartan supports R1CS, Plonkish, AIR,
-  and CCS in principle (with lookup constraints fitting natively via
-  Spartan's internal lookup arguments), this library currently exposes
-  the R1CS frontend. Zero-knowledge is obtained via Nova's folding
-  scheme. The Spark optimization is not implemented, so verifier work
-  is proportional to the number of non-zero R1CS entries.
+## Why integer Mod-R1CS
 
-- **NeutronNova zkSNARK** — a non-recursive implementation of
+Standard R1CS forces all arithmetic into one fixed prime field, so a
+single multiplication modulo a foreign modulus `N` (say, a 2048-bit RSA
+modulus) costs thousands of constraints in limb-decomposed form. The
+Integer Mod-R1CS relation works over the integers with a **per-row
+modulus** `m_i` and a prover-supplied quotient `q_i`:
+
+```text
+A·z ∘ B·z = C·z + m ∘ q        (over Z, with bounded norms)
+```
+
+so one row *is* one modular multiplication `LC_A · LC_B ≡ LC_C (mod m_i)`,
+regardless of how wide `m_i` is. The sum-check is then run modulo a
+random prime `p` sampled by the verifier via Fiat–Shamir.
+
+## What's implemented
+
+The integer-proving work is staged; both phases live side by side:
+
+- **Phase 1 — [`imod_spartan`](src/imod_spartan.rs) over
+  [`imod_r1cs`](src/imod_r1cs/mod.rs).** The IntMod-R1CS relation
+  proved entirely in the curve scalar field (`p = q`). Single witness
+  segment, no limb decomposition, no range checks — the simplest
+  version that exercises every structural change relative to plain
+  Spartan.
+
+- **Phase 2 — [`imod_spartan_modp`](src/imod_spartan_modp.rs) over
+  [`imod_r1cs_modp`](src/imod_r1cs_modp/mod.rs).** Shapes, witnesses,
+  and matrix entries are integer-valued (`BigUint`); the sum-check
+  prime `p` is sampled from the transcript by Miller–Rabin rejection
+  sampling and the protocol runs in the runtime-modulus field
+  [`DynPrime`](src/dyn_prime.rs). The driver is generic over a
+  `ModEngine` whose **Mod-PCS** commits integer polynomials and opens
+  them at `Z_p` points (current instantiation:
+  [`integer_modpcs`](src/provider/pcs/integer_modpcs.rs) with the
+  `T256DynPrimeEngine` provider). A parallel sum-check / polynomial
+  stack ([`sumcheck_modp`](src/sumcheck_modp.rs),
+  [`polys_modp/`](src/polys_modp/)) keeps this independent of the
+  field-generic code paths.
+
+- **[`logup_gkr`](src/logup_gkr.rs)** — a LogUp-GKR range proof
+  (fractional-sum GKR over the logarithmic-derivative lookup identity)
+  for `[0, 2^bits)` range checks, reduced to two PCS openings.
+
+Planned next phases (dual fields `p ≠ q` end-to-end, limb-split with
+range checks pushed into the PCS) are tracked in
+[docs/imod_r1cs_plan.md](docs/imod_r1cs_plan.md) and
+[docs/imod_followups.md](docs/imod_followups.md).
+
+## The base library
+
+The fork retains Spartan2's proving systems, which the integer work
+builds on and benchmarks against:
+
+- **Spartan zkSNARK** — a PCS-generic implementation of
+  [Spartan](https://eprint.iacr.org/2019/550), a sum-check-based
+  zkSNARK with a linear-time prover. Accepts R1CS circuits written
+  with [bellpepper](https://github.com/lurk-lab/bellpepper) and works
+  with any multilinear PCS (Hyrax engines over Pallas/Vesta/P-256/T-256
+  and BN254 are provided). Zero-knowledge is obtained via Nova's
+  folding scheme.
+
+- **NeutronNova zkSNARK** — non-recursive
   [NeutronNova](https://eprint.iacr.org/2024/1606) folding for uniform
-  computations: given many instances of a single **step circuit**, all
-  R1CS instances are multi-folded into one and the folded instance is
-  proved with Spartan, amortizing the prover across the batch. An
-  optional **core circuit** can tie the batch together (e.g., to
-  enforce cross-step consistency).
+  computations: many instances of one step circuit are multi-folded
+  into a single R1CS instance proved with Spartan, amortizing the
+  prover across the batch.
 
-- **Precomputable / online witness split.** Both protocols expose
-  `setup` → `prep_prove` → `prove`. `setup` produces circuit-shape key
-  material. `prep_prove` processes the *precomputable* witness — the
-  portion known ahead of proving time — synthesizing and committing to
-  it; for NeutronNova it also caches the per-step matrix-vector
-  products (`Az`, `Bz`, `Cz`). `prove` consumes fresh *online* witness
-  data (challenges, rest-witness, fresh randomness), runs NeutronNova's
-  multi-folding rounds where applicable, and produces the final proof.
-  The `prep_prove` state can be reused across multiple `prove` calls,
-  so amortizable work is paid once. This is the pattern
-  [Vega](https://eprint.iacr.org/2025/2094) relies on for low-latency
-  proving.
+- **Precomputable / online witness split** — both protocols expose
+  `setup` → `prep_prove` → `prove`, so witness material known ahead of
+  time is synthesized and committed once and reused across proofs.
+  This is the pattern [Vega](https://eprint.iacr.org/2025/2094) relies
+  on for low-latency proving.
 
-- **Criterion benchmarks** — `benches/sha256_spartan.rs` and
-  `benches/sha256_neutronnova.rs` measure setup, prep_prove, prove, and
-  verify across message sizes and thread counts, and report proof
-  sizes.
+## Benchmarks
 
-## Running benchmarks
-
-The `benches/` directory contains SHA-256 benchmarks for both protocols using [Criterion](https://github.com/bheisler/criterion.rs). Each benchmark measures setup, prep_prove, prove, and verify times across multiple iterations and thread counts, and reports proof sizes.
+All benchmarks use [Criterion](https://github.com/bheisler/criterion.rs)
+and report setup / (prep_)prove / verify times plus proof sizes. Run
+with native CPU codegen:
 
 ```bash
-# Spartan: SHA-256 over 1 KiB and 2 KiB messages
-RUSTFLAGS="-C target-cpu=native" cargo bench --bench sha256_spartan
-
-# NeutronNova: 32 SHA-256 step circuits (2048 bytes total)
-RUSTFLAGS="-C target-cpu=native" cargo bench --bench sha256_neutronnova
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 ```
+
+| Bench | What it measures |
+| --- | --- |
+| `imod_spartan` | Phase-1 IntMod-Spartan on synthetic modular multiplications |
+| `imod_spartan_modp` | Phase-2 driver (`T256DynPrimeEngine` + integer Mod-PCS) on the same shapes |
+| `spartan_synthetic` | Plain-Spartan baseline, shape-matched to the imod benches |
+| `multiswap_modp` | MultiSwap (RSA-accumulator swap batches, [OWWB20](https://eprint.iacr.org/2019/1494)) with wired 2048-bit square-and-multiply chains — one imod row per `mod N` multiply |
+| `logup_gkr` | LogUp-GKR range proof in isolation |
+| `sha256_spartan` | Spartan over SHA-256 (1–2 KiB messages) |
+| `sha256_neutronnova` | NeutronNova over 32 SHA-256 step circuits |
 
 Override thread counts with `BENCH_THREADS` (comma-separated):
 
 ```bash
-BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench sha256_spartan
+BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spartan
 ```
 
+Measured results and analysis are logged in
+[docs/imod_perf_log.md](docs/imod_perf_log.md);
+[scripts/](scripts/) regenerates the MultiSwap shape plots.
+
 ## References
+
+*SNARKs for Integers* — the protocol this repository implements
+(see [docs/imod_r1cs_plan.md](docs/imod_r1cs_plan.md)).
 
 [Spartan: Efficient and general-purpose zkSNARKs without trusted setup](https://eprint.iacr.org/2019/550) \
 Srinath Setty \
@@ -79,24 +133,12 @@ IACR ePrint 2024/1606
 Darya Kaviani, Srinath Setty \
 IEEE S&P 2026
 
-## Contributing
+[Scaling Verifiable Computation Using Efficient Set Accumulators](https://eprint.iacr.org/2019/1494) \
+Alex Ozdemir, Riad S. Wahby, Barry Whitehat, Dan Boneh \
+USENIX Security 2020
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
+## License
 
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
+MIT, inherited from the upstream
+[Spartan2](https://github.com/Microsoft/Spartan2) project — see
+[LICENSE](LICENSE).
