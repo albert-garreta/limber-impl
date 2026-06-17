@@ -518,16 +518,23 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       );
     });
 
+    // Timed region = the full prover pipeline: witness generation
+    // (`multiswap_shape_and_witness`, dominated by the real RSA-2048
+    // exponentiation advice) + witness commitment + prove. The untimed
+    // setup closure holds only the SNARK setup (PCS key derivation); the
+    // shape it builds there is discarded except for the keys, and is
+    // regenerated alongside the witness in the routine. `witness_advice`
+    // and `commit_witness` above isolate the two pre-prove phases.
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, w, q) = multiswap_shape_and_witness(dims);
+          let (shape, _, _) = multiswap_shape_and_witness(dims);
           let params = params_for(&shape, DEFAULT_K);
-          let (pk, _vk) =
-            IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
-          (pk, shape, w, q)
+          let (pk, _vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape, params).unwrap();
+          pk
         },
-        |(pk, shape, w, q)| {
+        |pk| {
+          let (shape, w, q) = multiswap_shape_and_witness(dims);
           let (witness, instance) =
             IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
           let _ = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();

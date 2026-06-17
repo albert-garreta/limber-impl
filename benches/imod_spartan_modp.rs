@@ -174,13 +174,15 @@ fn setup_msshape(
   IntModSpartanModpSNARK::<M>::setup_with_params(shape, params).unwrap()
 }
 
+/// Synthetic modulus shared by `make_shape` and `synth_witness`.
+const SYNTH_MODULUS: u64 = 7;
+
 /// Synthetic shape: `num_cons` independent modular multiplications, each
 /// using three fresh witness columns. Witness columns are laid out as
-/// `w = [a_0, b_0, c_0, a_1, b_1, c_1, …]` padded to `num_vars`.
-fn make_shape_and_witness(
-  num_cons: usize,
-  num_vars: usize,
-) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
+/// `w = [a_0, b_0, c_0, a_1, b_1, c_1, …]` padded to `num_vars`. This is
+/// the relation/circuit — built in the (untimed) bench setup closure, not
+/// part of the prover's per-proof work.
+fn make_shape(num_cons: usize, num_vars: usize) -> IntModR1CSShapeModp<M> {
   assert!(
     3 * num_cons <= num_vars,
     "num_vars must hold 3·num_cons columns"
@@ -198,15 +200,18 @@ fn make_shape_and_witness(
     c_entries.push((i, 3 * i + 2, one.clone()));
   }
 
-  let modulus: u64 = 7;
-  let mods = vec![BigUint::from(modulus); num_cons];
+  let mods = vec![BigUint::from(SYNTH_MODULUS); num_cons];
 
-  let shape = IntModR1CSShapeModp::<M>::new(
+  IntModR1CSShapeModp::<M>::new(
     num_cons, num_vars, num_io, a_entries, b_entries, c_entries, mods,
   )
-  .unwrap();
+  .unwrap()
+}
 
-  // Witness: pick small a, b so a·b fits in u64; choose c, q so a·b = c + N·q.
+/// Witness generation: the prover's per-proof work, so it belongs in the
+/// timed region. Picks small a, b so a·b fits in u64; chooses c, q so
+/// a·b = c + N·q under `SYNTH_MODULUS`.
+fn synth_witness(num_cons: usize, num_vars: usize) -> (Vec<BigUint>, Vec<BigUint>) {
   let zero = BigUint::from(0u32);
   let mut w = vec![zero.clone(); num_vars];
   let mut q = vec![zero; num_cons];
@@ -214,14 +219,20 @@ fn make_shape_and_witness(
     let a = (i as u64 % 100) + 1;
     let b = ((i as u64 * 7) % 100) + 1;
     let ab = a * b;
-    let qi = ab / modulus;
-    let ci = ab % modulus;
     w[3 * i] = BigUint::from(a);
     w[3 * i + 1] = BigUint::from(b);
-    w[3 * i + 2] = BigUint::from(ci);
-    q[i] = BigUint::from(qi);
+    w[3 * i + 2] = BigUint::from(ab % SYNTH_MODULUS);
+    q[i] = BigUint::from(ab / SYNTH_MODULUS);
   }
+  (w, q)
+}
 
+fn make_shape_and_witness(
+  num_cons: usize,
+  num_vars: usize,
+) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
+  let shape = make_shape(num_cons, num_vars);
+  let (w, q) = synth_witness(num_cons, num_vars);
   (shape, w, q)
 }
 
@@ -284,17 +295,22 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
       );
     });
 
-    // The timed region includes the witness commitment
-    // (`IntModR1CSWitnessModp::new` commits w and q) — the plain-Spartan
-    // baseline's prove likewise synthesizes + commits its witness.
+    // Timed region = the full prover pipeline: witness generation
+    // (`synth_witness`) + witness commitment (`IntModR1CSWitnessModp::new`
+    // commits w and q) + prove. The untimed setup closure holds only the
+    // circuit/shape and the SNARK setup (PCS key derivation) — which is
+    // reusable, verifier-shared work and also has its own `setup/` group.
+    // The plain-Spartan baseline likewise synthesizes + commits its
+    // witness inside the timed prove.
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, w, q) = make_shape_and_witness(num_cons, num_vars);
+          let shape = make_shape(num_cons, num_vars);
           let (pk, _vk) = setup_for(shape.clone());
-          (pk, shape, w, q)
+          (pk, shape)
         },
-        |(pk, shape, w, q)| {
+        |(pk, shape)| {
+          let (w, q) = synth_witness(num_cons, num_vars);
           let (witness, instance) =
             IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
           let _ = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
