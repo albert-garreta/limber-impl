@@ -123,7 +123,7 @@ pub trait SumcheckField:
   /// at most `LIMBS * 8` bytes, so for a modulus near that width the
   /// challenge is slightly biased. Fine for the Phase-2 prototype; a
   /// soundness-grade version needs wide reduction (≥ modulus_bits + 128
-  /// input bits).
+  /// input bits). Tracked in docs/imod_followups.md.
   fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self;
 }
 
@@ -286,7 +286,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   ///
   /// Mirrors `PCSEngineTrait::blind` for the Phase-2 step-6 wrapping
   /// pattern. For future hash-based / non-hiding Mod-PCS impls, this can
-  /// return a unit-typed sentinel.
+  /// return a unit-typed sentinel (see `docs/imod_followups.md`).
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
 
   /// Commit to an **integer-valued** polynomial. Each entry is a
