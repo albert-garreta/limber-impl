@@ -47,7 +47,7 @@ type MParams<M> = <MScalar<M> as SumcheckField>::Params;
 type ModPCS<M> = <M as ModEngine>::ModPCS;
 type ModCK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::CommitmentKey;
 type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
-type ModEvalArg<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::EvaluationArgument;
+type ModBatchEvalArg<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::BatchEvaluationArgument;
 
 /// Convert a `BigUint` integer into an `M::Scalar` value by reducing
 /// modulo the runtime modulus carried in `params`.
@@ -116,9 +116,10 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
   // inner sumcheck (for w)
   sc_inner: SumcheckProof<M>,
   eval_w: MScalar<M>,
-  eval_arg_w: ModEvalArg<M>,
-  // Q opening at r_x
-  eval_arg_q: ModEvalArg<M>,
+  // Mod-PCS opening of W (at r_y[1..]) and Q (at r_x) merged into ONE
+  // batched argument: a single shared LogUp-GKR range check and a single
+  // combined inner-product opening cover both polynomials.
+  eval_arg: ModBatchEvalArg<M>,
 }
 
 impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
@@ -322,35 +323,25 @@ where
     let eval_w = (eval_z - r_y[0] * eval_x) * inv;
     info!(elapsed_ms = %er_t.elapsed().as_millis(), "imod_modp_eval_recover");
 
-    // Mod-PCS open W at r_y[1..]. Mod-PCS commits/opens integers — pass
-    // the original BigUint witness and the Z_p eval reduced into a
-    // BigUint in [0, p).
-    let (_wopen_span, wopen_t) = start_span!("imod_modp_w_open");
+    // Mod-PCS open W at r_y[1..] and Q at r_x in ONE batched argument:
+    // both polynomials share a single LogUp-GKR range check and a single
+    // combined inner-product opening, instead of paying that fixed
+    // per-open cost twice. Mod-PCS commits/opens integers — pass the
+    // original BigUint witness/quotient and the Z_p evals reduced into
+    // BigUints in [0, p).
+    let (_open_span, open_t) = start_span!("imod_modp_wq_open");
     let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
-    let eval_arg_w = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
-      &pk.ck,
-      &mut transcript,
-      &U.comm_w,
-      &W.w,
-      &W.r_w,
-      &r_y[1..],
-      &eval_w_bu,
-    )?;
-    info!(elapsed_ms = %wopen_t.elapsed().as_millis(), "imod_modp_w_open");
-
-    // Mod-PCS open Q at r_x.
-    let (_qopen_span, qopen_t) = start_span!("imod_modp_q_open");
     let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
-    let eval_arg_q = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
+    let eval_arg = <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch(
       &pk.ck,
       &mut transcript,
-      &U.comm_q,
-      &W.q,
-      &W.r_q,
-      &r_x,
-      &v_q_bu,
+      &[&U.comm_w, &U.comm_q],
+      &[W.w.as_slice(), W.q.as_slice()],
+      &[&W.r_w, &W.r_q],
+      &[&r_y[1..], &r_x[..]],
+      &[&eval_w_bu, &v_q_bu],
     )?;
-    info!(elapsed_ms = %qopen_t.elapsed().as_millis(), "imod_modp_q_open");
+    info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_modp_wq_open");
 
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "imod_spartan_modp_prove");
     Ok(Self {
@@ -362,8 +353,7 @@ where
       v_q,
       sc_inner,
       eval_w,
-      eval_arg_w,
-      eval_arg_q,
+      eval_arg,
     })
   }
 
@@ -468,31 +458,20 @@ where
     }
     info!(elapsed_ms = %em_t.elapsed().as_millis(), "imod_modp_eval_matrices");
 
-    // Mod-PCS verification for W at r_y[1..].
-    let (_wver_span, wver_t) = start_span!("imod_modp_w_verify");
+    // Mod-PCS verification for W (at r_y[1..]) and Q (at r_x) in ONE
+    // batched argument, mirroring the prover's merged open.
+    let (_wqver_span, wqver_t) = start_span!("imod_modp_wq_verify");
     let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
-    <ModPCS<M> as ModPCSEngineTrait<M>>::verify(
-      &vk.vk_ee,
-      &mut transcript,
-      &U.comm_w,
-      &r_y[1..],
-      &eval_w_bu,
-      &self.eval_arg_w,
-    )?;
-    info!(elapsed_ms = %wver_t.elapsed().as_millis(), "imod_modp_w_verify");
-
-    // Mod-PCS verification for Q at r_x.
-    let (_qver_span, qver_t) = start_span!("imod_modp_q_verify");
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
-    <ModPCS<M> as ModPCSEngineTrait<M>>::verify(
+    <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch(
       &vk.vk_ee,
       &mut transcript,
-      &U.comm_q,
-      &r_x,
-      &v_q_bu,
-      &self.eval_arg_q,
+      &[&U.comm_w, &U.comm_q],
+      &[&r_y[1..], &r_x[..]],
+      &[&eval_w_bu, &v_q_bu],
+      &self.eval_arg,
     )?;
-    info!(elapsed_ms = %qver_t.elapsed().as_millis(), "imod_modp_q_verify");
+    info!(elapsed_ms = %wqver_t.elapsed().as_millis(), "imod_modp_wq_verify");
 
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "imod_spartan_modp_verify");
     Ok(())

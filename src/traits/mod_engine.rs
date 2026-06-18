@@ -271,6 +271,12 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Evaluation-argument data sent in the proof.
   type EvaluationArgument: Clone + Debug + Send + Sync + Serialize + for<'de> Deserialize<'de>;
 
+  /// Evaluation-argument data for a *batched* multi-polynomial opening
+  /// ([`prove_batch`](Self::prove_batch)). Sound impls share the
+  /// expensive per-open machinery (range checks, inner-product argument)
+  /// across all polynomials.
+  type BatchEvaluationArgument: Clone + Debug + Send + Sync + Serialize + for<'de> Deserialize<'de>;
+
   /// Sample commitment keys for vectors of length up to `n`.
   fn setup(
     label: &'static [u8],
@@ -334,5 +340,37 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     point: &[E::Scalar],
     eval: &BigUint,
     arg: &Self::EvaluationArgument,
+  ) -> Result<(), SpartanError>;
+
+  /// Prove a *batch* of openings — polynomial `polys[i]` (committed by
+  /// `comms[i]` with blind `blinds[i]`) evaluates at `points[i]` to
+  /// `evals[i]` — in ONE argument. The `i`-th opening uses the same
+  /// arguments it would as a standalone [`prove`](Self::prove) call; the
+  /// distinction is that sound impls discharge all openings through a
+  /// single shared range check and inner-product argument rather than
+  /// repeating that fixed per-open work `polys.len()` times. All slices
+  /// have equal length; `points[i]` may differ in length (the
+  /// polynomials need not share a number of variables). The transcript is
+  /// threaded through all openings in index order.
+  fn prove_batch(
+    ck: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError>;
+
+  /// Verify a batched opening produced by [`prove_batch`](Self::prove_batch).
+  /// `comms`, `points`, and `evals` mirror the prover's inputs in the
+  /// same index order.
+  fn verify_batch(
+    vk: &Self::VerifierKey,
+    transcript: &mut E::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
   ) -> Result<(), SpartanError>;
 }

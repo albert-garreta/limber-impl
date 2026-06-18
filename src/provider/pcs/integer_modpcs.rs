@@ -611,6 +611,41 @@ pub struct IntEvalArgument {
   pub(crate) combined_open: CombinedBatchOpen,
 }
 
+/// Per-polynomial portion of a batched [`IntEvalBatchArgument`]: the same
+/// reduction-sumcheck round polynomials, integer evaluation, chains, and
+/// stacked-layer commitments a standalone [`IntEvalArgument`] carries,
+/// minus the range check and combined opening (which are shared across
+/// the whole batch).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IntEvalPerPolyArgument {
+  /// See [`IntEvalArgument::reduction_round_polys`].
+  pub reduction_round_polys: Vec<Vec<BigUint>>,
+  /// See [`IntEvalArgument::int_v_prime`].
+  pub int_v_prime: BigInt,
+  /// See [`IntEvalArgument::chains`].
+  pub chains: Vec<ChainData>,
+  /// See [`IntEvalArgument::ab_comms`].
+  pub(crate) ab_comms: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+}
+
+/// Evaluation argument for a *batched* Mod-PCS open of several integer
+/// polynomials at (possibly distinct) points. Each polynomial's reduction
+/// sumcheck and per-prime chains run independently
+/// ([`IntEvalPerPolyArgument`]), but ALL of their range-check batches are
+/// discharged by ONE shared LogUp-GKR range check and ALL of their
+/// evaluation claims by ONE combined inner-product opening — so the fixed
+/// per-open costs (the `2^16`-table-side GKR, the merged IPA) are paid
+/// once for the whole batch instead of once per polynomial.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IntEvalBatchArgument {
+  /// One entry per opened polynomial, in the caller's input order.
+  pub per_poly: Vec<IntEvalPerPolyArgument>,
+  /// ONE shared LogUp-GKR range check covering every batch of every poly.
+  pub(crate) range_check: SharedRangeCheck,
+  /// ONE combined opening discharging every evaluation claim of every poly.
+  pub(crate) combined_open: CombinedBatchOpen,
+}
+
 /// ONE combined multi-point opening for ALL commitments of a Mod-PCS
 /// open. Per commitment, its claims are RLC-combined (`Σ_i λ^i·y_i =
 /// Σ_x f(x)·W(x)`); the per-commitment degree-2 sumchecks then run
@@ -1169,6 +1204,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   type Commitment = IntegerModCommitment;
   type Blind = IntegerModBlind;
   type EvaluationArgument = IntEvalArgument;
+  type BatchEvaluationArgument = IntEvalBatchArgument;
 
   /// Trait-driven setup: derive `IntEvalParams` optimized for this
   /// polynomial size via [`IntEvalParams::derive_optimized`], with the
@@ -1279,464 +1315,66 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     eval: &BigUint,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove");
-    let params = &ck.params;
-    let monty = point
-      .first()
-      .map(|p| *p.params())
-      .ok_or(SpartanError::InternalError {
-        reason: "IntegerModPCS::prove: empty point".to_string(),
-      })?;
-
-    let (_red_span, red_t) = start_span!("imod_pcs_reduction_sc");
-    // 0. Limb-split f → f_limb. For numlimb=1 this is a literal pass-
-    //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
-    //    coefficients (and 2^numlimb_var slots per original coefficient,
-    //    padded with zero if numlimb isn't a power of two).
-    let (_ls_span, ls_t) = start_span!("imod_pcs_red_limb_split");
-    let f_limb = limb_split_polynomial(poly, params.log_t, params.log_t_f);
-    info!(elapsed_ms = %ls_t.elapsed().as_millis(), "imod_pcs_red_limb_split");
-
-    // 1. Reduction sumcheck (Phase-3 step D3): reduce the eval claim
-    //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
-    //    point `(int_r, r_k)` where `r_k` are the sumcheck challenges.
-    //    Integrand: `limb(k) · f_limb(int_r, k)`, summed over k ∈
-    //    {0,1}^numlimb_var. For numlimb_var = 0 the sumcheck has zero
-    //    rounds, returns `r_k = []`, and the recovered eval equals
-    //    the input `eval` directly (limb(empty) = T^0 = 1).
-    let (_dc_span, dc_t) = start_span!("imod_pcs_red_to_dynprime");
-    let f_limb_p: Vec<crate::dyn_prime::DynPrime<4>> = f_limb
-      .iter()
-      .map(|b| {
-        <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
-          &monty,
-          &b.to_bytes_le(),
-        )
-      })
-      .collect();
-    info!(elapsed_ms = %dc_t.elapsed().as_millis(), "imod_pcs_red_to_dynprime");
-    // Partial-eval f_limb at the original `point` in Z_p, leaving the
-    // last numlimb_var variables free. Bind the top variables (= the
-    // original n_vars) one at a time.
-    let (_pe_span, pe_t) = start_span!("imod_pcs_red_dynprime_bind");
-    let mut mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
-    for r_i in point {
-      mle.bind_poly_var_top(r_i);
-    }
-    let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<4>> = mle.into_vec();
-    info!(elapsed_ms = %pe_t.elapsed().as_millis(), "imod_pcs_red_dynprime_bind");
-    debug_assert_eq!(f_limb_at_int_r.len(), 1 << params.numlimb_var);
-
-    let limb_p = build_limb_weight_dynprime(params, &monty);
-    let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
-      &monty,
-      &eval.to_bytes_le(),
-    );
-
-    let mut poly_lhs = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
-    let mut poly_rhs =
-      crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_at_int_r, monty);
-    let (red_sc, r_k, final_claims) =
-      crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine>::prove_quad(
-        &eval_p,
-        params.numlimb_var,
-        &mut poly_lhs,
-        &mut poly_rhs,
-        transcript,
-      )?;
-    // `final_claims = [limb(r_k), f_limb(int_r, r_k)]`. The integer-side
-    // IntEval will prove `int_v' ≡ f_limb(int_r, r_k) (mod p)`, so the
-    // "eval claim" handed to the IntEval body is the second component.
-    let f_eval_p = final_claims[1];
-
-    // 2. Extend the integer point with r_k (canonical < p integers).
-    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
-    let r_k_int: Vec<BigUint> = r_k.iter().map(dyn_to_biguint).collect();
-    let int_point_ext: Vec<BigUint> = int_point.iter().chain(r_k_int.iter()).cloned().collect();
-
-    // 3. int_v' = f_limb at the extended point, over Z.
-    let (_ie_span, ie_t) = start_span!("imod_pcs_red_integer_eval");
-    let int_v_prime = integer_mle_evaluate(&f_limb, &int_point_ext);
-    info!(elapsed_ms = %ie_t.elapsed().as_millis(), "imod_pcs_red_integer_eval");
-
-    // 4. Sanity: f_eval_p ≡ int_v' (mod p). For numlimb_var=0, f_eval_p
-    //    == eval and this matches the pre-D3 check.
-    let p = extract_p(point)?;
-    let int_v_mod_p_u = int_v_prime
-      .mod_floor(&BigInt::from(p.clone()))
-      .to_biguint()
-      .expect("mod_floor by a positive divisor is non-negative");
-    let f_eval_bu = BigUint::from_bytes_le(&f_eval_p.to_le_bytes());
-    if int_v_mod_p_u != f_eval_bu {
-      return Err(SpartanError::InternalError {
-        reason: "IntegerModPCS::prove: f_limb(ext_point) ≠ int_v' mod p (prover bug)".to_string(),
-      });
-    }
-
-    // 5. Bind int_v' into the transcript.
-    absorb_bigint(transcript, &int_v_prime);
-
-    // Extract round polys from the reduction sumcheck as a Serde-
-    // friendly BigUint payload for the verifier.
-    let reduction_round_polys: Vec<Vec<BigUint>> = red_sc
-      .compressed_polys
-      .iter()
-      .map(|cp| {
-        cp.coeffs_except_linear_term
-          .iter()
-          .map(dyn_to_biguint)
-          .collect()
-      })
-      .collect();
-
-    // From here on the chain prover operates on `f_limb` over the
-    // extended point. For numlimb_var=0 these match the pre-D3 `poly`
-    // / `point` exactly.
-    let int_point = int_point_ext;
-    let num_vars = point.len() + params.numlimb_var;
-    let with_iter = num_vars > params.k;
-    let poly = f_limb.as_slice();
-    let (_fq_span, fq_t) = start_span!("imod_pcs_red_to_fq");
-    let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
-    info!(elapsed_ms = %fq_t.elapsed().as_millis(), "imod_pcs_red_to_fq");
-    info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_pcs_reduction");
-
-    // 4. Phase 1: per prime, sample p_i, run all t iterations (if any).
-    //    No per-chain commitments: all chains' shifted (a_j, b_j) are
-    //    stacked into ONE commitment per layer below.
-    let (_p1_span, p1_t) = start_span!("imod_pcs_chain_phase1");
-    // Lift `poly` to BigInt once; each iterating chain clones it as its
-    // `a_0`. Only the `with_iter` path consumes it.
-    let poly_bigint: Vec<BigInt> = if with_iter {
-      poly.par_iter().map(|x| BigInt::from(x.clone())).collect()
-    } else {
-      Vec::new()
-    };
-
-    // Sample all `s` small primes upfront (paper §4: the verifier sends
-    // `[p_i]_{i=1}^s` in one round, then the prover responds with the chain
-    // oracles). The chains are independent and built in parallel.
-    let primes: Vec<BigUint> = (0..params.s)
-      .map(|_| sample_small_prime(transcript, params.log_p))
-      .collect::<Result<Vec<_>, SpartanError>>()?;
-
-    let chain_states: Vec<ChainProverState> = primes
-      .par_iter()
-      .map(|p_i| -> Result<ChainProverState, SpartanError> {
-        let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
-        let mut iters = Vec::new();
-
-        if with_iter {
-          let t = num_vars.saturating_sub(params.k).div_ceil(params.k);
-          let n = num_vars;
-          let k = params.k;
-          let d_big = BigInt::from(p_i.clone());
-          let s_a = BigInt::from(shift_a(params));
-          let s_b = BigInt::from(shift_b(params));
-
-          // a_prev starts as the input polynomial (lifted once above).
-          let mut a_prev_int: Vec<BigInt> = poly_bigint.clone();
-
-          for j in 1..=t {
-            let lo = n - j * k;
-            let hi = n - (j - 1) * k;
-            let r_lower = &r_i_int[lo..hi];
-
-            let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
-            // Toward-zero divmod by p_i: `q·p_i + r = g`, `(b, a) = (q, r)`.
-            // Inner loop kept serial — the per-chain `par_iter` already
-            // saturates the cores.
-            let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = g_j_int
-              .iter()
-              .map(|g| {
-                let q = g / &d_big;
-                let r = g - &q * &d_big;
-                (q, r)
-              })
-              .unzip();
-
-            let a_j_shifted: Vec<BigUint> = a_j_int
-              .iter()
-              .map(|x| (x + &s_a).to_biguint().expect("shift makes non-negative"))
-              .collect();
-            let b_j_shifted: Vec<BigUint> = b_j_int
-              .iter()
-              .map(|x| (x + &s_b).to_biguint().expect("shift makes non-negative"))
-              .collect();
-
-            let a_j_shifted_fq: Vec<t256::Scalar> =
-              a_j_shifted.iter().map(biguint_to_scalar).collect();
-            let b_j_shifted_fq: Vec<t256::Scalar> =
-              b_j_shifted.iter().map(biguint_to_scalar).collect();
-
-            iters.push(IterationProverState {
-              a_shifted: a_j_shifted,
-              a_shifted_fq: a_j_shifted_fq,
-              b_shifted: b_j_shifted,
-              b_shifted_fq: b_j_shifted_fq,
-            });
-
-            a_prev_int = a_j_int;
-          }
-        }
-
-        Ok(ChainProverState {
-          p_i: p_i.clone(),
-          r_i_int,
-          iters,
-        })
-      })
-      .collect::<Result<Vec<_>, SpartanError>>()?;
-
-    // Stack all chains' shifted (a_j, b_j) per layer into ONE commitment:
-    // index = (role, chain, x), role 0 = a / 1 = b, chains padded to
-    // s_pad = next_pow2(s). Absorbed in layer order, before γ.
-    let t_layers = if with_iter {
-      num_vars.saturating_sub(params.k).div_ceil(params.k)
-    } else {
-      0
-    };
-    let s_pad = params.s.next_power_of_two();
-    let log_spad = s_pad.trailing_zeros() as usize;
-    type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
-    type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
-    let mut ab_polys: Vec<Vec<t256::Scalar>> = Vec::with_capacity(t_layers);
-    let mut ab_blinds: Vec<HB> = Vec::with_capacity(t_layers);
-    let mut ab_comms: Vec<HC> = Vec::with_capacity(t_layers);
-    for jm1 in 0..t_layers {
-      let m = 1usize << (num_vars - (jm1 + 1) * params.k);
-      let mut stacked = vec![t256::Scalar::ZERO; 2 * s_pad * m];
-      for (c, st) in chain_states.iter().enumerate() {
-        let it = &st.iters[jm1];
-        stacked[c * m..(c + 1) * m].copy_from_slice(&it.a_shifted_fq);
-        stacked[(s_pad + c) * m..(s_pad + c + 1) * m].copy_from_slice(&it.b_shifted_fq);
-      }
-      let ab_blind = Hyrax::blind(&ck.inner, stacked.len());
-      let ab_comm = Hyrax::commit(&ck.inner, &stacked, &ab_blind, false)?;
-      transcript.absorb(b"ab_stacked", &ab_comm);
-      ab_polys.push(stacked);
-      ab_blinds.push(ab_blind);
-      ab_comms.push(ab_comm);
-    }
-    info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
-
-    // 5. Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
-    let gamma_fq: Vec<t256::Scalar> = if with_iter {
-      (0..(num_vars - params.k))
-        .map(|i| {
-          let bytes = transcript.squeeze_bytes(b"gamma")?;
-          let label = (i as u64).to_le_bytes();
-          transcript.absorb_bytes(b"gamma_idx", &label);
-          Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
-        })
-        .collect::<Result<Vec<_>, SpartanError>>()?
-    } else {
-      Vec::new()
-    };
-
-    // 6. Identity-check and final-remainder evaluations become multi-point
-    //    CLAIMS on `f` / the stacked layer commitments; each claimed eval
-    //    is absorbed (binding it before the batch challenges), and all
-    //    claims are discharged by one batched open per commitment below.
-    let (_open_span, open_t) = start_span!("imod_pcs_chain_claims");
-    let mut f_claims = OpenClaims::default();
-    let mut ab_claims: Vec<OpenClaims> = (0..t_layers).map(|_| OpenClaims::default()).collect();
-
-    // Fast path for the j=1 a_prev evals: all chains share the γ-prefix,
-    // so bind `f` once at γ[..n-k]; per chain only a 2^k-size dot with
-    // eq(r_lower) remains.
-    let poly_at_gamma: Vec<t256::Scalar> = if with_iter {
-      let mut m = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.clone());
-      for r in &gamma_fq[..(num_vars - params.k)] {
-        m.bind_poly_var_top(r);
-      }
-      m.into_vec()
-    } else {
-      Vec::new()
-    };
-
-    let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
-    for (ci, state) in chain_states.iter().enumerate() {
-      let r_i_int = &state.r_i_int;
-      let iters = &state.iters;
-      let n = num_vars;
-      let k = params.k;
-
-      let mut iter_oracles = Vec::with_capacity(iters.len());
-      for (jm1, iter_state) in iters.iter().enumerate() {
-        let j = jm1 + 1;
-        let prefix_len = n - j * k;
-        let lo = n - j * k;
-        let hi = n - (j - 1) * k;
-        let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
-        let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
-        let gamma_extended: Vec<t256::Scalar> = gamma_prefix
-          .iter()
-          .chain(r_lower_fq.iter())
-          .copied()
-          .collect();
-
-        let a_prev_eval = if j == 1 {
-          let v = mle_evaluate_fq(&poly_at_gamma, &r_lower_fq);
-          f_claims.push(gamma_extended.clone(), v);
-          v
-        } else {
-          let v = mle_evaluate_fq(&iters[jm1 - 1].a_shifted_fq, &gamma_extended);
-          ab_claims[jm1 - 1].push(ab_stack_point(0, ci, log_spad, &gamma_extended), v);
-          v
-        };
-        let a_curr_eval = mle_evaluate_fq(&iter_state.a_shifted_fq, &gamma_prefix);
-        let b_curr_eval = mle_evaluate_fq(&iter_state.b_shifted_fq, &gamma_prefix);
-        ab_claims[jm1].push(ab_stack_point(0, ci, log_spad, &gamma_prefix), a_curr_eval);
-        ab_claims[jm1].push(ab_stack_point(1, ci, log_spad, &gamma_prefix), b_curr_eval);
-        for ev in [&a_prev_eval, &a_curr_eval, &b_curr_eval] {
-          transcript.absorb_bytes(b"claim_ev", ev.to_repr().as_ref());
-        }
-        iter_oracles.push(IterationOracles {
-          a_prev_eval,
-          a_curr_eval,
-          b_curr_eval,
-        });
-      }
-
-      // Final-remainder claim: a_t at r_i[0..n-tk]. For t=0 this is a
-      // claim on the *input* polynomial at the full r_i (step B path).
-      let t = iters.len();
-      let final_point_fq: Vec<t256::Scalar> = r_i_int[..(num_vars - t * params.k)]
-        .iter()
-        .map(biguint_to_scalar)
-        .collect();
-      let final_eval = if t == 0 {
-        let v = mle_evaluate_fq(&poly_fq, &final_point_fq);
-        f_claims.push(final_point_fq, v);
-        v
-      } else {
-        let last = &iters[t - 1];
-        let v = mle_evaluate_fq(&last.a_shifted_fq, &final_point_fq);
-        ab_claims[t - 1].push(ab_stack_point(0, ci, log_spad, &final_point_fq), v);
-        v
-      };
-      transcript.absorb_bytes(b"claim_ev", final_eval.to_repr().as_ref());
-
-      chains.push(ChainData {
-        iterations: iter_oracles,
-        final_eval,
-      });
-    }
-    info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_claims");
-
-    // 7. ONE shared LogUp-GKR range check across all `(bound, size)`
-    // groups, in canonical order `f_limb`, then for each iteration `j`
-    // the `a_j` batch (all `s` chains) and the `b_j` batch. All batches
-    // share one multiplicity table and one table-side GKR; its value and
-    // chunk evaluations come back as claims.
-    let t = t_layers;
-    let log_bound_a = params.log_p + 1;
-    let log_bound_b = LOG_Q - params.log_p + 1;
-    let mut rc_batches: Vec<RangeBatchInputs<'_>> = Vec::with_capacity(1 + 2 * t);
-
-    rc_batches.push(RangeBatchInputs {
-      target: RcTarget::F,
-      value_polys_fq: vec![poly_fq.as_slice()],
-      values: vec![poly],
-      n_values: poly.len(),
-      log_bound: params.log_t,
-    });
-
-    for j in 0..t {
-      for (role, log_bound) in [(0u8, log_bound_a), (1u8, log_bound_b)] {
-        let value_polys_fq = chain_states
-          .iter()
-          .map(|st| {
-            if role == 0 {
-              st.iters[j].a_shifted_fq.as_slice()
-            } else {
-              st.iters[j].b_shifted_fq.as_slice()
-            }
-          })
-          .collect::<Vec<_>>();
-        let values = chain_states
-          .iter()
-          .map(|st| {
-            if role == 0 {
-              st.iters[j].a_shifted.as_slice()
-            } else {
-              st.iters[j].b_shifted.as_slice()
-            }
-          })
-          .collect::<Vec<_>>();
-        let n_values = values[0].len();
-        rc_batches.push(RangeBatchInputs {
-          target: RcTarget::Ab { layer: j, role },
-          value_polys_fq,
-          values,
-          n_values,
-          log_bound,
-        });
-      }
-    }
-
-    let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
-    let (range_check, rc_art) =
-      prove_shared_range_check(&ck.inner, &ck.eval, &rc_batches, transcript)?;
-    info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
-
-    // Route the range check's value claims to their target commitments.
-    for (target, z, y) in rc_art.value_claims {
-      match target {
-        RcTarget::F => f_claims.push(z, y),
-        RcTarget::Ab { layer, role } => {
-          let mut pt = Vec::with_capacity(1 + z.len());
-          pt.push(if role == 1 {
-            t256::Scalar::ONE
-          } else {
-            t256::Scalar::ZERO
-          });
-          pt.extend(z);
-          ab_claims[layer].push(pt, y);
-        }
-      }
-    }
-
-    // 8. ONE combined opening over all commitments, canonical order: `f`,
-    //    the stacked layers, the chunk commitments, the multiplicity
-    //    table. Interleaved tail-aligned sumchecks + a single merged
-    //    same-column IPA.
-    let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
-    let mut bsub = spawn_batch_subtranscript(transcript)?;
-    let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &OpenClaims)> =
-      Vec::with_capacity(1 + t + (1 + 2 * t) + 1);
-    bo_targets.push((&comm.inner, poly_fq.as_slice(), &blind.inner, &f_claims));
-    for j in 0..t_layers {
-      bo_targets.push((
-        &ab_comms[j],
-        ab_polys[j].as_slice(),
-        &ab_blinds[j],
-        &ab_claims[j],
-      ));
-    }
-    for (bi, (chunk_fq, chunk_blind, claims)) in rc_art.chunk_data.iter().enumerate() {
-      bo_targets.push((
-        &range_check.batches[bi].chunk_comm,
-        chunk_fq.as_slice(),
-        chunk_blind,
-        claims,
-      ));
-    }
-    bo_targets.push((
-      &range_check.mult_comm,
-      rc_art.mult_fq.as_slice(),
-      &rc_art.mult_blind,
-      &rc_art.mult_claims,
-    ));
-    let combined_open = prove_combined_batch_open(&ck.inner, &ck.eval, &mut bsub, &bo_targets)?;
-    info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
+    let mut st = prove_one_poly(ck, transcript, poly, point, eval)?;
+    let (range_check, combined_open) = finish_batch_open(
+      ck,
+      transcript,
+      std::slice::from_mut(&mut st),
+      &[&comm.inner],
+      &[&blind.inner],
+    )?;
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
-
     Ok(IntEvalArgument {
-      reduction_round_polys,
-      int_v_prime,
-      chains,
-      ab_comms,
+      reduction_round_polys: st.reduction_round_polys,
+      int_v_prime: st.int_v_prime,
+      chains: st.chains,
+      ab_comms: st.ab_comms,
+      range_check,
+      combined_open,
+    })
+  }
+
+  fn prove_batch(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    let (_prove_span, prove_t) = start_span!("integer_modpcs_prove_batch");
+    let n = polys.len();
+    if n == 0 || comms.len() != n || blinds.len() != n || points.len() != n || evals.len() != n {
+      return Err(SpartanError::InternalError {
+        reason: "IntegerModPCS::prove_batch: empty or mismatched inputs".to_string(),
+      });
+    }
+    // Per polynomial: reduction sumcheck + chains, advancing the shared
+    // transcript in index order. The expensive range check and inner-
+    // product opening are then run ONCE over every polynomial's batches.
+    let mut states: Vec<PerPolyProver> = Vec::with_capacity(n);
+    for i in 0..n {
+      states.push(prove_one_poly(
+        ck, transcript, polys[i], points[i], evals[i],
+      )?);
+    }
+    let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
+    let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
+    let (range_check, combined_open) =
+      finish_batch_open(ck, transcript, &mut states, &comm_inners, &blind_inners)?;
+    let per_poly = states
+      .into_iter()
+      .map(|st| IntEvalPerPolyArgument {
+        reduction_round_polys: st.reduction_round_polys,
+        int_v_prime: st.int_v_prime,
+        chains: st.chains,
+        ab_comms: st.ab_comms,
+      })
+      .collect();
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove_batch");
+    Ok(IntEvalBatchArgument {
+      per_poly,
       range_check,
       combined_open,
     })
@@ -1751,314 +1389,891 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("integer_modpcs_verify");
-    let params = &vk.params;
-    let monty = point
-      .first()
-      .map(|p| *p.params())
-      .ok_or(SpartanError::InternalError {
-        reason: "IntegerModPCS::verify: empty point".to_string(),
-      })?;
+    let mut v = verify_one_poly(
+      &vk.params,
+      transcript,
+      point,
+      eval,
+      &arg.reduction_round_polys,
+      &arg.int_v_prime,
+      &arg.chains,
+      &arg.ab_comms,
+    )?;
+    finish_batch_verify(
+      vk,
+      transcript,
+      &[&comm.inner],
+      std::slice::from_mut(&mut v),
+      &[arg.ab_comms.as_slice()],
+      &arg.range_check,
+      &arg.combined_open,
+    )?;
+    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify");
+    Ok(())
+  }
 
-    let (_vred_span, vred_t) = start_span!("imod_pcs_verify_reduction_sc");
-    if arg.chains.len() != params.s {
+  fn verify_batch(
+    vk: &Self::VerifierKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+  ) -> Result<(), SpartanError> {
+    let (_verify_span, verify_t) = start_span!("integer_modpcs_verify_batch");
+    let n = arg.per_poly.len();
+    if comms.len() != n || points.len() != n || evals.len() != n {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    if arg.reduction_round_polys.len() != params.numlimb_var {
-      return Err(SpartanError::InvalidSumcheckProof);
+    let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
+    for i in 0..n {
+      let pp = &arg.per_poly[i];
+      vs.push(verify_one_poly(
+        &vk.params,
+        transcript,
+        points[i],
+        evals[i],
+        &pp.reduction_round_polys,
+        &pp.int_v_prime,
+        &pp.chains,
+        &pp.ab_comms,
+      )?);
     }
-
-    // 1. Reduction sumcheck (Phase-3 step D3). Reconstruct the
-    //    SumcheckProof from the round polys carried by `arg`, run
-    //    `verify` with initial claim `eval` (the original Z_p eval
-    //    claim) and `numlimb_var` rounds. For `numlimb_var = 0` this
-    //    is a 0-round sumcheck: final_claim = eval, r_k = [].
-    let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
-      &monty,
-      &eval.to_bytes_le(),
-    );
-    let red_sc_polys: Vec<
-      crate::polys_modp::univariate::CompressedUniPoly<crate::dyn_prime::DynPrime<4>>,
-    > = arg
-      .reduction_round_polys
+    let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
+    let ab_comms_per_poly: Vec<_> = arg
+      .per_poly
       .iter()
-      .map(|coeffs| crate::polys_modp::univariate::CompressedUniPoly {
-        coeffs_except_linear_term: coeffs
-          .iter()
-          .map(|b| {
-            <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
-              &monty,
-              &b.to_bytes_le(),
-            )
-          })
-          .collect(),
+      .map(|pp| pp.ab_comms.as_slice())
+      .collect();
+    finish_batch_verify(
+      vk,
+      transcript,
+      &comm_inners,
+      &mut vs,
+      &ab_comms_per_poly,
+      &arg.range_check,
+      &arg.combined_open,
+    )?;
+    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify_batch");
+    Ok(())
+  }
+}
+
+/// Per-polynomial prover state of a (batched) Mod-PCS open: the proof
+/// outputs plus the witness polynomials the shared range check / combined
+/// opening borrow from. Built by [`prove_one_poly`], consumed by
+/// [`finish_batch_open`].
+struct PerPolyProver {
+  reduction_round_polys: Vec<Vec<BigUint>>,
+  int_v_prime: BigInt,
+  chains: Vec<ChainData>,
+  ab_comms: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  /// `f_limb` reduced to the Hyrax base field: F-batch value polynomial
+  /// AND the input commitment's combined-open polynomial.
+  poly_fq: Vec<t256::Scalar>,
+  /// `f_limb` as integers: the F-batch's range-checked values.
+  f_limb: Vec<BigUint>,
+  /// Per-prime chain states feeding the `a_j`/`b_j` layer batches.
+  chain_states: Vec<ChainProverState>,
+  /// Stacked per-layer `(role, chain, x)` polynomials and their blinds.
+  ab_polys: Vec<Vec<t256::Scalar>>,
+  ab_blinds: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind>,
+  /// Accumulated multi-point claims on the input commitment / the layers.
+  f_claims: OpenClaims,
+  ab_claims: Vec<OpenClaims>,
+  t_layers: usize,
+}
+
+/// Per-polynomial prover stages of a (batched) Mod-PCS open: the
+/// reduction sumcheck (Phase-3 step D3) and the per-prime chains, up to
+/// and including all evaluation CLAIMS. Advances `transcript` exactly as
+/// a standalone open would through the chain-claim phase, and returns the
+/// proof outputs plus the witness data [`finish_batch_open`]'s shared
+/// range check and combined opening borrow from.
+fn prove_one_poly(
+  ck: &IntegerModCommitmentKey,
+  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  poly: &[BigUint],
+  point: &[crate::dyn_prime::DynPrime<4>],
+  eval: &BigUint,
+) -> Result<PerPolyProver, SpartanError> {
+  type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+  type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+  let params = &ck.params;
+  let monty = point
+    .first()
+    .map(|p| *p.params())
+    .ok_or(SpartanError::InternalError {
+      reason: "IntegerModPCS::prove: empty point".to_string(),
+    })?;
+
+  let (_red_span, red_t) = start_span!("imod_pcs_reduction_sc");
+  // 0. Limb-split f → f_limb. For numlimb=1 this is a literal pass-
+  //    through; for numlimb>1 f_limb has 2^numlimb_var times as many
+  //    coefficients (and 2^numlimb_var slots per original coefficient,
+  //    padded with zero if numlimb isn't a power of two).
+  let (_ls_span, ls_t) = start_span!("imod_pcs_red_limb_split");
+  let f_limb = limb_split_polynomial(poly, params.log_t, params.log_t_f);
+  info!(elapsed_ms = %ls_t.elapsed().as_millis(), "imod_pcs_red_limb_split");
+
+  // 1. Reduction sumcheck (Phase-3 step D3): reduce the eval claim
+  //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
+  //    point `(int_r, r_k)` where `r_k` are the sumcheck challenges.
+  let (_dc_span, dc_t) = start_span!("imod_pcs_red_to_dynprime");
+  let f_limb_p: Vec<crate::dyn_prime::DynPrime<4>> = f_limb
+    .iter()
+    .map(|b| {
+      <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(&monty, &b.to_bytes_le())
+    })
+    .collect();
+  info!(elapsed_ms = %dc_t.elapsed().as_millis(), "imod_pcs_red_to_dynprime");
+  // Partial-eval f_limb at the original `point` in Z_p, leaving the last
+  // numlimb_var variables free.
+  let (_pe_span, pe_t) = start_span!("imod_pcs_red_dynprime_bind");
+  let mut mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_p, monty);
+  for r_i in point {
+    mle.bind_poly_var_top(r_i);
+  }
+  let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<4>> = mle.into_vec();
+  info!(elapsed_ms = %pe_t.elapsed().as_millis(), "imod_pcs_red_dynprime_bind");
+  debug_assert_eq!(f_limb_at_int_r.len(), 1 << params.numlimb_var);
+
+  let limb_p = build_limb_weight_dynprime(params, &monty);
+  let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+    &monty,
+    &eval.to_bytes_le(),
+  );
+
+  let mut poly_lhs = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
+  let mut poly_rhs =
+    crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_at_int_r, monty);
+  let (red_sc, r_k, final_claims) =
+    crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine>::prove_quad(
+      &eval_p,
+      params.numlimb_var,
+      &mut poly_lhs,
+      &mut poly_rhs,
+      transcript,
+    )?;
+  // `final_claims = [limb(r_k), f_limb(int_r, r_k)]`.
+  let f_eval_p = final_claims[1];
+
+  // 2. Extend the integer point with r_k (canonical < p integers).
+  let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+  let r_k_int: Vec<BigUint> = r_k.iter().map(dyn_to_biguint).collect();
+  let int_point_ext: Vec<BigUint> = int_point.iter().chain(r_k_int.iter()).cloned().collect();
+
+  // 3. int_v' = f_limb at the extended point, over Z.
+  let (_ie_span, ie_t) = start_span!("imod_pcs_red_integer_eval");
+  let int_v_prime = integer_mle_evaluate(&f_limb, &int_point_ext);
+  info!(elapsed_ms = %ie_t.elapsed().as_millis(), "imod_pcs_red_integer_eval");
+
+  // 4. Sanity: f_eval_p ≡ int_v' (mod p).
+  let p = extract_p(point)?;
+  let int_v_mod_p_u = int_v_prime
+    .mod_floor(&BigInt::from(p.clone()))
+    .to_biguint()
+    .expect("mod_floor by a positive divisor is non-negative");
+  let f_eval_bu = BigUint::from_bytes_le(&f_eval_p.to_le_bytes());
+  if int_v_mod_p_u != f_eval_bu {
+    return Err(SpartanError::InternalError {
+      reason: "IntegerModPCS::prove: f_limb(ext_point) ≠ int_v' mod p (prover bug)".to_string(),
+    });
+  }
+
+  // 5. Bind int_v' into the transcript.
+  absorb_bigint(transcript, &int_v_prime);
+
+  let reduction_round_polys: Vec<Vec<BigUint>> = red_sc
+    .compressed_polys
+    .iter()
+    .map(|cp| {
+      cp.coeffs_except_linear_term
+        .iter()
+        .map(dyn_to_biguint)
+        .collect()
+    })
+    .collect();
+
+  // From here on the chain prover operates on `f_limb` over the extended
+  // point. For numlimb_var=0 these match the pre-D3 `poly` / `point`.
+  let int_point = int_point_ext;
+  let num_vars = point.len() + params.numlimb_var;
+  let with_iter = num_vars > params.k;
+  let poly = f_limb.as_slice();
+  let (_fq_span, fq_t) = start_span!("imod_pcs_red_to_fq");
+  let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
+  info!(elapsed_ms = %fq_t.elapsed().as_millis(), "imod_pcs_red_to_fq");
+  info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_pcs_reduction");
+
+  // Phase 1: per prime, sample p_i, run all t iterations (if any).
+  let (_p1_span, p1_t) = start_span!("imod_pcs_chain_phase1");
+  let poly_bigint: Vec<BigInt> = if with_iter {
+    poly.par_iter().map(|x| BigInt::from(x.clone())).collect()
+  } else {
+    Vec::new()
+  };
+
+  let primes: Vec<BigUint> = (0..params.s)
+    .map(|_| sample_small_prime(transcript, params.log_p))
+    .collect::<Result<Vec<_>, SpartanError>>()?;
+
+  let chain_states: Vec<ChainProverState> = primes
+    .par_iter()
+    .map(|p_i| -> Result<ChainProverState, SpartanError> {
+      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
+      let mut iters = Vec::new();
+
+      if with_iter {
+        let t = num_vars.saturating_sub(params.k).div_ceil(params.k);
+        let n = num_vars;
+        let k = params.k;
+        let d_big = BigInt::from(p_i.clone());
+        let s_a = BigInt::from(shift_a(params));
+        let s_b = BigInt::from(shift_b(params));
+
+        let mut a_prev_int: Vec<BigInt> = poly_bigint.clone();
+
+        for j in 1..=t {
+          let lo = n - j * k;
+          let hi = n - (j - 1) * k;
+          let r_lower = &r_i_int[lo..hi];
+
+          let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
+          let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = g_j_int
+            .iter()
+            .map(|g| {
+              let q = g / &d_big;
+              let r = g - &q * &d_big;
+              (q, r)
+            })
+            .unzip();
+
+          let a_j_shifted: Vec<BigUint> = a_j_int
+            .iter()
+            .map(|x| (x + &s_a).to_biguint().expect("shift makes non-negative"))
+            .collect();
+          let b_j_shifted: Vec<BigUint> = b_j_int
+            .iter()
+            .map(|x| (x + &s_b).to_biguint().expect("shift makes non-negative"))
+            .collect();
+
+          let a_j_shifted_fq: Vec<t256::Scalar> =
+            a_j_shifted.iter().map(biguint_to_scalar).collect();
+          let b_j_shifted_fq: Vec<t256::Scalar> =
+            b_j_shifted.iter().map(biguint_to_scalar).collect();
+
+          iters.push(IterationProverState {
+            a_shifted: a_j_shifted,
+            a_shifted_fq: a_j_shifted_fq,
+            b_shifted: b_j_shifted,
+            b_shifted_fq: b_j_shifted_fq,
+          });
+
+          a_prev_int = a_j_int;
+        }
+      }
+
+      Ok(ChainProverState {
+        p_i: p_i.clone(),
+        r_i_int,
+        iters,
       })
-      .collect();
-    let red_sc = crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine> {
-      compressed_polys: red_sc_polys,
-    };
-    let (red_final_claim, r_k) =
-      red_sc.verify(eval_p, params.numlimb_var, 2, &monty, transcript)?;
+    })
+    .collect::<Result<Vec<_>, SpartanError>>()?;
 
-    // Compute limb(r_k) by MLE-evaluating the public limb weight
-    // polynomial at the sumcheck challenges.
-    let limb_p = build_limb_weight_dynprime(params, &monty);
-    let mut limb_mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
-    for r in &r_k {
-      limb_mle.bind_poly_var_top(r);
+  let t_layers = if with_iter {
+    num_vars.saturating_sub(params.k).div_ceil(params.k)
+  } else {
+    0
+  };
+  let s_pad = params.s.next_power_of_two();
+  let log_spad = s_pad.trailing_zeros() as usize;
+  let mut ab_polys: Vec<Vec<t256::Scalar>> = Vec::with_capacity(t_layers);
+  let mut ab_blinds: Vec<HB> = Vec::with_capacity(t_layers);
+  let mut ab_comms: Vec<HC> = Vec::with_capacity(t_layers);
+  for jm1 in 0..t_layers {
+    let m = 1usize << (num_vars - (jm1 + 1) * params.k);
+    let mut stacked = vec![t256::Scalar::ZERO; 2 * s_pad * m];
+    for (c, st) in chain_states.iter().enumerate() {
+      let it = &st.iters[jm1];
+      stacked[c * m..(c + 1) * m].copy_from_slice(&it.a_shifted_fq);
+      stacked[(s_pad + c) * m..(s_pad + c + 1) * m].copy_from_slice(&it.b_shifted_fq);
     }
-    let limb_at_r_k = limb_mle.into_vec()[0];
-    let limb_inv = <crate::dyn_prime::DynPrime<4> as SumcheckField>::invert(&limb_at_r_k)
-      .ok_or(SpartanError::InvalidSumcheckProof)?;
-    let f_eval_p = red_final_claim * limb_inv;
+    let ab_blind = Hyrax::blind(&ck.inner, stacked.len());
+    let ab_comm = Hyrax::commit(&ck.inner, &stacked, &ab_blind, false)?;
+    transcript.absorb(b"ab_stacked", &ab_comm);
+    ab_polys.push(stacked);
+    ab_blinds.push(ab_blind);
+    ab_comms.push(ab_comm);
+  }
+  info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
-    // 2. Check int_v' ≡ f_eval_p (mod p).
-    let p = extract_p(point)?;
-    let int_v_mod_p_u = arg
-      .int_v_prime
-      .mod_floor(&BigInt::from(p.clone()))
-      .to_biguint()
-      .ok_or(SpartanError::InvalidSumcheckProof)?;
-    let f_eval_bu = BigUint::from_bytes_le(&f_eval_p.to_le_bytes());
-    if int_v_mod_p_u != f_eval_bu {
-      return Err(SpartanError::InvalidSumcheckProof);
+  // Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
+  let gamma_fq: Vec<t256::Scalar> = if with_iter {
+    (0..(num_vars - params.k))
+      .map(|i| {
+        let bytes = transcript.squeeze_bytes(b"gamma")?;
+        let label = (i as u64).to_le_bytes();
+        transcript.absorb_bytes(b"gamma_idx", &label);
+        Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+      })
+      .collect::<Result<Vec<_>, SpartanError>>()?
+  } else {
+    Vec::new()
+  };
+
+  // Identity-check and final-remainder evaluations become multi-point
+  // claims on `f` / the stacked layer commitments.
+  let (_open_span, open_t) = start_span!("imod_pcs_chain_claims");
+  let mut f_claims = OpenClaims::default();
+  let mut ab_claims: Vec<OpenClaims> = (0..t_layers).map(|_| OpenClaims::default()).collect();
+
+  let poly_at_gamma: Vec<t256::Scalar> = if with_iter {
+    let mut m = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.clone());
+    for r in &gamma_fq[..(num_vars - params.k)] {
+      m.bind_poly_var_top(r);
     }
+    m.into_vec()
+  } else {
+    Vec::new()
+  };
 
-    // 3. Bind int_v' into the transcript.
-    absorb_bigint(transcript, &arg.int_v_prime);
-
-    // 4. Extend the integer point with r_k for the IntEval chain
-    //    verification.
-    let int_point_orig: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
-    let r_k_int: Vec<BigUint> = r_k.iter().map(dyn_to_biguint).collect();
-    let int_point: Vec<BigUint> = int_point_orig
-      .iter()
-      .chain(r_k_int.iter())
-      .cloned()
-      .collect();
-
-    let num_vars = point.len() + params.numlimb_var;
-    let with_iter = num_vars > params.k;
+  let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
+  for (ci, state) in chain_states.iter().enumerate() {
+    let r_i_int = &state.r_i_int;
+    let iters = &state.iters;
     let n = num_vars;
     let k = params.k;
-    let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
-    info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction_sc");
 
-    let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
-    // 3. Phase 1 mirror: re-sample all `s` primes, absorb the stacked
-    //    layer commitments, sample γ.
-    let primes: Vec<BigUint> = (0..params.s)
-      .map(|_| sample_small_prime(transcript, params.log_p))
-      .collect::<Result<Vec<_>, SpartanError>>()?;
-    let mut chain_primes: Vec<(BigUint, Vec<BigUint>)> = Vec::with_capacity(params.s);
-    for (chain, p_i) in arg.chains.iter().zip(primes.iter()) {
-      if chain.iterations.len() != t {
-        return Err(SpartanError::InvalidSumcheckProof);
+    let mut iter_oracles = Vec::with_capacity(iters.len());
+    for (jm1, iter_state) in iters.iter().enumerate() {
+      let j = jm1 + 1;
+      let prefix_len = n - j * k;
+      let lo = n - j * k;
+      let hi = n - (j - 1) * k;
+      let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
+      let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
+      let gamma_extended: Vec<t256::Scalar> = gamma_prefix
+        .iter()
+        .chain(r_lower_fq.iter())
+        .copied()
+        .collect();
+
+      let a_prev_eval = if j == 1 {
+        let v = mle_evaluate_fq(&poly_at_gamma, &r_lower_fq);
+        f_claims.push(gamma_extended.clone(), v);
+        v
+      } else {
+        let v = mle_evaluate_fq(&iters[jm1 - 1].a_shifted_fq, &gamma_extended);
+        ab_claims[jm1 - 1].push(ab_stack_point(0, ci, log_spad, &gamma_extended), v);
+        v
+      };
+      let a_curr_eval = mle_evaluate_fq(&iter_state.a_shifted_fq, &gamma_prefix);
+      let b_curr_eval = mle_evaluate_fq(&iter_state.b_shifted_fq, &gamma_prefix);
+      ab_claims[jm1].push(ab_stack_point(0, ci, log_spad, &gamma_prefix), a_curr_eval);
+      ab_claims[jm1].push(ab_stack_point(1, ci, log_spad, &gamma_prefix), b_curr_eval);
+      for ev in [&a_prev_eval, &a_curr_eval, &b_curr_eval] {
+        transcript.absorb_bytes(b"claim_ev", ev.to_repr().as_ref());
       }
-      let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
-      chain_primes.push((p_i.clone(), r_i_int));
+      iter_oracles.push(IterationOracles {
+        a_prev_eval,
+        a_curr_eval,
+        b_curr_eval,
+      });
     }
-    if arg.ab_comms.len() != t {
+
+    let t = iters.len();
+    let final_point_fq: Vec<t256::Scalar> = r_i_int[..(num_vars - t * params.k)]
+      .iter()
+      .map(biguint_to_scalar)
+      .collect();
+    let final_eval = if t == 0 {
+      let v = mle_evaluate_fq(&poly_fq, &final_point_fq);
+      f_claims.push(final_point_fq, v);
+      v
+    } else {
+      let last = &iters[t - 1];
+      let v = mle_evaluate_fq(&last.a_shifted_fq, &final_point_fq);
+      ab_claims[t - 1].push(ab_stack_point(0, ci, log_spad, &final_point_fq), v);
+      v
+    };
+    transcript.absorb_bytes(b"claim_ev", final_eval.to_repr().as_ref());
+
+    chains.push(ChainData {
+      iterations: iter_oracles,
+      final_eval,
+    });
+  }
+  info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_claims");
+
+  Ok(PerPolyProver {
+    reduction_round_polys,
+    int_v_prime,
+    chains,
+    ab_comms,
+    poly_fq,
+    f_limb,
+    chain_states,
+    ab_polys,
+    ab_blinds,
+    f_claims,
+    ab_claims,
+    t_layers,
+  })
+}
+
+/// Shared finish of a (batched) Mod-PCS open: ONE LogUp-GKR range check
+/// over every batch of every polynomial, then ONE combined inner-product
+/// opening discharging every evaluation claim. `comms[p]` / `blinds[p]`
+/// are polynomial `p`'s input commitment / blind. The range check's value
+/// claims are routed back into each state's claim sets before the combined
+/// opening consumes them. Canonical batch / target order: for each
+/// polynomial in turn (its `f_limb` batch then its `a_j`/`b_j` layer
+/// batches), then all chunk commitments in that batch order, then the
+/// shared multiplicity table.
+fn finish_batch_open(
+  ck: &IntegerModCommitmentKey,
+  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  states: &mut [PerPolyProver],
+  comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
+  blinds: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind],
+) -> Result<(SharedRangeCheck, CombinedBatchOpen), SpartanError> {
+  type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+  type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+  let params = &ck.params;
+  let log_bound_a = params.log_p + 1;
+  let log_bound_b = LOG_Q - params.log_p + 1;
+
+  // ONE shared LogUp-GKR range check across every polynomial's batches.
+  let (range_check, rc_art) = {
+    let mut rc_batches: Vec<RangeBatchInputs<'_>> = Vec::new();
+    for (p, st) in states.iter().enumerate() {
+      rc_batches.push(RangeBatchInputs {
+        target: RcTarget::F { poly: p },
+        value_polys_fq: vec![st.poly_fq.as_slice()],
+        values: vec![st.f_limb.as_slice()],
+        n_values: st.f_limb.len(),
+        log_bound: params.log_t,
+      });
+      for j in 0..st.t_layers {
+        for (role, log_bound) in [(0u8, log_bound_a), (1u8, log_bound_b)] {
+          let value_polys_fq = st
+            .chain_states
+            .iter()
+            .map(|cs| {
+              if role == 0 {
+                cs.iters[j].a_shifted_fq.as_slice()
+              } else {
+                cs.iters[j].b_shifted_fq.as_slice()
+              }
+            })
+            .collect::<Vec<_>>();
+          let values = st
+            .chain_states
+            .iter()
+            .map(|cs| {
+              if role == 0 {
+                cs.iters[j].a_shifted.as_slice()
+              } else {
+                cs.iters[j].b_shifted.as_slice()
+              }
+            })
+            .collect::<Vec<_>>();
+          let n_values = values[0].len();
+          rc_batches.push(RangeBatchInputs {
+            target: RcTarget::Ab {
+              poly: p,
+              layer: j,
+              role,
+            },
+            value_polys_fq,
+            values,
+            n_values,
+            log_bound,
+          });
+        }
+      }
+    }
+    let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
+    let out = prove_shared_range_check(&ck.inner, &ck.eval, &rc_batches, transcript)?;
+    info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
+    out
+  };
+
+  // Route the range check's value claims to each polynomial's target
+  // commitment claim sets.
+  for (target, z, y) in rc_art.value_claims {
+    match target {
+      RcTarget::F { poly } => states[poly].f_claims.push(z, y),
+      RcTarget::Ab { poly, layer, role } => {
+        let mut pt = Vec::with_capacity(1 + z.len());
+        pt.push(if role == 1 {
+          t256::Scalar::ONE
+        } else {
+          t256::Scalar::ZERO
+        });
+        pt.extend(z);
+        states[poly].ab_claims[layer].push(pt, y);
+      }
+    }
+  }
+
+  // ONE combined opening over all commitments.
+  let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
+  let mut bsub = spawn_batch_subtranscript(transcript)?;
+  let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &OpenClaims)> = Vec::new();
+  for (p, st) in states.iter().enumerate() {
+    bo_targets.push((comms[p], st.poly_fq.as_slice(), blinds[p], &st.f_claims));
+    for j in 0..st.t_layers {
+      bo_targets.push((
+        &st.ab_comms[j],
+        st.ab_polys[j].as_slice(),
+        &st.ab_blinds[j],
+        &st.ab_claims[j],
+      ));
+    }
+  }
+  for (bi, (chunk_fq, chunk_blind, claims)) in rc_art.chunk_data.iter().enumerate() {
+    bo_targets.push((
+      &range_check.batches[bi].chunk_comm,
+      chunk_fq.as_slice(),
+      chunk_blind,
+      claims,
+    ));
+  }
+  bo_targets.push((
+    &range_check.mult_comm,
+    rc_art.mult_fq.as_slice(),
+    &rc_art.mult_blind,
+    &rc_art.mult_claims,
+  ));
+  let combined_open = prove_combined_batch_open(&ck.inner, &ck.eval, &mut bsub, &bo_targets)?;
+  info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
+
+  Ok((range_check, combined_open))
+}
+
+/// Per-polynomial verifier state: the accumulated open claims plus the
+/// public dimensions [`finish_batch_verify`] needs to pin batch shapes
+/// and combined-open point lengths.
+struct PerPolyVerifier {
+  f_claims: OpenClaims,
+  ab_claims: Vec<OpenClaims>,
+  num_vars: usize,
+  t: usize,
+  log_spad: usize,
+}
+
+/// Verifier mirror of [`prove_one_poly`]: reconstruct and verify the
+/// reduction sumcheck and the per-prime chains (identity + CRT checks),
+/// advancing `transcript` identically, and return the open claims and
+/// dimensions for [`finish_batch_verify`].
+#[allow(clippy::too_many_arguments)]
+fn verify_one_poly(
+  params: &IntEvalParams,
+  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  point: &[crate::dyn_prime::DynPrime<4>],
+  eval: &BigUint,
+  reduction_round_polys: &[Vec<BigUint>],
+  int_v_prime: &BigInt,
+  chains: &[ChainData],
+  ab_comms: &[<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
+) -> Result<PerPolyVerifier, SpartanError> {
+  let monty = point
+    .first()
+    .map(|p| *p.params())
+    .ok_or(SpartanError::InternalError {
+      reason: "IntegerModPCS::verify: empty point".to_string(),
+    })?;
+
+  let (_vred_span, vred_t) = start_span!("imod_pcs_verify_reduction_sc");
+  if chains.len() != params.s {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  if reduction_round_polys.len() != params.numlimb_var {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+
+  let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+    &monty,
+    &eval.to_bytes_le(),
+  );
+  let red_sc_polys: Vec<
+    crate::polys_modp::univariate::CompressedUniPoly<crate::dyn_prime::DynPrime<4>>,
+  > = reduction_round_polys
+    .iter()
+    .map(|coeffs| crate::polys_modp::univariate::CompressedUniPoly {
+      coeffs_except_linear_term: coeffs
+        .iter()
+        .map(|b| {
+          <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+            &monty,
+            &b.to_bytes_le(),
+          )
+        })
+        .collect(),
+    })
+    .collect();
+  let red_sc = crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine> {
+    compressed_polys: red_sc_polys,
+  };
+  let (red_final_claim, r_k) = red_sc.verify(eval_p, params.numlimb_var, 2, &monty, transcript)?;
+
+  let limb_p = build_limb_weight_dynprime(params, &monty);
+  let mut limb_mle = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
+  for r in &r_k {
+    limb_mle.bind_poly_var_top(r);
+  }
+  let limb_at_r_k = limb_mle.into_vec()[0];
+  let limb_inv = <crate::dyn_prime::DynPrime<4> as SumcheckField>::invert(&limb_at_r_k)
+    .ok_or(SpartanError::InvalidSumcheckProof)?;
+  let f_eval_p = red_final_claim * limb_inv;
+
+  let p = extract_p(point)?;
+  let int_v_mod_p_u = int_v_prime
+    .mod_floor(&BigInt::from(p.clone()))
+    .to_biguint()
+    .ok_or(SpartanError::InvalidSumcheckProof)?;
+  let f_eval_bu = BigUint::from_bytes_le(&f_eval_p.to_le_bytes());
+  if int_v_mod_p_u != f_eval_bu {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+
+  absorb_bigint(transcript, int_v_prime);
+
+  let int_point_orig: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+  let r_k_int: Vec<BigUint> = r_k.iter().map(dyn_to_biguint).collect();
+  let int_point: Vec<BigUint> = int_point_orig
+    .iter()
+    .chain(r_k_int.iter())
+    .cloned()
+    .collect();
+
+  let num_vars = point.len() + params.numlimb_var;
+  let with_iter = num_vars > params.k;
+  let n = num_vars;
+  let k = params.k;
+  let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
+  info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction_sc");
+
+  let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
+  let primes: Vec<BigUint> = (0..params.s)
+    .map(|_| sample_small_prime(transcript, params.log_p))
+    .collect::<Result<Vec<_>, SpartanError>>()?;
+  let mut chain_primes: Vec<(BigUint, Vec<BigUint>)> = Vec::with_capacity(params.s);
+  for (chain, p_i) in chains.iter().zip(primes.iter()) {
+    if chain.iterations.len() != t {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    let s_pad = params.s.next_power_of_two();
-    let log_spad = s_pad.trailing_zeros() as usize;
-    for c in &arg.ab_comms {
-      transcript.absorb(b"ab_stacked", c);
-    }
+    let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
+    chain_primes.push((p_i.clone(), r_i_int));
+  }
+  if ab_comms.len() != t {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  let s_pad = params.s.next_power_of_two();
+  let log_spad = s_pad.trailing_zeros() as usize;
+  for c in ab_comms {
+    transcript.absorb(b"ab_stacked", c);
+  }
 
-    // 4. Sample γ if iterating, identically to prover.
-    let gamma_fq: Vec<t256::Scalar> = if with_iter {
-      (0..(n - k))
-        .map(|i| {
-          let bytes = transcript.squeeze_bytes(b"gamma")?;
-          let label = (i as u64).to_le_bytes();
-          transcript.absorb_bytes(b"gamma_idx", &label);
-          Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
-        })
-        .collect::<Result<Vec<_>, SpartanError>>()?
-    } else {
-      Vec::new()
-    };
+  let gamma_fq: Vec<t256::Scalar> = if with_iter {
+    (0..(n - k))
+      .map(|i| {
+        let bytes = transcript.squeeze_bytes(b"gamma")?;
+        let label = (i as u64).to_le_bytes();
+        transcript.absorb_bytes(b"gamma_idx", &label);
+        Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+      })
+      .collect::<Result<Vec<_>, SpartanError>>()?
+  } else {
+    Vec::new()
+  };
 
-    // 5. Per chain: re-derive the claim points, absorb the claimed evals
-    //    (mirroring the prover), run the identity and CRT checks, and
-    //    collect the claims for the batched-open verification.
-    let shift_a_fq = biguint_to_scalar(&shift_a(params));
-    let shift_b_fq = biguint_to_scalar(&shift_b(params));
+  let shift_a_fq = biguint_to_scalar(&shift_a(params));
+  let shift_b_fq = biguint_to_scalar(&shift_b(params));
 
-    let mut f_claims = OpenClaims::default();
-    let mut ab_claims: Vec<OpenClaims> = (0..t).map(|_| OpenClaims::default()).collect();
-    for (chain_idx, chain) in arg.chains.iter().enumerate() {
-      let (p_i, r_i_int) = &chain_primes[chain_idx];
-      let p_i_fq = biguint_to_scalar(p_i);
+  let mut f_claims = OpenClaims::default();
+  let mut ab_claims: Vec<OpenClaims> = (0..t).map(|_| OpenClaims::default()).collect();
+  for (chain_idx, chain) in chains.iter().enumerate() {
+    let (p_i, r_i_int) = &chain_primes[chain_idx];
+    let p_i_fq = biguint_to_scalar(p_i);
 
-      for (jm1, iter) in chain.iterations.iter().enumerate() {
-        let j = jm1 + 1;
-        let prefix_len = n - j * k;
-        let lo = n - j * k;
-        let hi = n - (j - 1) * k;
-        let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
-        let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
-        let gamma_extended: Vec<t256::Scalar> = gamma_prefix
-          .iter()
-          .chain(r_lower_fq.iter())
-          .copied()
-          .collect();
-
-        if j == 1 {
-          f_claims.push(gamma_extended.clone(), iter.a_prev_eval);
-        } else {
-          ab_claims[jm1 - 1].push(
-            ab_stack_point(0, chain_idx, log_spad, &gamma_extended),
-            iter.a_prev_eval,
-          );
-        }
-        ab_claims[jm1].push(
-          ab_stack_point(0, chain_idx, log_spad, &gamma_prefix),
-          iter.a_curr_eval,
-        );
-        ab_claims[jm1].push(
-          ab_stack_point(1, chain_idx, log_spad, &gamma_prefix),
-          iter.b_curr_eval,
-        );
-        for ev in [&iter.a_prev_eval, &iter.a_curr_eval, &iter.b_curr_eval] {
-          transcript.absorb_bytes(b"claim_ev", ev.to_repr().as_ref());
-        }
-
-        // Identity check in F: a_j(γ) + p_i · b_j(γ) ?= a_{j-1}(γ_ext).
-        // a_prev for j=1 is the *unshifted* input poly (no subtract);
-        // otherwise a_prev_shifted: subtract shift_a.
-        let lhs_a = iter.a_curr_eval - shift_a_fq;
-        let lhs_b = iter.b_curr_eval - shift_b_fq;
-        let lhs = lhs_a + p_i_fq * lhs_b;
-        let rhs = if j == 1 {
-          iter.a_prev_eval
-        } else {
-          iter.a_prev_eval - shift_a_fq
-        };
-        if lhs != rhs {
-          return Err(SpartanError::InvalidSumcheckProof);
-        }
-      }
-
-      // Final-remainder claim + CRT check: (final_eval [- shift_a if t>0])
-      // interpreted as a *balanced* integer ≡ int_v' (mod p_i).
-      let final_point_fq: Vec<t256::Scalar> = r_i_int[..(n - t * k)]
+    for (jm1, iter) in chain.iterations.iter().enumerate() {
+      let j = jm1 + 1;
+      let prefix_len = n - j * k;
+      let lo = n - j * k;
+      let hi = n - (j - 1) * k;
+      let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
+      let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
+      let gamma_extended: Vec<t256::Scalar> = gamma_prefix
         .iter()
-        .map(biguint_to_scalar)
+        .chain(r_lower_fq.iter())
+        .copied()
         .collect();
-      if t == 0 {
-        f_claims.push(final_point_fq, chain.final_eval);
+
+      if j == 1 {
+        f_claims.push(gamma_extended.clone(), iter.a_prev_eval);
       } else {
-        ab_claims[t - 1].push(
-          ab_stack_point(0, chain_idx, log_spad, &final_point_fq),
-          chain.final_eval,
+        ab_claims[jm1 - 1].push(
+          ab_stack_point(0, chain_idx, log_spad, &gamma_extended),
+          iter.a_prev_eval,
         );
       }
-      transcript.absorb_bytes(b"claim_ev", chain.final_eval.to_repr().as_ref());
+      ab_claims[jm1].push(
+        ab_stack_point(0, chain_idx, log_spad, &gamma_prefix),
+        iter.a_curr_eval,
+      );
+      ab_claims[jm1].push(
+        ab_stack_point(1, chain_idx, log_spad, &gamma_prefix),
+        iter.b_curr_eval,
+      );
+      for ev in [&iter.a_prev_eval, &iter.a_curr_eval, &iter.b_curr_eval] {
+        transcript.absorb_bytes(b"claim_ev", ev.to_repr().as_ref());
+      }
 
-      let final_f = if t == 0 {
-        chain.final_eval
+      let lhs_a = iter.a_curr_eval - shift_a_fq;
+      let lhs_b = iter.b_curr_eval - shift_b_fq;
+      let lhs = lhs_a + p_i_fq * lhs_b;
+      let rhs = if j == 1 {
+        iter.a_prev_eval
       } else {
-        chain.final_eval - shift_a_fq
+        iter.a_prev_eval - shift_a_fq
       };
-      let lhs = scalar_to_balanced_int(&final_f)
-        .mod_floor(&BigInt::from(p_i.clone()))
-        .to_biguint()
-        .ok_or(SpartanError::InvalidSumcheckProof)?;
-      let rhs = arg
-        .int_v_prime
-        .mod_floor(&BigInt::from(p_i.clone()))
-        .to_biguint()
-        .ok_or(SpartanError::InvalidSumcheckProof)?;
       if lhs != rhs {
         return Err(SpartanError::InvalidSumcheckProof);
       }
     }
-    info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
 
-    let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
-    // ONE shared LogUp-GKR range check across all (bound, size) groups,
-    // in the same canonical batch order the prover used. Its value and
-    // chunk claims come back for the batched-open verification.
-    let log_bound_a = params.log_p + 1;
-    let log_bound_b = LOG_Q - params.log_p + 1;
-    let mut rc_metas: Vec<RangeBatchMeta> = Vec::with_capacity(1 + 2 * t);
+    let final_point_fq: Vec<t256::Scalar> = r_i_int[..(n - t * k)]
+      .iter()
+      .map(biguint_to_scalar)
+      .collect();
+    if t == 0 {
+      f_claims.push(final_point_fq, chain.final_eval);
+    } else {
+      ab_claims[t - 1].push(
+        ab_stack_point(0, chain_idx, log_spad, &final_point_fq),
+        chain.final_eval,
+      );
+    }
+    transcript.absorb_bytes(b"claim_ev", chain.final_eval.to_repr().as_ref());
+
+    let final_f = if t == 0 {
+      chain.final_eval
+    } else {
+      chain.final_eval - shift_a_fq
+    };
+    let lhs = scalar_to_balanced_int(&final_f)
+      .mod_floor(&BigInt::from(p_i.clone()))
+      .to_biguint()
+      .ok_or(SpartanError::InvalidSumcheckProof)?;
+    let rhs = int_v_prime
+      .mod_floor(&BigInt::from(p_i.clone()))
+      .to_biguint()
+      .ok_or(SpartanError::InvalidSumcheckProof)?;
+    if lhs != rhs {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+  }
+  info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
+
+  Ok(PerPolyVerifier {
+    f_claims,
+    ab_claims,
+    num_vars,
+    t,
+    log_spad,
+  })
+}
+
+/// Verifier mirror of [`finish_batch_open`]: ONE shared range check over
+/// every polynomial's batches, then ONE combined-open verification over
+/// every commitment, in the same canonical order the prover used.
+#[allow(clippy::too_many_arguments)]
+fn finish_batch_verify(
+  vk: &IntegerModVerifierKey,
+  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
+  verifiers: &mut [PerPolyVerifier],
+  ab_comms_per_poly: &[&[<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment]],
+  range_check: &SharedRangeCheck,
+  combined_open: &CombinedBatchOpen,
+) -> Result<(), SpartanError> {
+  let params = &vk.params;
+  let log_bound_a = params.log_p + 1;
+  let log_bound_b = LOG_Q - params.log_p + 1;
+
+  let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
+  let mut rc_metas: Vec<RangeBatchMeta> = Vec::new();
+  for (p, v) in verifiers.iter().enumerate() {
     rc_metas.push(RangeBatchMeta {
-      target: RcTarget::F,
+      target: RcTarget::F { poly: p },
       num_polys: 1,
-      n_values: 1usize << num_vars,
+      n_values: 1usize << v.num_vars,
       log_bound: params.log_t,
     });
-    for j in 0..t {
-      let n_values = 1usize << (num_vars - (j + 1) * params.k);
+    for j in 0..v.t {
+      let n_values = 1usize << (v.num_vars - (j + 1) * params.k);
       for (role, log_bound) in [(0u8, log_bound_a), (1u8, log_bound_b)] {
         rc_metas.push(RangeBatchMeta {
-          target: RcTarget::Ab { layer: j, role },
+          target: RcTarget::Ab {
+            poly: p,
+            layer: j,
+            role,
+          },
           num_polys: params.s,
           n_values,
           log_bound,
         });
       }
     }
-    let rc_claims = verify_shared_range_check(&rc_metas, &arg.range_check, transcript)?;
-    for (target, z, y) in rc_claims.value_claims {
-      match target {
-        RcTarget::F => f_claims.push(z, y),
-        RcTarget::Ab { layer, role } => {
-          let mut pt = Vec::with_capacity(1 + z.len());
-          pt.push(if role == 1 {
-            t256::Scalar::ONE
-          } else {
-            t256::Scalar::ZERO
-          });
-          pt.extend(z);
-          ab_claims[layer].push(pt, y);
-        }
+  }
+  let rc_claims = verify_shared_range_check(&rc_metas, range_check, transcript)?;
+  for (target, z, y) in rc_claims.value_claims {
+    match target {
+      RcTarget::F { poly } => verifiers[poly].f_claims.push(z, y),
+      RcTarget::Ab { poly, layer, role } => {
+        let mut pt = Vec::with_capacity(1 + z.len());
+        pt.push(if role == 1 {
+          t256::Scalar::ONE
+        } else {
+          t256::Scalar::ZERO
+        });
+        pt.extend(z);
+        verifiers[poly].ab_claims[layer].push(pt, y);
       }
     }
-    info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
-
-    // 6. Verify the ONE combined opening over all commitments, same
-    //    canonical order as the prover.
-    let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
-    let mut bsub = spawn_batch_subtranscript(transcript)?;
-    let mut bo_targets: Vec<(
-      &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-      usize,
-      &OpenClaims,
-    )> = Vec::with_capacity(1 + t + (1 + 2 * t) + 1);
-    bo_targets.push((&comm.inner, num_vars, &f_claims));
-    for (j, ab_comm) in arg.ab_comms.iter().enumerate() {
-      let m_vars = num_vars - (j + 1) * params.k;
-      bo_targets.push((ab_comm, 1 + log_spad + m_vars, &ab_claims[j]));
-    }
-    for (bi, meta) in rc_metas.iter().enumerate() {
-      let d = BatchDims::new(meta.num_polys, meta.n_values, meta.log_bound);
-      bo_targets.push((
-        &arg.range_check.batches[bi].chunk_comm,
-        ceil_log2(d.n_chunks.max(1)),
-        &rc_claims.chunk_claims[bi],
-      ));
-    }
-    bo_targets.push((
-      &arg.range_check.mult_comm,
-      CHUNK_BITS,
-      &rc_claims.mult_claims,
-    ));
-    verify_combined_batch_open(
-      &vk.inner,
-      &vk.eval,
-      &mut bsub,
-      &bo_targets,
-      &arg.combined_open,
-    )?;
-    info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
-
-    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify");
-
-    Ok(())
   }
+  info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
+
+  let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
+  let mut bsub = spawn_batch_subtranscript(transcript)?;
+  let mut bo_targets: Vec<(
+    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+    usize,
+    &OpenClaims,
+  )> = Vec::new();
+  for (p, v) in verifiers.iter().enumerate() {
+    bo_targets.push((comms[p], v.num_vars, &v.f_claims));
+    for (j, ab_comm) in ab_comms_per_poly[p].iter().enumerate() {
+      let m_vars = v.num_vars - (j + 1) * params.k;
+      bo_targets.push((ab_comm, 1 + v.log_spad + m_vars, &v.ab_claims[j]));
+    }
+  }
+  for (bi, meta) in rc_metas.iter().enumerate() {
+    let d = BatchDims::new(meta.num_polys, meta.n_values, meta.log_bound);
+    bo_targets.push((
+      &range_check.batches[bi].chunk_comm,
+      ceil_log2(d.n_chunks.max(1)),
+      &rc_claims.chunk_claims[bi],
+    ));
+  }
+  bo_targets.push((&range_check.mult_comm, CHUNK_BITS, &rc_claims.mult_claims));
+  verify_combined_batch_open(&vk.inner, &vk.eval, &mut bsub, &bo_targets, combined_open)?;
+  info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
+  Ok(())
 }
 
 /// Multilinear evaluation of `poly_fq` at point `r` over F. Mirrors the
@@ -2159,11 +2374,12 @@ fn hyrax_verify_open<T: ByteTranscript>(
 /// Which commitment a range-check batch's value claim targets.
 #[derive(Clone, Copy, Debug)]
 enum RcTarget {
-  /// The input polynomial `f` (the `f_limb` batch).
-  F,
+  /// The input polynomial `f` of batch member `poly` (its `f_limb` batch).
+  F { poly: usize },
   /// The stacked `(role, chain, x)` commitment of iteration layer `layer`
-  /// (0-indexed), restricted to `role` (0 = a, 1 = b).
-  Ab { layer: usize, role: u8 },
+  /// (0-indexed) of batch member `poly`, restricted to `role` (0 = a,
+  /// 1 = b).
+  Ab { poly: usize, layer: usize, role: u8 },
 }
 
 /// Accumulated multi-point evaluation claims against one commitment.
