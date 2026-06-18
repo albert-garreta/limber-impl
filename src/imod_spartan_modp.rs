@@ -47,7 +47,6 @@ type MParams<M> = <MScalar<M> as SumcheckField>::Params;
 type ModPCS<M> = <M as ModEngine>::ModPCS;
 type ModCK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::CommitmentKey;
 type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
-type ModBlind<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Blind;
 type ModEvalArg<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::EvaluationArgument;
 
 /// Convert a `BigUint` integer into an `M::Scalar` value by reducing
@@ -76,7 +75,6 @@ fn biguint_matrix_to_scalars<M: ModEngine>(
 #[derive(Clone)]
 pub struct IntModSpartanModpProverKey<M: ModEngine> {
   pub(crate) ck: ModCK<M>,
-  pub(crate) ck_s: ModCK<M>,
   pub(crate) shape: IntModR1CSShapeModp<M>,
   pub(crate) vk_digest: [u8; 32],
 }
@@ -93,7 +91,6 @@ impl<M: ModEngine> IntModSpartanModpProverKey<M> {
 #[derive(Clone)]
 pub struct IntModSpartanModpVerifierKey<M: ModEngine> {
   pub(crate) vk_ee: ModVK<M>,
-  pub(crate) ck_s: ModCK<M>,
   pub(crate) shape: IntModR1CSShapeModp<M>,
   pub(crate) digest: [u8; 32],
 }
@@ -119,10 +116,8 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
   // inner sumcheck (for w)
   sc_inner: SumcheckProof<M>,
   eval_w: MScalar<M>,
-  blind_eval_w: ModBlind<M>,
   eval_arg_w: ModEvalArg<M>,
   // Q opening at r_x
-  blind_eval_q: ModBlind<M>,
   eval_arg_q: ModEvalArg<M>,
 }
 
@@ -165,8 +160,9 @@ where
   }
 
   /// Shared tail of `setup` / `setup_with_params`: precompute the
-  /// commitment-key tables, build the size-1 `ck_s`, and assemble the
-  /// prover/verifier keys from a prebuilt `(ck, vk_ee)` pair.
+  /// commitment-key tables and assemble the prover/verifier keys from a
+  /// prebuilt `(ck, vk_ee)` pair. (The Mod-PCS now owns its own size-1
+  /// eval key internally, so there is no separate `ck_s` to build here.)
   pub(crate) fn assemble_keys(
     shape: IntModR1CSShapeModp<M>,
     ck: ModCK<M>,
@@ -176,19 +172,15 @@ where
     IntModSpartanModpVerifierKey<M>,
   ) {
     <ModPCS<M> as ModPCSEngineTrait<M>>::precompute_ck(&ck);
-    let (ck_s, _) = <ModPCS<M> as ModPCSEngineTrait<M>>::setup(b"ck_s_imod_modp", 1, 1);
-    <ModPCS<M> as ModPCSEngineTrait<M>>::precompute_ck(&ck_s);
 
     let digest = shape.digest();
     let vk = IntModSpartanModpVerifierKey {
       vk_ee,
-      ck_s: ck_s.clone(),
       shape: shape.clone(),
       digest,
     };
     let pk = IntModSpartanModpProverKey {
       ck,
-      ck_s,
       shape,
       vk_digest: digest,
     };
@@ -335,48 +327,28 @@ where
     // BigUint in [0, p).
     let (_wopen_span, wopen_t) = start_span!("imod_modp_w_open");
     let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
-    let blind_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
-    let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
-      &pk.ck_s,
-      std::slice::from_ref(&eval_w_bu),
-      &blind_eval_w,
-      false,
-    )?;
     let eval_arg_w = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
       &pk.ck,
-      &pk.ck_s,
       &mut transcript,
       &U.comm_w,
       &W.w,
       &W.r_w,
       &r_y[1..],
       &eval_w_bu,
-      &comm_eval_w,
-      &blind_eval_w,
     )?;
     info!(elapsed_ms = %wopen_t.elapsed().as_millis(), "imod_modp_w_open");
 
     // Mod-PCS open Q at r_x.
     let (_qopen_span, qopen_t) = start_span!("imod_modp_q_open");
     let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
-    let blind_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(&pk.ck_s, 1);
-    let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
-      &pk.ck_s,
-      std::slice::from_ref(&v_q_bu),
-      &blind_eval_q,
-      false,
-    )?;
     let eval_arg_q = <ModPCS<M> as ModPCSEngineTrait<M>>::prove(
       &pk.ck,
-      &pk.ck_s,
       &mut transcript,
       &U.comm_q,
       &W.q,
       &W.r_q,
       &r_x,
       &v_q_bu,
-      &comm_eval_q,
-      &blind_eval_q,
     )?;
     info!(elapsed_ms = %qopen_t.elapsed().as_millis(), "imod_modp_q_open");
 
@@ -390,9 +362,7 @@ where
       v_q,
       sc_inner,
       eval_w,
-      blind_eval_w,
       eval_arg_w,
-      blind_eval_q,
       eval_arg_q,
     })
   }
@@ -501,20 +471,12 @@ where
     // Mod-PCS verification for W at r_y[1..].
     let (_wver_span, wver_t) = start_span!("imod_modp_w_verify");
     let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
-    let comm_eval_w = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
-      &vk.ck_s,
-      std::slice::from_ref(&eval_w_bu),
-      &self.blind_eval_w,
-      false,
-    )?;
     <ModPCS<M> as ModPCSEngineTrait<M>>::verify(
       &vk.vk_ee,
-      &vk.ck_s,
       &mut transcript,
       &U.comm_w,
       &r_y[1..],
       &eval_w_bu,
-      &comm_eval_w,
       &self.eval_arg_w,
     )?;
     info!(elapsed_ms = %wver_t.elapsed().as_millis(), "imod_modp_w_verify");
@@ -522,20 +484,12 @@ where
     // Mod-PCS verification for Q at r_x.
     let (_qver_span, qver_t) = start_span!("imod_modp_q_verify");
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
-    let comm_eval_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(
-      &vk.ck_s,
-      std::slice::from_ref(&v_q_bu),
-      &self.blind_eval_q,
-      false,
-    )?;
     <ModPCS<M> as ModPCSEngineTrait<M>>::verify(
       &vk.vk_ee,
-      &vk.ck_s,
       &mut transcript,
       &U.comm_q,
       &r_x,
       &v_q_bu,
-      &comm_eval_q,
       &self.eval_arg_q,
     )?;
     info!(elapsed_ms = %qver_t.elapsed().as_millis(), "imod_modp_q_verify");

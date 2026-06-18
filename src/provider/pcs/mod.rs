@@ -13,4 +13,3 @@ pub mod ipa;
 pub mod hyrax_pc;
 pub mod integer_modpcs;
 pub mod kzh_pc;
-pub mod trivial_modpcs;

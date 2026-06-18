@@ -22,7 +22,7 @@ use crate::{
     bn254::types as bn254_types,
     keccak::Keccak256Transcript,
     pasta::{pallas, vesta},
-    pcs::{hyrax_pc::HyraxPCS, kzh_pc::KZHPCS, trivial_modpcs::TrivialModPCS},
+    pcs::{hyrax_pc::HyraxPCS, kzh_pc::KZHPCS},
     pt256::{p256, t256},
   },
   traits::{Engine, mod_engine::ModEngine, mod_engine::SumcheckEngine},
@@ -91,21 +91,7 @@ impl Engine for Bn254Engine {
   type PCS = KZHPCS<Self>;
 }
 
-// ---- ModEngine impls (Phase 2 step 6: trivial backward-compat) ----------
-//
-// Smoke-test the `ModEngine` / `ModPCSEngineTrait` machinery by wiring up
-// the existing curve+Hyrax engines as ModEngines whose `Scalar` is just the
-// curve scalar (no dynamic prime yet). Step 7 will add ModEngines with
-// `Scalar = DynPrime<LIMBS>` and a Mod-PCS that bridges DynPrime ↔ curve
-// scalar.
-
-impl ModEngine for T256HyraxEngine {
-  type ModPCS = TrivialModPCS<Self>;
-
-  fn bootstrap_params() {}
-
-  fn sample_params<T: crate::traits::transcript::ByteTranscript>(_transcript: &mut T) {}
-}
+// ---- ModEngine impls ------------------------------------------------------
 
 /// A Phase-2 engine whose sumcheck arithmetic runs over the dynamic-prime
 /// field `DynPrime<4>` (256-bit, runtime modulus). This is *not* an

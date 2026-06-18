@@ -190,11 +190,11 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
 
     let (comm_w_ok, comm_q_ok) = rayon::join(
       || -> Result<bool, SpartanError> {
-        let cw = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.w, &W.r_w, false)?;
+        let cw = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.w, &W.r_w)?;
         Ok(cw == U.comm_w)
       },
       || -> Result<bool, SpartanError> {
-        let cq = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.q, &W.r_q, false)?;
+        let cq = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.q, &W.r_q)?;
         Ok(cq == U.comm_q)
       },
     );
@@ -286,8 +286,8 @@ impl<M: ModEngine> IntModR1CSWitnessModp<M> {
     let r_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_cons);
     let (_wq_span, wq_t) = start_span!("imod_modp_wq_commit");
     let (comm_w, comm_q) = rayon::join(
-      || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &w, &r_w, false),
-      || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &q, &r_q, false),
+      || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &w, &r_w),
+      || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &q, &r_q),
     );
     let comm_w = comm_w?;
     let comm_q = comm_q?;

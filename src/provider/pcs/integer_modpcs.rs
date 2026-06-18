@@ -482,16 +482,29 @@ fn soundness_bits_per_prime(log_p: usize, n: usize, log_t: usize) -> f64 {
 }
 
 /// Mod-PCS commitment key wraps Hyrax's plus the IntEval parameters.
+///
+/// `eval` is a size-1 Hyrax key the IntEval protocol uses internally to
+/// form the per-opening eval commitment `G^{f_y}` (which the verifier
+/// reconstructs locally). It lives inside the Mod-PCS key — not on the
+/// universal `ModPCSEngineTrait` surface — so the trait stays
+/// PCS-agnostic (a hash/FRI Mod-PCS would carry no such key).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntegerModCommitmentKey {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+  pub(crate) eval: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   pub(crate) params: IntEvalParams,
 }
 
 /// Verifier key wraps Hyrax's plus the IntEval parameters.
+///
+/// `eval` mirrors the commitment key's size-1 eval key: the verifier
+/// reconstructs the eval commitment `G^{f_y}` locally during opening
+/// verification, so it needs the same generators. Kept inside the key
+/// rather than on the trait surface (PCS-agnostic).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntegerModVerifierKey {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
+  pub(crate) eval: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   pub(crate) params: IntEvalParams,
 }
 
@@ -1102,13 +1115,23 @@ impl IntegerModPCS {
           ),
         })?;
     let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
+    // Size-1 eval key for the internal `G^{f_y}` eval commitments (kept
+    // inside the Mod-PCS key, off the PCS-agnostic trait surface).
+    let (eval_ck, _) = Hyrax::setup(b"imod_modpcs_eval", 1, 1);
+    // Precompute once at setup so neither prove nor verify rebuilds the
+    // eval key's generator table per `G^{f_y}` (re)construction. Cloning
+    // after precompute propagates it into both the commitment and verifier
+    // keys (mirrors the pre-refactor `precompute_ck(&ck_s)`).
+    Hyrax::precompute_ck(&eval_ck);
     Ok((
       IntegerModCommitmentKey {
         inner: inner_ck,
+        eval: eval_ck.clone(),
         params: params.clone(),
       },
       IntegerModVerifierKey {
         inner: inner_vk,
+        eval: eval_ck,
         params,
       },
     ))
@@ -1167,20 +1190,28 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       .checked_shl(params.numlimb_var as u32)
       .expect("n * 2^numlimb_var overflows usize");
     let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
+    let (eval_ck, _) = Hyrax::setup(b"imod_modpcs_eval", 1, 1);
+    // Precompute the eval key once at setup (see `setup_with_params`).
+    Hyrax::precompute_ck(&eval_ck);
     (
       IntegerModCommitmentKey {
         inner: inner_ck,
+        eval: eval_ck.clone(),
         params: params.clone(),
       },
       IntegerModVerifierKey {
         inner: inner_vk,
+        eval: eval_ck,
         params,
       },
     )
   }
 
   fn precompute_ck(ck: &Self::CommitmentKey) {
-    Hyrax::precompute_ck(&ck.inner)
+    Hyrax::precompute_ck(&ck.inner);
+    // Also precompute the size-1 eval key (used for the internal `G^{f_y}`
+    // eval commitments) so a deserialized key doesn't rebuild it lazily.
+    Hyrax::precompute_ck(&ck.eval);
   }
 
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
@@ -1200,7 +1231,6 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     ck: &Self::CommitmentKey,
     v: &[BigUint],
     r: &Self::Blind,
-    is_small: bool,
   ) -> Result<Self::Commitment, SpartanError> {
     // Limb-split the integer-valued polynomial: each coefficient
     // becomes `numlimb` limbs each in `[0, T)`. For `numlimb = 1`
@@ -1208,21 +1238,21 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // F PCS commits the limb polynomial, which has `numlimb * v.len()`
     // (or `2^numlimb_var * v.len()` after padding) coefficients.
     //
-    // Stopgap: size-1 commits are *eval-value* commits issued by the
-    // SNARK driver (e.g. `comm_eval_w`) to satisfy the trait's
-    // `comm_eval` slot — which `IntegerModPCS::prove`/`verify` actually
-    // ignore. The single value may be any F element, not bounded by
-    // `T_f`. Skip limb-splitting in this case so a 128-bit Z_p eval
-    // doesn't trip the bound check. Proper fix: drop `comm_eval` /
-    // `blind_eval` from the trait (unused by IntegerModPCS). Tracked
-    // in followups.
+    // Stopgap: size-1 commits are single-value commits used internally
+    // (e.g. the eval-value commitment); the value may be any F element,
+    // not bounded by `T_f`, so skip limb-splitting in that case.
+    //
+    // The small-scalar MSM fast path is chosen here, not via a trait
+    // param: the limb-split path produces limbs `< 2^log_t` (small), so
+    // `is_small = true`; the size-1 stopgap value may be a full-width
+    // `Z_p` element, so `is_small = false`.
     //
     // TODO Phase 3 step D5: per-limb range check `|limb| < T`.
     let params = &ck.params;
-    let v_limbs = if v.len() == 1 {
-      v.to_vec()
+    let (v_limbs, is_small) = if v.len() == 1 {
+      (v.to_vec(), false)
     } else {
-      limb_split_polynomial(v, params.log_t, params.log_t_f)
+      (limb_split_polynomial(v, params.log_t, params.log_t_f), true)
     };
     let v_fq: Vec<t256::Scalar> = v_limbs.iter().map(biguint_to_scalar).collect();
     let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, is_small)?;
@@ -1235,15 +1265,12 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
   fn prove(
     ck: &Self::CommitmentKey,
-    ck_eval: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
     comm: &Self::Commitment,
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
     eval: &BigUint,
-    _comm_eval: &Self::Commitment,
-    _blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove");
     let params = &ck.params;
@@ -1644,7 +1671,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
     let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
     let (range_check, rc_art) =
-      prove_shared_range_check(&ck.inner, &ck_eval.inner, &rc_batches, transcript)?;
+      prove_shared_range_check(&ck.inner, &ck.eval, &rc_batches, transcript)?;
     info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
 
     // Route the range check's value claims to their target commitments.
@@ -1695,8 +1722,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &rc_art.mult_blind,
       &rc_art.mult_claims,
     ));
-    let combined_open =
-      prove_combined_batch_open(&ck.inner, &ck_eval.inner, &mut bsub, &bo_targets)?;
+    let combined_open = prove_combined_batch_open(&ck.inner, &ck.eval, &mut bsub, &bo_targets)?;
     info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
 
@@ -1712,12 +1738,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
   fn verify(
     vk: &Self::VerifierKey,
-    ck_eval: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
     comm: &Self::Commitment,
     point: &[<T256DynPrimeEngine as SumcheckEngine>::Scalar],
     eval: &BigUint,
-    _comm_eval: &Self::Commitment,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("integer_modpcs_verify");
@@ -2018,7 +2042,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     ));
     verify_combined_batch_open(
       &vk.inner,
-      &ck_eval.inner,
+      &vk.eval,
       &mut bsub,
       &bo_targets,
       &arg.combined_open,
@@ -3103,7 +3127,7 @@ mod tests {
     let (ck, _vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-test", n, 256);
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(7u32 * i as u32 + 3)).collect();
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     // Re-commit directly via Hyrax and confirm equality.
     let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
@@ -3194,7 +3218,6 @@ mod tests {
       let n = 1usize << num_vars;
       let (ck, vk) =
         IntegerModPCS::setup_optimized(b"inteval-opt", n, 256, DEFAULT_LOG_T_F).unwrap();
-      let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
       let dyn_params = small_dyn_params();
       let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
@@ -3211,36 +3234,15 @@ mod tests {
         .unwrap();
 
       let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-      let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-      let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-      let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-        &ck_eval,
-        std::slice::from_ref(&eval),
-        &blind_eval,
-        false,
-      )
-      .unwrap();
+      let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
       let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-      let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-        &ck,
-        &ck_eval,
-        &mut pt,
-        &comm,
-        &poly,
-        &blind,
-        &point,
-        &eval,
-        &comm_eval,
-        &blind_eval,
-      )
-      .unwrap();
+      let arg =
+        <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+          .unwrap();
 
       let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-      <MP as ModPCSEngineTrait<ME>>::verify(
-        &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
-      )
-      .unwrap();
+      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
     }
   }
 
@@ -3568,7 +3570,6 @@ mod tests {
     let num_vars = 4usize;
     let n = 1usize << num_vars; // 16
     let (ck, vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-rt", n, 256);
-    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
@@ -3586,36 +3587,15 @@ mod tests {
       .unwrap();
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-      &ck_eval,
-      std::slice::from_ref(&eval),
-      &blind_eval,
-      false,
-    )
-    .unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck,
-      &ck_eval,
-      &mut pt,
-      &comm,
-      &poly,
-      &blind,
-      &point,
-      &eval,
-      &comm_eval,
-      &blind_eval,
-    )
-    .unwrap();
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
-    )
-    .unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
   }
 
   /// Verifier rejects a tampered claimed Z_p eval.
@@ -3624,7 +3604,6 @@ mod tests {
     let num_vars = 4usize;
     let n = 1usize << num_vars;
     let (ck, vk) = <MP as ModPCSEngineTrait<ME>>::setup(b"inteval-rt", n, 256);
-    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
@@ -3643,37 +3622,17 @@ mod tests {
     let bad_eval = (real_eval.clone() + BigUint::from(1u32)) % &p;
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-      &ck_eval,
-      std::slice::from_ref(&real_eval),
-      &blind_eval,
-      false,
-    )
-    .unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck,
-      &ck_eval,
-      &mut pt,
-      &comm,
-      &poly,
-      &blind,
-      &point,
-      &real_eval,
-      &comm_eval,
-      &blind_eval,
-    )
-    .unwrap();
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &real_eval)
+        .unwrap();
 
     // Verifier with the bad eval claim must reject.
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
-    let err = <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &bad_eval, &comm_eval, &arg,
-    )
-    .unwrap_err();
+    let err = <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &bad_eval, &arg)
+      .unwrap_err();
     assert!(matches!(err, SpartanError::InvalidSumcheckProof));
   }
 
@@ -3689,7 +3648,6 @@ mod tests {
     let small_params =
       IntEvalParams::derive_no_limb_split(8, 2, num_vars).expect("valid derived params");
     let (ck, vk) = IntegerModPCS::setup_with_params(b"inteval-iter", n, 256, small_params).unwrap();
-    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
@@ -3706,36 +3664,15 @@ mod tests {
       .unwrap();
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-      &ck_eval,
-      std::slice::from_ref(&eval),
-      &blind_eval,
-      false,
-    )
-    .unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
-    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck,
-      &ck_eval,
-      &mut pt,
-      &comm,
-      &poly,
-      &blind,
-      &point,
-      &eval,
-      &comm_eval,
-      &blind_eval,
-    )
-    .unwrap();
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
-    )
-    .unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
   }
 
   /// Two-iteration roundtrip (`k=2`, `num_vars=6` → `t=2`). Exercises the
@@ -3749,7 +3686,6 @@ mod tests {
       IntEvalParams::derive_no_limb_split(8, 2, num_vars).expect("valid derived params");
     let (ck, vk) =
       IntegerModPCS::setup_with_params(b"inteval-iter2", n, 256, small_params).unwrap();
-    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
@@ -3763,30 +3699,12 @@ mod tests {
       .unwrap();
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-      &ck_eval,
-      std::slice::from_ref(&eval),
-      &blind_eval,
-      false,
-    )
-    .unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
-    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck,
-      &ck_eval,
-      &mut pt,
-      &comm,
-      &poly,
-      &blind,
-      &point,
-      &eval,
-      &comm_eval,
-      &blind_eval,
-    )
-    .unwrap();
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
 
     // Confirm we actually exercised t=2 (two stacked layers, two layer
     // batched opens: f + ab_1 + ab_2 + chunks + mult).
@@ -3794,10 +3712,7 @@ mod tests {
     assert_eq!(arg.ab_comms.len(), 2, "expected 2 stacked layer comms");
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-iter2", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
-    )
-    .unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
   }
 
   /// Step D5 (stacked rbatchrange): tampering *any* range-check group's
@@ -3814,7 +3729,6 @@ mod tests {
       IntEvalParams::derive_no_limb_split(8, 2, num_vars).expect("valid derived params");
     let (ck, vk) =
       IntegerModPCS::setup_with_params(b"inteval-rc-tamper", n, 256, small_params).unwrap();
-    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();
     let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
@@ -3828,30 +3742,12 @@ mod tests {
       .unwrap();
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-      &ck_eval,
-      std::slice::from_ref(&eval),
-      &blind_eval,
-      false,
-    )
-    .unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
-    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck,
-      &ck_eval,
-      &mut pt,
-      &comm,
-      &poly,
-      &blind,
-      &point,
-      &eval,
-      &comm_eval,
-      &blind_eval,
-    )
-    .unwrap();
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
 
     // Three batches (f_limb, a_1, b_1) — the config must produce them.
     assert_eq!(
@@ -3868,10 +3764,7 @@ mod tests {
       bad.range_check.batches[gi].value_eval += t256::Scalar::ONE;
       let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
       assert!(
-        <MP as ModPCSEngineTrait<ME>>::verify(
-          &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &bad,
-        )
-        .is_err(),
+        <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &bad,).is_err(),
         "batch {gi} tamper not rejected"
       );
     }
@@ -3881,10 +3774,7 @@ mod tests {
     bad.combined_open.final_evals[0] += t256::Scalar::ONE;
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(
-        &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &bad,
-      )
-      .is_err()
+      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &bad,).is_err()
     );
 
     // Dropping a batch (count mismatch) must also be rejected.
@@ -3892,10 +3782,7 @@ mod tests {
     short.range_check.batches.pop();
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-rc", dyn_params);
     assert!(
-      <MP as ModPCSEngineTrait<ME>>::verify(
-        &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &short,
-      )
-      .is_err()
+      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &short,).is_err()
     );
   }
 
@@ -3919,7 +3806,6 @@ mod tests {
 
     let (ck, vk) =
       IntegerModPCS::setup_with_params(b"limb-split-test", n, 256, limb_params).unwrap();
-    let (ck_eval, _) = <MP as ModPCSEngineTrait<ME>>::setup(b"ck_eval", 1, 1);
 
     let dyn_params = small_dyn_params();
     // Coefficients in [0, 2^8). The integer eval can grow large but
@@ -3940,39 +3826,18 @@ mod tests {
       .unwrap();
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
-    let blind_eval = <MP as ModPCSEngineTrait<ME>>::blind(&ck_eval, 1);
-    let comm_eval = <MP as ModPCSEngineTrait<ME>>::commit(
-      &ck_eval,
-      std::slice::from_ref(&eval),
-      &blind_eval,
-      false,
-    )
-    .unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"limb-split", dyn_params);
-    let arg = <MP as ModPCSEngineTrait<ME>>::prove(
-      &ck,
-      &ck_eval,
-      &mut pt,
-      &comm,
-      &poly,
-      &blind,
-      &point,
-      &eval,
-      &comm_eval,
-      &blind_eval,
-    )
-    .unwrap();
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
     // The reduction sumcheck ran one round → one entry in
     // reduction_round_polys.
     assert_eq!(arg.reduction_round_polys.len(), 1);
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"limb-split", dyn_params);
-    <MP as ModPCSEngineTrait<ME>>::verify(
-      &vk, &ck_eval, &mut vt, &comm, &point, &eval, &comm_eval, &arg,
-    )
-    .unwrap();
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
   }
 
   /// Regression: limb-split commit when the *inflated* polynomial spans
@@ -4000,7 +3865,7 @@ mod tests {
 
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     // The bug manifested as an index-out-of-bounds panic here.
-    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind, false).unwrap();
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
     // Commit matches a direct Hyrax commit of the limb-split polynomial.
     let limbs = limb_split_polynomial(&poly, 4, 8);

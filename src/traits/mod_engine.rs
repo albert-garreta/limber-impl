@@ -293,11 +293,14 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// non-negative bounded integer in `BigUint` form — `p`-independent and
   /// chosen before the runtime prime `p` is sampled, so the commitment
   /// binds the integers themselves.
+  ///
+  /// The impl chooses any commitment-internal representation (small-scalar
+  /// fast paths, limb-splitting, etc.) itself — the universal surface does
+  /// not expose group/Pedersen-specific hints.
   fn commit(
     ck: &Self::CommitmentKey,
     v: &[BigUint],
     r: &Self::Blind,
-    is_small: bool,
   ) -> Result<Self::Commitment, SpartanError>;
 
   /// Length / shape sanity check on a commitment.
@@ -305,36 +308,31 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
 
   /// Prove that the integer-valued polynomial `poly` evaluates at the
   /// `Z_p` point `point` to `eval` (the canonical integer in `[0, p)`
-  /// representing the `Z_p` evaluation). `comm_eval` is the commitment
-  /// to `eval` from the calling SNARK driver; sound Mod-PCS impls
-  /// (Phase-3 IntEval) also use `eval` directly for the integer-side
-  /// consistency check.
-  #[allow(clippy::too_many_arguments)]
+  /// representing the `Z_p` evaluation).
+  ///
+  /// PCS-agnostic: the surface carries no group/Pedersen "commitment to the
+  /// evaluation" — a sound Mod-PCS impl binds `eval` however its own
+  /// machinery requires (e.g. a Pedersen-backed impl manages its own
+  /// eval-commitment key internally; a hash/FRI impl needs none).
   fn prove(
     ck: &Self::CommitmentKey,
-    ck_eval: &Self::CommitmentKey,
     transcript: &mut E::TE,
     comm: &Self::Commitment,
     poly: &[BigUint],
     blind: &Self::Blind,
     point: &[E::Scalar],
     eval: &BigUint,
-    comm_eval: &Self::Commitment,
-    blind_eval: &Self::Blind,
   ) -> Result<Self::EvaluationArgument, SpartanError>;
 
   /// Verify a polynomial opening. `eval` is the canonical integer in
   /// `[0, p)` representing the claimed `Z_p` evaluation; the IntEval
   /// protocol uses it to check `int_v' ≡ eval (mod p)`.
-  #[allow(clippy::too_many_arguments)]
   fn verify(
     vk: &Self::VerifierKey,
-    ck_eval: &Self::CommitmentKey,
     transcript: &mut E::TE,
     comm: &Self::Commitment,
     point: &[E::Scalar],
     eval: &BigUint,
-    comm_eval: &Self::Commitment,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError>;
 }
