@@ -3514,6 +3514,77 @@ mod tests {
     <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
   }
 
+  /// N≥2 batch path: a two-poly `prove_batch` round-trips, and tampering
+  /// *either* poly's claimed eval makes `verify_batch` reject. Guards the
+  /// batch-specific logic (per-target λ routing, μ-RLC, the `RcTarget` poly
+  /// index) that the SNARK driver tests only hit on the happy path.
+  #[test]
+  fn batch_open_rejects_tampered_eval() {
+    let num_vars = 6usize;
+    let n = 1usize << num_vars;
+    let (ck, vk) =
+      IntegerModPCS::setup_optimized(b"inteval-batch", n, 256, DEFAULT_LOG_T_F).unwrap();
+
+    let dyn_params = small_dyn_params();
+    let p: BigUint = BigUint::from(37u32);
+
+    // Two distinct polynomials opened at two distinct points.
+    let poly0: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1)).collect();
+    let poly1: Vec<BigUint> = (0..n).map(|i| BigUint::from((i as u32) * 3 + 5)).collect();
+    let point0: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+    let point1: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 5 + 1) % 37))
+      .collect();
+
+    let eval_of = |poly: &[BigUint], point: &[DP]| -> BigUint {
+      let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &int_point)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+    let eval0 = eval_of(&poly0, &point0);
+    let eval1 = eval_of(&poly1, &point1);
+
+    let blind0 = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let blind1 = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm0 = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly0, &blind0).unwrap();
+    let comm1 = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly1, &blind1).unwrap();
+
+    let comms = [&comm0, &comm1];
+    let polys: [&[BigUint]; 2] = [&poly0, &poly1];
+    let blinds = [&blind0, &blind1];
+    let points: [&[DP]; 2] = [&point0, &point1];
+    let evals = [&eval0, &eval1];
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-batch", dyn_params);
+    let arg = <MP as ModPCSEngineTrait<ME>>::prove_batch(
+      &ck, &mut pt, &comms, &polys, &blinds, &points, &evals,
+    )
+    .unwrap();
+
+    // Positive: the untampered 2-poly batch verifies.
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-batch", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify_batch(&vk, &mut vt, &comms, &points, &evals, &arg)
+      .unwrap();
+
+    // Negative: tampering *either* poly's claimed eval must reject — confirms
+    // each claim is checked against the correct commitment.
+    let bad0 = (&eval0 + BigUint::from(1u32)) % &p;
+    let bad1 = (&eval1 + BigUint::from(1u32)) % &p;
+    for (i, bad) in [(0usize, &bad0), (1usize, &bad1)] {
+      let evals_t = if i == 0 { [bad, &eval1] } else { [&eval0, bad] };
+      let mut vtt = <ME as SumcheckEngine>::TE::new_with_params(b"intev-batch", dyn_params);
+      assert!(
+        <MP as ModPCSEngineTrait<ME>>::verify_batch(&vk, &mut vtt, &comms, &points, &evals_t, &arg)
+          .is_err(),
+        "verify_batch must reject a tampered eval for poly {i}"
+      );
+    }
+  }
+
   /// `validate` catches a hand-rolled `IntEvalParams` literal where
   /// `numlimb` is inconsistent with `(log_t, log_t_f)`.
   #[test]
