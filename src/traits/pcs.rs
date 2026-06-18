@@ -60,7 +60,14 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
   /// Returns a blind to be used for commitment to a polynomial of size `n`
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
 
-  /// Commits to the provided vector using the provided ck and returns the commitment
+  /// Commits to the provided vector using the provided ck and returns the commitment.
+  ///
+  /// `is_small` is a **caller guarantee that every element of `v` is `< 2^64`**.
+  /// When `true`, the fast small-scalar MSM path takes the low 64 bits of each
+  /// element *without checking* — passing `true` for any value `>= 2^64`
+  /// silently truncates and yields a wrong (non-binding) commitment. When
+  /// `false`, the implementation detects small scalars itself and is correct
+  /// for any width.
   fn commit(
     ck: &Self::CommitmentKey,
     v: &[E::Scalar],

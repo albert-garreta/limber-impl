@@ -461,6 +461,11 @@ where
               scalars_small.clear();
               scalars_small.extend(scalars.iter().map(|s| {
                 let bytes = s.to_repr();
+                debug_assert!(
+                  bytes.as_ref()[8..].iter().all(|&b| b == 0),
+                  "commit(is_small=true) given a scalar >= 2^64; the low-64-bit \
+                   fast path would silently truncate to a wrong commitment"
+                );
                 u64::from_le_bytes(bytes.as_ref()[..8].try_into().unwrap())
               }));
             }

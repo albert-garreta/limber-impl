@@ -1242,17 +1242,23 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // (e.g. the eval-value commitment); the value may be any F element,
     // not bounded by `T_f`, so skip limb-splitting in that case.
     //
-    // The small-scalar MSM fast path is chosen here, not via a trait
-    // param: the limb-split path produces limbs `< 2^log_t` (small), so
-    // `is_small = true`; the size-1 stopgap value may be a full-width
-    // `Z_p` element, so `is_small = false`.
+    // The small-scalar MSM fast path (`is_small`) requires every committed
+    // value to be `< 2^64` — Hyrax takes the low 8 bytes with no check, so a
+    // wider value would be silently truncated to a wrong commitment. Limbs
+    // are `< 2^log_t`, so claim `is_small` only when `log_t <= 64`; wider
+    // limbs (e.g. a `log_t = 128` choice from `derive_optimized`) take the
+    // checked full-MSM path. The size-1 stopgap value may be a full-width
+    // `Z_p` element, so `is_small = false` there too.
     //
     // TODO Phase 3 step D5: per-limb range check `|limb| < T`.
     let params = &ck.params;
     let (v_limbs, is_small) = if v.len() == 1 {
       (v.to_vec(), false)
     } else {
-      (limb_split_polynomial(v, params.log_t, params.log_t_f), true)
+      (
+        limb_split_polynomial(v, params.log_t, params.log_t_f),
+        params.log_t <= 64,
+      )
     };
     let v_fq: Vec<t256::Scalar> = v_limbs.iter().map(biguint_to_scalar).collect();
     let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, is_small)?;
@@ -3244,6 +3250,52 @@ mod tests {
       let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
       <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
     }
+  }
+
+  /// Wide limbs (`log_t = 128 > 64`) with large coefficients must round-trip
+  /// and verify. Regression for the truncation bug: `commit` previously
+  /// hardcoded `is_small = true`, so 128-bit limbs were silently truncated to
+  /// their low 64 bits, producing a non-binding commitment whose opening
+  /// failed the IPA verify ("first equation failed"). With the fix, wide
+  /// limbs take the checked full-MSM path and the opening verifies.
+  #[test]
+  fn wide_limb_commit_roundtrips_and_verifies() {
+    let num_vars = 6usize;
+    let n = 1usize << num_vars;
+    // Force log_t = 128 (numlimb = 2): the > 64-bit limb regime.
+    let params = (2..16usize)
+      .find_map(|k| IntEvalParams::derive(256, 128, k, num_vars).ok())
+      .expect("a valid k exists for log_t = 128");
+    assert!(params.log_t > 64, "test must exercise > 64-bit limbs");
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"wide-limb", n, 256, params).unwrap();
+
+    let dyn_params = small_dyn_params();
+    // Coefficients ~2^200 so each splits into limbs that exceed 2^64 — exactly
+    // what the buggy is_small=true path truncated.
+    let big = BigUint::from(2u32).pow(200);
+    let poly: Vec<BigUint> = (0..n).map(|i| &big + BigUint::from(i as u32 + 1)).collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v = integer_mle_evaluate(&poly, &int_point);
+    let p: BigUint = BigUint::from(37u32);
+    let eval = int_v
+      .mod_floor(&BigInt::from(p.clone()))
+      .to_biguint()
+      .unwrap();
+
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
   }
 
   /// `validate` catches a hand-rolled `IntEvalParams` literal where
