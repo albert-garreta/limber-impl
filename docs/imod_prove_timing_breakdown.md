@@ -23,30 +23,45 @@ because multi-thread numbers on this machine are not reproducible (see
   (one setup/prove/verify, no criterion iteration). **Single (un-warmed) runs —
   treat absolute ms as ±10–20%; the ranking and proportions are the robust part.**
 
-## Breakdown (msshape c12, single-thread, ≈660 ms full routine)
+## Breakdown (msshape c12, single-thread, ≈645 ms full routine)
 
 The timed routine is `msshape_witness` (gen) → `IntModR1CSWitnessModp::new`
-(commit `w`,`q`) → `prove`. The `prove` span itself is ≈509 ms; the witness
-commit (≈151 ms) and gen (~few ms) happen before it.
+(commit `w`,`q`) → `prove`. The `prove` span is ≈490 ms; the witness commit
+(~150 ms) and gen (~few ms) happen before it. Full flat breakdown — every span
+its own line, sorted by cost:
 
-| component | ms | % | span | kind |
-|---|---:|---:|---|---|
-| chunk commit (range check) | 210 | ~32% | `rc_chunk_commit` | **MSM** |
-| witness commit (`comm_w`+`comm_q`) | 151 | ~23% | `imod_modp_wq_commit` | **MSM** |
-| batched opens (one combined IPA) | 91 | ~14% | `imod_pcs_batched_opens` | open sumchecks + IPA |
-| LogUp-GKR (one shared) | 75 | ~11% | `rc_logup_gkr` | sumcheck |
-| chain phases (per-prime setup) | 66 | ~10% | `imod_pcs_chain_phase1/claims` | — |
-| reduction (limb-split→DynPrime) | 30 | ~5% | `imod_pcs_reduction` | — |
-| mult commit | 14 | ~2% | `rc_mult_commit` | **MSM** |
-| SNARK outer/inner sumcheck + wit-gen + misc | ~13 | ~2% | `imod_modp_*` / unspanned | — |
+| # | component | span | ms | % |
+|---|---|---|---:|---:|
+| 1 | range-check chunk commit | `rc_chunk_commit` | 195 | 30% |
+| 2 | witness commit (`comm_w`+`comm_q`) | `imod_modp_wq_commit` | ~150 | 23% |
+| 3 | open sumcheck / W-build | `imod_pcs_batched_opens` − IPA | 82 | 13% |
+| 4 | LogUp-GKR range check | `rc_logup_gkr` | 76 | 12% |
+| 5 | a/b value commit | `imod_pcs_ab_commit` | 33 | 5% |
+| 6 | reduction (limb-split→DynPrime) | `imod_pcs_reduction` | 27 | 4% |
+| 7 | chain build (partial-eval) | `imod_pcs_chain_build` | 27 | 4% |
+| 8 | mult-table commit | `rc_mult_commit` | 14 | 2% |
+| 9 | IPA opens | `hyrax_prove_ipa` (×6) | 11 | 2% |
+| 10 | range-check recon/bit-validity | `rc_shared` residual | ~9 | 1.4% |
+| 11 | witness gen | (unspanned) | ~5 | 0.8% |
+| 12 | SNARK outer sumcheck | `imod_modp_outer_sumcheck` | 3 | 0.5% |
+| 13 | prime sampling + chain claims | residual | ~3 | 0.5% |
+| 14 | SNARK inner sumcheck | `imod_modp_inner_sumcheck` | 2 | 0.3% |
 
-- **MSM commits** (chunk 210 + witness 151 + mult 14 = **375 ms, ~57%**) are the
-  dominant single-thread cost — consistent with the flamegraph (~45% of
-  single-thread self-time is T256 curve adds).
-- **Witness gen** is *timed* (the gen+commit bench fix put `msshape_witness`
-  inside the measured routine) but has **no span**, so it's the ~few-ms residual,
-  not a line item. (For `multiswap`, gen would be large — the real RSA-2048
+Sum ≈ 638 ms ≈ the 645 ms routine (rounding + un-spanned bits).
+
+- **MSM commits** (rows 1,2,5,8 = chunk 195 + witness 150 + a/b 33 + mult 14 =
+  **392 ms, ~61%**) dominate single-threaded — consistent with the flamegraph
+  (~45% of single-thread self-time is T256 curve adds).
+- **Two of those commits are duplicates** (every range-checked poly is committed
+  once in value/limb form and again in chunk form): the witness commit (~150 ms)
+  duplicates the `f_limb` chunks inside `rc_chunk_commit`, and the a/b value
+  commit (`ab_comm`, 33 ms) duplicates the `Ab` chunks. The commit-sharing levers
+  below target these.
+- **Witness gen** is *timed* (the gen+commit bench fix) but **un-spanned**, so
+  it's the ~few-ms residual. (For `multiswap` gen is large — the real RSA-2048
   exponentiation — but that's a different bench.)
+- Single un-warmed run → ±10–20% on absolutes (chunk commit was 210 in an earlier
+  run, 195 here).
 
 ## What `cd3b093` (batched w/q opens) changed
 

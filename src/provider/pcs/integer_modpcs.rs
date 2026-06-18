@@ -1618,6 +1618,7 @@ fn prove_one_poly(
     .map(|_| sample_small_prime(transcript, params.log_p))
     .collect::<Result<Vec<_>, SpartanError>>()?;
 
+  let (_cb_span, cb_t) = start_span!("imod_pcs_chain_build");
   let chain_states: Vec<ChainProverState> = primes
     .par_iter()
     .map(|p_i| -> Result<ChainProverState, SpartanError> {
@@ -1681,6 +1682,7 @@ fn prove_one_poly(
       })
     })
     .collect::<Result<Vec<_>, SpartanError>>()?;
+  info!(elapsed_ms = %cb_t.elapsed().as_millis(), "imod_pcs_chain_build");
 
   let t_layers = if with_iter {
     num_vars.saturating_sub(params.k).div_ceil(params.k)
@@ -1692,6 +1694,7 @@ fn prove_one_poly(
   let mut ab_polys: Vec<Vec<t256::Scalar>> = Vec::with_capacity(t_layers);
   let mut ab_blinds: Vec<HB> = Vec::with_capacity(t_layers);
   let mut ab_comms: Vec<HC> = Vec::with_capacity(t_layers);
+  let (_ab_span, ab_t) = start_span!("imod_pcs_ab_commit");
   for jm1 in 0..t_layers {
     let m = 1usize << (num_vars - (jm1 + 1) * params.k);
     let mut stacked = vec![t256::Scalar::ZERO; 2 * s_pad * m];
@@ -1707,6 +1710,7 @@ fn prove_one_poly(
     ab_blinds.push(ab_blind);
     ab_comms.push(ab_comm);
   }
+  info!(elapsed_ms = %ab_t.elapsed().as_millis(), "imod_pcs_ab_commit");
   info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
   // Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
