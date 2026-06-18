@@ -281,6 +281,25 @@ size; promote into a phase plan when picked up.
   shared bit commitment and one shared sumcheck per iteration.
 
   Next perf levers worth profiling:
+  - **Share the witness commitment with the `f_limb` range-check chunk
+    commitment (`log_t = CHUNK_BITS = 16`).** When the limb width equals the
+    range-check chunk width (16), each limb *is* one chunk, so
+    `limb_split(w)` equals the chunk decomposition — i.e. `comm_w` (and
+    `comm_q`) and the range check's `f_limb` chunk commitment commit the
+    *identical* polynomial. Use `log_t=16` and reuse `comm_w`/`comm_q` as the
+    `f_limb` chunk commitment instead of committing it again. Total
+    range-check chunks are `log_t_f/16` regardless of `log_t`, so the GKR
+    cost is unchanged; this purely drops the duplicate MSM. Per-value commit
+    entries (msshape, `log_t_f=256`): `log_t=32` no-share = 8 limbs + 16
+    chunks = 24; `log_t=16` + share = 16 (one commit). The witness commit is
+    ~21% of single-threaded prove, so collapsing its duplicate is real.
+    Caveats: (1) the witness-commit layout must be made to match exactly what
+    the range check consumes (same `ck`, ordering, padding — at `log_t=16`
+    `stride=1`, so they can coincide); (2) only `w`/`q` share — the `a_j`/`b_j`
+    IntEval chains keep their own range-check commits; (3) safe only post the
+    `is_small = log_t <= 64` fix (commit `f045217`). Needs a verify-inclusive
+    A/B (bigger single shared commit vs dropping a separate one). Idea raised
+    by the user 2026-06-18.
   - **Batched Hyrax opens inside a `BatchRangeCheck`.** Each batch
     still does `N` separate Hyrax::prove calls for the value-poly
     openings at the shared `r_v_within`. Multi-point batched open

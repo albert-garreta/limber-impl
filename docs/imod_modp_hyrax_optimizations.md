@@ -1,5 +1,17 @@
 # imod_spartan_modp — low-hanging prover/verifier optimizations (Hyrax-kept)
 
+> **Superseded attribution (2026-06-17):** the "range-check path is the 3–4×
+> cost driver / MSM-bound" framing below was an *unprofiled estimate*. A
+> measured breakdown ([imod_prove_timing_breakdown.md](imod_prove_timing_breakdown.md))
+> shows that on the multi-threaded machine the prover is dominated by the
+> **LogUp-GKR sumcheck (~42%, and ~2× *slower* threaded — negative scaling)**
+> and the **batched opens (~28%, serial)**, *not* MSM. The commit MSM is the
+> biggest single-thread cost but parallelizes ~7× and is only ~7% of
+> multi-threaded wall-clock. So the highest-value levers are (1) a parallelism
+> threshold in `logup_gkr` and (2) parallelizing `prove_combined_batch_open`
+> across chains — the commit-batching items below mostly help the single-core
+> / proof-size case. Read that doc first.
+
 Optimizations that reduce prover/verifier cost of `IntModSpartanModpSNARK`
 **without** changing the PCS (stays Hyrax-over-T256) and **without** any
 protocol/soundness change. All targets live in the Phase-3 batch
