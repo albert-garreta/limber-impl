@@ -7,3 +7,5 @@
 //! Merkle commitment lacks).
 
 pub mod code;
+pub mod commit;
+pub mod merkle;
