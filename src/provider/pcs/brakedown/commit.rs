@@ -71,11 +71,12 @@ pub struct BrakedownCommitData<F> {
   pub tree: MerkleTree,
 }
 
-/// Serialize a column (the `n_rows` field elements at column `c`) to bytes.
-fn column_bytes<F: PrimeField>(encoded: &[Vec<F>], c: usize) -> Vec<u8> {
-  let mut buf = Vec::with_capacity(encoded.len() * 32);
-  for row in encoded {
-    buf.extend_from_slice(row[c].to_repr().as_ref());
+/// Serialize a column (the field elements at one column index) to bytes. Shared
+/// by `commit` (building leaves) and the verifier (recomputing a leaf).
+pub(crate) fn column_to_bytes<F: PrimeField>(col: &[F]) -> Vec<u8> {
+  let mut buf = Vec::with_capacity(col.len() * 32);
+  for x in col {
+    buf.extend_from_slice(x.to_repr().as_ref());
   }
   buf
 }
@@ -96,7 +97,10 @@ pub fn commit<F: PrimeFieldExt>(
   // Hash each encoded column into a leaf, in parallel.
   let leaves: Vec<Hash> = (0..params.n_cols)
     .into_par_iter()
-    .map(|c| hash_leaf(&column_bytes(&encoded, c)))
+    .map(|c| {
+      let col: Vec<F> = encoded.iter().map(|row| row[c]).collect();
+      hash_leaf(&column_to_bytes(&col))
+    })
     .collect();
   let tree = MerkleTree::from_leaves(leaves);
   (tree.root(), BrakedownCommitData { encoded, tree })

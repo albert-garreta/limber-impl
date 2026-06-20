@@ -165,14 +165,17 @@ impl<F: PrimeFieldExt> SparseMat<F> {
   }
 }
 
-fn xof(seed: &[u8], tag: &[u8]) -> impl XofReader + use<> {
+/// Deterministic XOF stream seeded by `seed || tag` (Shake256). Also used by the
+/// IOPP to expand transcript challenges into field elements / column indices.
+pub(crate) fn xof(seed: &[u8], tag: &[u8]) -> impl XofReader + use<> {
   let mut h = Shake256::default();
   h.update(seed);
   h.update(tag);
   h.finalize_xof()
 }
 
-fn next_scalar<F: PrimeFieldExt>(reader: &mut impl XofReader) -> F {
+/// Next field element from a XOF stream (64 uniform bytes → field).
+pub(crate) fn next_scalar<F: PrimeFieldExt>(reader: &mut impl XofReader) -> F {
   let mut b = [0u8; 64];
   reader.read(&mut b);
   F::from_uniform(&b)
@@ -187,7 +190,8 @@ fn next_nonzero<F: PrimeFieldExt>(reader: &mut impl XofReader) -> F {
   }
 }
 
-fn next_index(reader: &mut impl XofReader, bound: usize) -> usize {
+/// Next index in `[0, bound)` from a XOF stream.
+pub(crate) fn next_index(reader: &mut impl XofReader, bound: usize) -> usize {
   let mut b = [0u8; 8];
   reader.read(&mut b);
   (u64::from_le_bytes(b) % bound as u64) as usize

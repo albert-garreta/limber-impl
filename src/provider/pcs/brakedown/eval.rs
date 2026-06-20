@@ -1,0 +1,266 @@
+//! Brakedown evaluation opening — the tensor IOPP.
+//!
+//! The committed poly is the `n_rows × row_len` message matrix `M`. An MLE eval
+//! at `r = (r_hi, r_lo)` factors as `eval = ⟨ e_row · M , e_col ⟩` with
+//! `e_row = eq(r_hi)` (length `n_rows`), `e_col = eq(r_lo)` (length `row_len`).
+//!
+//! The prover sends two combined message rows — `w_prox = r_comb·M` for a random
+//! `r_comb` (proximity / well-formedness) and `w_eval = e_row·M` (the eval) —
+//! plus `t` opened columns of the encoded matrix (with Merkle paths). For each
+//! opened column `c` the verifier checks, using the code's linearity
+//! (`combo·EncodedMatrix = Enc(combo·M)`):
+//! `Enc(w_prox)[c] == ⟨r_comb, col_c⟩` and `Enc(w_eval)[c] == ⟨e_row, col_c⟩`,
+//! and finally `eval == ⟨w_eval, e_col⟩`.
+
+use super::{
+  code::{next_index, next_scalar, xof},
+  commit::{BrakedownParams, column_to_bytes, commit},
+  merkle::{Hash, verify_path},
+};
+use crate::{
+  errors::SpartanError,
+  traits::{PrimeFieldExt, transcript::ByteTranscript},
+};
+use ff::Field;
+
+/// An opened column: its index, the `n_rows` encoded entries, and Merkle path.
+#[derive(Clone, Debug)]
+pub struct OpenedColumn<F> {
+  index: usize,
+  entries: Vec<F>,
+  path: Vec<Hash>,
+}
+
+/// Evaluation argument: the proximity row, the eval row, and the opened columns.
+#[derive(Clone, Debug)]
+pub struct BrakedownEvalArg<F> {
+  w_prox: Vec<F>,
+  w_eval: Vec<F>,
+  columns: Vec<OpenedColumn<F>>,
+}
+
+/// eq-polynomial evaluations over `r`, high-bit-first: `out[k] = ∏_b (k_b?
+/// r_b : 1-r_b)` with `r[0]` the most-significant index bit. Factorizes as
+/// `eq(r_hi||r_lo)[i·2^|lo| + j] = eq(r_hi)[i]·eq(r_lo)[j]`.
+fn eq_evals<F: Field>(r: &[F]) -> Vec<F> {
+  let mut e = vec![F::ONE];
+  for &ri in r {
+    let mut next = Vec::with_capacity(e.len() * 2);
+    for &ev in &e {
+      next.push(ev * (F::ONE - ri));
+      next.push(ev * ri);
+    }
+    e = next;
+  }
+  e
+}
+
+fn inner<F: Field>(a: &[F], b: &[F]) -> F {
+  a.iter().zip(b).fold(F::ZERO, |acc, (x, y)| acc + *x * *y)
+}
+
+/// `combo · M` over the systematic (message) columns: `out[j] = Σ_i combo[i] ·
+/// encoded[i][j]` for `j < row_len`.
+fn combine_message_rows<F: Field>(encoded: &[Vec<F>], combo: &[F], row_len: usize) -> Vec<F> {
+  let mut out = vec![F::ZERO; row_len];
+  for (i, row) in encoded.iter().enumerate() {
+    let c = combo[i];
+    for (o, &m) in out.iter_mut().zip(&row[..row_len]) {
+      *o += c * m;
+    }
+  }
+  out
+}
+
+fn expand_scalars<F: PrimeFieldExt>(seed: &[u8; 64], n: usize) -> Vec<F> {
+  let mut r = xof(seed, b"sc");
+  (0..n).map(|_| next_scalar::<F>(&mut r)).collect()
+}
+
+fn expand_indices(seed: &[u8; 64], count: usize, bound: usize) -> Vec<usize> {
+  let mut r = xof(seed, b"idx");
+  (0..count).map(|_| next_index(&mut r, bound)).collect()
+}
+
+fn verr(reason: &str) -> SpartanError {
+  SpartanError::ProofVerifyError {
+    reason: format!("brakedown: {reason}"),
+  }
+}
+
+/// Prove `poly(point) = eval`. Re-derives the commitment internally (so the
+/// caller need only hold the root); returns the evaluation and its argument.
+pub fn open<F: PrimeFieldExt>(
+  params: &BrakedownParams<F>,
+  poly: &[F],
+  point: &[F],
+  transcript: &mut impl ByteTranscript,
+) -> Result<(F, BrakedownEvalArg<F>), SpartanError> {
+  let (root, data) = commit(params, poly);
+  transcript.absorb_bytes(b"bd_root", &root);
+  let log_rows = params.n_rows.trailing_zeros() as usize;
+  let e_row = eq_evals(&point[..log_rows]);
+  let e_col = eq_evals(&point[log_rows..]);
+
+  let seed_rc = transcript.squeeze_bytes(b"bd_rcomb")?;
+  let r_comb = expand_scalars::<F>(&seed_rc, params.n_rows);
+  let w_prox = combine_message_rows(&data.encoded, &r_comb, params.row_len);
+  let w_eval = combine_message_rows(&data.encoded, &e_row, params.row_len);
+  transcript.absorb_bytes(b"bd_wprox", &column_to_bytes(&w_prox));
+  transcript.absorb_bytes(b"bd_weval", &column_to_bytes(&w_eval));
+  let eval = inner(&w_eval, &e_col);
+
+  let seed_cols = transcript.squeeze_bytes(b"bd_cols")?;
+  let idxs = expand_indices(&seed_cols, params.n_col_opens, params.n_cols);
+  let columns = idxs
+    .iter()
+    .map(|&c| OpenedColumn {
+      index: c,
+      entries: data.encoded.iter().map(|row| row[c]).collect(),
+      path: data.tree.path(c),
+    })
+    .collect();
+  Ok((
+    eval,
+    BrakedownEvalArg {
+      w_prox,
+      w_eval,
+      columns,
+    },
+  ))
+}
+
+/// Verify that `point` opens `comm` (the Merkle root) to `eval`.
+pub fn verify_open<F: PrimeFieldExt>(
+  params: &BrakedownParams<F>,
+  root: &Hash,
+  point: &[F],
+  eval: F,
+  arg: &BrakedownEvalArg<F>,
+  transcript: &mut impl ByteTranscript,
+) -> Result<(), SpartanError> {
+  transcript.absorb_bytes(b"bd_root", root);
+  let log_rows = params.n_rows.trailing_zeros() as usize;
+  let e_row = eq_evals(&point[..log_rows]);
+  let e_col = eq_evals(&point[log_rows..]);
+
+  let seed_rc = transcript.squeeze_bytes(b"bd_rcomb")?;
+  let r_comb = expand_scalars::<F>(&seed_rc, params.n_rows);
+  if arg.w_prox.len() != params.row_len || arg.w_eval.len() != params.row_len {
+    return Err(verr("bad combined-row length"));
+  }
+  transcript.absorb_bytes(b"bd_wprox", &column_to_bytes(&arg.w_prox));
+  transcript.absorb_bytes(b"bd_weval", &column_to_bytes(&arg.w_eval));
+
+  let seed_cols = transcript.squeeze_bytes(b"bd_cols")?;
+  let idxs = expand_indices(&seed_cols, params.n_col_opens, params.n_cols);
+  if arg.columns.len() != idxs.len() {
+    return Err(verr("wrong number of opened columns"));
+  }
+
+  // Encode the two combined rows once (verifier-side, O(row_len)).
+  let enc_prox = params.code.encode(&arg.w_prox);
+  let enc_eval = params.code.encode(&arg.w_eval);
+
+  for (k, col) in arg.columns.iter().enumerate() {
+    if col.index != idxs[k] {
+      return Err(verr("opened column index does not match challenge"));
+    }
+    if col.entries.len() != params.n_rows {
+      return Err(verr("opened column has wrong height"));
+    }
+    if !verify_path(root, &column_to_bytes(&col.entries), col.index, &col.path) {
+      return Err(verr("Merkle path check failed"));
+    }
+    if inner(&r_comb, &col.entries) != enc_prox[col.index] {
+      return Err(verr("proximity check failed"));
+    }
+    if inner(&e_row, &col.entries) != enc_eval[col.index] {
+      return Err(verr("eval-consistency check failed"));
+    }
+  }
+
+  if inner(&arg.w_eval, &e_col) != eval {
+    return Err(verr("claimed evaluation does not match"));
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    provider::{T256HyraxEngine, keccak::Keccak256Transcript, pcs::brakedown::code::DEFAULT_SPEC},
+    traits::{Engine, transcript::TranscriptEngineTrait},
+  };
+
+  type E = T256HyraxEngine;
+  type F = <E as Engine>::Scalar;
+
+  fn rand_vec(n: usize, tag: u64) -> Vec<F> {
+    let mut r = xof(b"bd-eval-test", &tag.to_le_bytes());
+    (0..n).map(|_| next_scalar::<F>(&mut r)).collect()
+  }
+
+  fn run(log_n: usize) {
+    let n = 1usize << log_n;
+    let params = BrakedownParams::<F>::new(n, DEFAULT_SPEC, 128, b"seed");
+    let poly = rand_vec(n, 1);
+    let point = rand_vec(log_n, 2);
+
+    // brute-force MLE eval (same eq convention as the reshape)
+    let expected = inner(&poly, &eq_evals(&point));
+
+    let (root, _) = commit(&params, &poly);
+    let mut pt = Keccak256Transcript::<E>::new(b"bd");
+    let (eval, arg) = open(&params, &poly, &point, &mut pt).unwrap();
+    assert_eq!(
+      eval, expected,
+      "protocol eval must equal MLE eval (log_n={log_n})"
+    );
+
+    let mut vt = Keccak256Transcript::<E>::new(b"bd");
+    verify_open(&params, &root, &point, eval, &arg, &mut vt).unwrap();
+  }
+
+  #[test]
+  fn roundtrip_eval_matches_mle() {
+    for log_n in [4usize, 8, 12, 14] {
+      run(log_n);
+    }
+  }
+
+  #[test]
+  fn verify_rejects_tampering() {
+    let log_n = 12;
+    let n = 1usize << log_n;
+    let params = BrakedownParams::<F>::new(n, DEFAULT_SPEC, 128, b"seed");
+    let poly = rand_vec(n, 1);
+    let point = rand_vec(log_n, 2);
+    let (root, _) = commit(&params, &poly);
+    let mut pt = Keccak256Transcript::<E>::new(b"bd");
+    let (eval, arg) = open(&params, &poly, &point, &mut pt).unwrap();
+
+    // wrong claimed eval
+    let mut vt = Keccak256Transcript::<E>::new(b"bd");
+    assert!(verify_open(&params, &root, &point, eval + F::ONE, &arg, &mut vt).is_err());
+
+    // tampered eval row
+    let mut bad = arg.clone();
+    bad.w_eval[0] += F::ONE;
+    let mut vt = Keccak256Transcript::<E>::new(b"bd");
+    assert!(verify_open(&params, &root, &point, eval, &bad, &mut vt).is_err());
+
+    // tampered opened column entry
+    let mut bad = arg.clone();
+    bad.columns[0].entries[0] += F::ONE;
+    let mut vt = Keccak256Transcript::<E>::new(b"bd");
+    assert!(verify_open(&params, &root, &point, eval, &bad, &mut vt).is_err());
+
+    // wrong commitment root
+    let mut wrong_root = root;
+    wrong_root[0] ^= 1;
+    let mut vt = Keccak256Transcript::<E>::new(b"bd");
+    assert!(verify_open(&params, &wrong_root, &point, eval, &arg, &mut vt).is_err());
+  }
+}

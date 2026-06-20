@@ -8,4 +8,5 @@
 
 pub mod code;
 pub mod commit;
+pub mod eval;
 pub mod merkle;
