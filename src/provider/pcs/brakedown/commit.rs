@@ -175,4 +175,69 @@ mod tests {
     let (root_c, _) = commit(&p, &poly2);
     assert_ne!(root_a, root_c, "commit must bind to the polynomial");
   }
+
+  /// Commit-cost A/B: Brakedown (encode + Merkle hash) vs Hyrax (Pedersen MSM,
+  /// `is_small` fast path), back-to-back, same machine. Run with:
+  ///   RAYON_NUM_THREADS=1 cargo test --lib -- --ignored --nocapture commit_bench
+  /// and again without the env var for the multi-thread picture.
+  #[test]
+  #[ignore = "benchmark; run with --ignored --nocapture"]
+  fn commit_bench() {
+    use crate::traits::pcs::PCSEngineTrait;
+    use sha3::{
+      Shake256,
+      digest::{ExtendableOutput, Update, XofReader},
+    };
+    use std::time::Instant;
+    type Hyrax = crate::provider::pcs::hyrax_pc::HyraxPCS<T256HyraxEngine>;
+
+    // small (< 2^64) values so Hyrax's is_small fast MSM path is valid
+    fn small_poly(n: usize) -> Vec<F> {
+      let mut h = Shake256::default();
+      h.update(b"commit-bench");
+      let mut r = h.finalize_xof();
+      (0..n)
+        .map(|_| {
+          let mut b = [0u8; 8];
+          r.read(&mut b);
+          F::from(u64::from_le_bytes(b))
+        })
+        .collect()
+    }
+
+    let threads = rayon::current_num_threads();
+    println!("\n== commit A/B (threads={threads}) ==");
+    for log_n in [12usize, 14, 16, 18] {
+      let n = 1usize << log_n;
+      let poly = small_poly(n);
+      let iters = 5;
+
+      let bp = BrakedownParams::<F>::new(n, DEFAULT_SPEC, 128, b"seed");
+      let _ = commit(&bp, &poly); // warmup
+      let t0 = Instant::now();
+      for _ in 0..iters {
+        let _ = commit(&bp, &poly);
+      }
+      let bd_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+      let width = 1usize << log_n.div_ceil(2);
+      let (ck, _vk) = Hyrax::setup(b"hbench", n, width);
+      Hyrax::precompute_ck(&ck);
+      let blind = Hyrax::blind(&ck, n);
+      let _ = Hyrax::commit(&ck, &poly, &blind, true).unwrap(); // warmup
+      let t1 = Instant::now();
+      for _ in 0..iters {
+        let _ = Hyrax::commit(&ck, &poly, &blind, true).unwrap();
+      }
+      let hx_ms = t1.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+      println!(
+        "n=2^{log_n:<2}  brakedown {bd_ms:7.2}ms  hyrax {hx_ms:7.2}ms  \
+         (bd rows={} cols={})  bd/hyrax={:.2}x",
+        bp.n_rows,
+        bp.n_cols,
+        bd_ms / hx_ms,
+      );
+    }
+  }
 }
