@@ -263,4 +263,48 @@ mod tests {
     let mut vt = Keccak256Transcript::<E>::new(b"bd");
     assert!(verify_open(&params, &wrong_root, &point, eval, &arg, &mut vt).is_err());
   }
+
+  /// Open/verify time and proof size across sizes. Run with:
+  ///   RAYON_NUM_THREADS=1 cargo test --release --lib -- --ignored --nocapture eval_bench
+  /// and again without the env var.
+  #[test]
+  #[ignore = "benchmark; run with --release --ignored --nocapture"]
+  fn eval_bench() {
+    use std::time::Instant;
+    println!(
+      "\n== Brakedown open/verify/proof (threads={}) ==",
+      rayon::current_num_threads()
+    );
+    for log_n in [12usize, 14, 16, 18] {
+      let n = 1usize << log_n;
+      let params = BrakedownParams::<F>::new(n, DEFAULT_SPEC, 128, b"seed");
+      let poly = rand_vec(n, 1);
+      let point = rand_vec(log_n, 2);
+      let (root, _) = commit(&params, &poly);
+
+      let mut pt = Keccak256Transcript::<E>::new(b"bd");
+      let t0 = Instant::now();
+      let (eval, arg) = open(&params, &poly, &point, &mut pt).unwrap();
+      let open_ms = t0.elapsed().as_secs_f64() * 1e3; // incl. internal re-commit
+
+      let mut vt = Keccak256Transcript::<E>::new(b"bd");
+      let t1 = Instant::now();
+      verify_open(&params, &root, &point, eval, &arg, &mut vt).unwrap();
+      let ver_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+      let fb = 32usize; // bytes per field element / hash
+      let rows_b = (arg.w_prox.len() + arg.w_eval.len()) * fb;
+      let col_b: usize = arg
+        .columns
+        .iter()
+        .map(|c| c.entries.len() * fb + c.path.len() * 32)
+        .sum();
+      let kb = (rows_b + col_b) as f64 / 1024.0;
+      println!(
+        "n=2^{log_n:<2} open(+commit) {open_ms:7.1}ms  verify {ver_ms:6.2}ms  \
+         proof {kb:8.1}KB  (t={} rows={} rowlen={} cols={})",
+        params.n_col_opens, params.n_rows, params.row_len, params.n_cols,
+      );
+    }
+  }
 }
