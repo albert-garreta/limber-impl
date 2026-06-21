@@ -15,28 +15,24 @@
 use super::{
   code::{next_index, next_scalar, xof},
   commit::{BrakedownParams, column_to_bytes, commit},
-  merkle::{Hash, verify_path},
+  merkle::{Hash, hash_leaf, verify_batch_path},
 };
 use crate::{
   errors::SpartanError,
   traits::{PrimeFieldExt, transcript::ByteTranscript},
 };
 use ff::Field;
+use std::collections::HashMap;
 
-/// An opened column: its index, the `n_rows` encoded entries, and Merkle path.
-#[derive(Clone, Debug)]
-pub struct OpenedColumn<F> {
-  index: usize,
-  entries: Vec<F>,
-  path: Vec<Hash>,
-}
-
-/// Evaluation argument: the proximity row, the eval row, and the opened columns.
+/// Evaluation argument: the proximity row, the eval row, the opened columns
+/// (sorted-unique `(index, entries)`), and one batched Merkle multiproof
+/// covering all of them.
 #[derive(Clone, Debug)]
 pub struct BrakedownEvalArg<F> {
   w_prox: Vec<F>,
   w_eval: Vec<F>,
-  columns: Vec<OpenedColumn<F>>,
+  columns: Vec<(usize, Vec<F>)>,
+  auth: Vec<Hash>,
 }
 
 /// eq-polynomial evaluations over `r`, high-bit-first: `out[k] = ∏_b (k_b?
@@ -112,20 +108,21 @@ pub fn open<F: PrimeFieldExt>(
 
   let seed_cols = transcript.squeeze_bytes(b"bd_cols")?;
   let idxs = expand_indices(&seed_cols, params.n_col_opens, params.n_cols);
-  let columns = idxs
+  let mut unique = idxs;
+  unique.sort_unstable();
+  unique.dedup();
+  let columns: Vec<(usize, Vec<F>)> = unique
     .iter()
-    .map(|&c| OpenedColumn {
-      index: c,
-      entries: data.encoded.iter().map(|row| row[c]).collect(),
-      path: data.tree.path(c),
-    })
+    .map(|&c| (c, data.encoded.iter().map(|row| row[c]).collect()))
     .collect();
+  let auth = data.tree.batch_path(&unique);
   Ok((
     eval,
     BrakedownEvalArg {
       w_prox,
       w_eval,
       columns,
+      auth,
     },
   ))
 }
@@ -154,28 +151,52 @@ pub fn verify_open<F: PrimeFieldExt>(
 
   let seed_cols = transcript.squeeze_bytes(b"bd_cols")?;
   let idxs = expand_indices(&seed_cols, params.n_col_opens, params.n_cols);
-  if arg.columns.len() != idxs.len() {
+  let mut unique = idxs.clone();
+  unique.sort_unstable();
+  unique.dedup();
+
+  // The opened columns must be exactly the unique challenged indices, sorted.
+  if arg.columns.len() != unique.len() {
     return Err(verr("wrong number of opened columns"));
+  }
+  for (col, &u) in arg.columns.iter().zip(&unique) {
+    if col.0 != u {
+      return Err(verr("opened column index does not match challenge"));
+    }
+    if col.1.len() != params.n_rows {
+      return Err(verr("opened column has wrong height"));
+    }
+  }
+
+  // One batched Merkle multiproof over all opened columns.
+  let height = params.n_cols.next_power_of_two().trailing_zeros() as usize;
+  let leaves: Vec<(usize, Hash)> = arg
+    .columns
+    .iter()
+    .map(|(i, entries)| (*i, hash_leaf(&column_to_bytes(entries))))
+    .collect();
+  if !verify_batch_path(root, height, &leaves, &arg.auth) {
+    return Err(verr("Merkle multiproof check failed"));
   }
 
   // Encode the two combined rows once (verifier-side, O(row_len)).
   let enc_prox = params.code.encode(&arg.w_prox);
   let enc_eval = params.code.encode(&arg.w_eval);
 
-  for (k, col) in arg.columns.iter().enumerate() {
-    if col.index != idxs[k] {
-      return Err(verr("opened column index does not match challenge"));
-    }
-    if col.entries.len() != params.n_rows {
-      return Err(verr("opened column has wrong height"));
-    }
-    if !verify_path(root, &column_to_bytes(&col.entries), col.index, &col.path) {
-      return Err(verr("Merkle path check failed"));
-    }
-    if inner(&r_comb, &col.entries) != enc_prox[col.index] {
+  // Per-challenge checks (a duplicate challenge index reuses its column).
+  let lookup: HashMap<usize, &[F]> = arg
+    .columns
+    .iter()
+    .map(|(i, e)| (*i, e.as_slice()))
+    .collect();
+  for &c in &idxs {
+    let entries = lookup
+      .get(&c)
+      .ok_or_else(|| verr("missing opened column"))?;
+    if inner(&r_comb, entries) != enc_prox[c] {
       return Err(verr("proximity check failed"));
     }
-    if inner(&e_row, &col.entries) != enc_eval[col.index] {
+    if inner(&e_row, entries) != enc_eval[c] {
       return Err(verr("eval-consistency check failed"));
     }
   }
@@ -253,7 +274,7 @@ mod tests {
 
     // tampered opened column entry
     let mut bad = arg.clone();
-    bad.columns[0].entries[0] += F::ONE;
+    bad.columns[0].1[0] += F::ONE;
     let mut vt = Keccak256Transcript::<E>::new(b"bd");
     assert!(verify_open(&params, &root, &point, eval, &bad, &mut vt).is_err());
 
@@ -294,12 +315,9 @@ mod tests {
 
       let fb = 32usize; // bytes per field element / hash
       let rows_b = (arg.w_prox.len() + arg.w_eval.len()) * fb;
-      let col_b: usize = arg
-        .columns
-        .iter()
-        .map(|c| c.entries.len() * fb + c.path.len() * 32)
-        .sum();
-      let kb = (rows_b + col_b) as f64 / 1024.0;
+      let col_b: usize = arg.columns.iter().map(|(_, e)| e.len() * fb).sum();
+      let auth_b = arg.auth.len() * 32;
+      let kb = (rows_b + col_b + auth_b) as f64 / 1024.0;
       println!(
         "n=2^{log_n:<2} open(+commit) {open_ms:7.1}ms  verify {ver_ms:6.2}ms  \
          proof {kb:8.1}KB  (t={} rows={} rowlen={} cols={})",
