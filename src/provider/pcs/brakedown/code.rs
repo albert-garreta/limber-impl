@@ -10,7 +10,6 @@
 //! distance `δ = β/R`; the IOPP opens `num_column_opens(spec, λ)` columns.
 
 use crate::traits::PrimeFieldExt;
-use ff::Field;
 use sha3::{
   Shake256,
   digest::{ExtendableOutput, Update, XofReader},
@@ -311,6 +310,7 @@ impl<F: PrimeFieldExt> BrakedownCode<F> {
 mod tests {
   use super::*;
   use crate::{provider::T256HyraxEngine, traits::Engine};
+  use ff::Field;
 
   type F = <T256HyraxEngine as Engine>::Scalar;
 

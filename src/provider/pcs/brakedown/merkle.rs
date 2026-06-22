@@ -158,16 +158,13 @@ mod tests {
     let leaves: Vec<Hash> = data.iter().map(|d| hash_leaf(d)).collect();
     let tree = MerkleTree::from_leaves(leaves);
     let root = tree.root();
-    for i in 0..n {
+    for (i, di) in data.iter().enumerate() {
       let path = tree.path(i);
-      assert!(
-        verify_path(&root, &data[i], i, &path),
-        "path {i} must verify"
-      );
+      assert!(verify_path(&root, di, i, &path), "path {i} must verify");
       // wrong data rejects
       assert!(!verify_path(&root, b"bogus", i, &path));
       // wrong index rejects
-      assert!(!verify_path(&root, &data[i], (i + 1) % n, &path));
+      assert!(!verify_path(&root, di, (i + 1) % n, &path));
     }
   }
 
