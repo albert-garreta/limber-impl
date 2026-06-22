@@ -115,8 +115,18 @@ Trade-off: higher spec → larger δ → fewer column opens, but larger rate R
   2¹²–2¹⁸.
 - **Proof size**: ~0.43–3.3 MB (after batched Merkle paths; was 1.9–4.9 MB). At
   2¹⁶: 1.72 MB = combined rows ~1 MB + column entries ~0.47 MB + batched auth
-  ~0.23 MB. Dropping `w_prox` (soundness-gated) → ~1.2 MB. Still ~1000× Hyrax's
-  ~KB IPA proof — the inherent code-PCS tradeoff (fast prover, large proof).
+  ~0.23 MB. Still ~1000× Hyrax's ~KB IPA proof — the inherent code-PCS tradeoff
+  (fast prover, large proof).
+
+> **UNVERIFIED CONJECTURE (do not use without analysis or a citation):**
+> dropping the proximity row `w_prox` and reusing the eval combiner `eq(r)` for
+> both proximity and evaluation would cut the proof to ~1.2 MB at 2¹⁶. This was
+> an inference of mine, *not* a sourced technique — the `conroi/lcpc` reference
+> keeps a separate uniform-random proximity row, and the standard Brakedown/
+> Ligero proximity lemma is stated for a uniform combiner, not the tensor-
+> structured `eq(r)` (only `log(n_rows)` degrees of freedom). It is not
+> known-unsound, just not justified. Before adopting, either find/write a
+> proximity bound that holds for the tensor combiner, or discard the idea.
 
 ## Integration findings (Milestone 1 conclusion)
 
