@@ -99,7 +99,43 @@ Trade-off: higher spec → larger δ → fewer column opens, but larger rate R
 
 ## Build order (each tested before the next)
 
-1. encoder + code-distance sanity test ← **current**
-2. Merkle column commit + determinism test
-3. tensor eval/open + verify + roundtrip test
-4. soundness/tamper tests + wire under plain Spartan
+1. encoder + code-distance sanity test — **done**
+2. Merkle column commit + determinism test — **done**
+3. tensor eval/open + verify + roundtrip test — **done** (+ batched Merkle multiproof)
+4. soundness/tamper tests — **done**; wire under plain Spartan — **blocked, see below**
+
+## Measured results (standalone, T256 scalar field)
+
+- **Commit** vs Hyrax MSM (`is_small`): ~3× faster single-thread vs the SNARK's
+  real commit path (~10× vs a from-scratch `Hyrax::commit`); ~4–7× faster
+  multi-thread at 2¹⁴–2¹⁸ after parallelizing the Merkle tree build (loses only
+  at tiny 2¹²). The remaining multi-thread limiter is the `n_rows`-way (4–8) row
+  encode; tree build + leaf + column hashing are fully parallel.
+- **Open / verify**: open ~5–126 ms (incl. re-commit), verify ~8–37 ms across
+  2¹²–2¹⁸.
+- **Proof size**: ~0.43–3.3 MB (after batched Merkle paths; was 1.9–4.9 MB). At
+  2¹⁶: 1.72 MB = combined rows ~1 MB + column entries ~0.47 MB + batched auth
+  ~0.23 MB. Dropping `w_prox` (soundness-gated) → ~1.2 MB. Still ~1000× Hyrax's
+  ~KB IPA proof — the inherent code-PCS tradeoff (fast prover, large proof).
+
+## Integration findings (Milestone 1 conclusion)
+
+- **MLE convention MATCHES Spartan.** `EqPolynomial::evals_from_points`
+  (`src/polys/eq.rs`) iterates `r.iter().rev()` so `r[0]` is the most-significant
+  index bit; our `eq_evals` agrees. A Brakedown opening would line up with
+  Spartan's sumcheck point with no reversal. ✓
+- **Blocker for plain-Spartan integration: the base `PCSEngineTrait` is
+  Pedersen-coupled via `comm_eval`.** `spartan.rs:424–426` commits the
+  evaluation value as `comm_eval_W = G^{eval_W}` and `PCS::prove`/`verify` work
+  against that group commitment. Brakedown reveals the eval directly (checked by
+  the tensor opening) and has no homomorphic `comm_eval`, so it does not fit the
+  trait's `prove(.., comm_eval, blind_eval)` / `verify(.., comm_eval, ..)`
+  surface as written.
+- **Path forward:** make `PCSEngineTrait` eval-agnostic — pass the eval *value*
+  instead of `comm_eval`/`blind_eval`/`ck_eval` — exactly the refactor already
+  applied to `ModPCSEngineTrait` (commit `22a9be8`). After that, Brakedown's
+  `open`/`verify_open` plug in directly. This is a base-trait refactor, separate
+  from (and smaller than) the Mod-PCS homomorphism rewrite.
+
+Status: standalone Brakedown PCS is **complete and benchmarked**. Trait/Spartan
+integration is deferred pending the `PCSEngineTrait` eval-agnostic refactor.
