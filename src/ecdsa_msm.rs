@@ -227,7 +227,7 @@ impl CircuitBuilder {
   }
 
   /// Affine EC doubling `2·P` for `P` at columns `(x,y)` (secp256k1, `a=0`).
-  /// Returns `(x3,y3)` columns and the next free row. 8 rows.
+  /// Returns `(x3,y3)` columns and the next free row. 9 rows.
   fn ec_double(&mut self, mut row: usize, x: usize, y: usize) -> (usize, usize, usize) {
     let cc = self.const_col;
     let xsq = self.mul(row, x, x); // xsq = x²
@@ -237,11 +237,17 @@ impl CircuitBuilder {
     let r3 = self.alloc(r3_val);
     self.push_row(row, &[(xsq, 3)], &[(cc, 1)], &[(r3, 1)]);
     row += 1;
-    // λ = r3 / (2y) ⇒ λ·(2y) ≡ r3 (mod p)
-    let two_y = (BigUint::from(2u32) * &self.w[y]) % &self.p;
-    let lam_val = (&self.w[r3] * mod_inv(&two_y, &self.p)) % &self.p;
+    // two_y = 2y mod p (reduce first, so the slope product stays < p² ⇒ q < p;
+    // a `B=[(y,2)]` row would give λ·2y < 2p² ⇒ q up to 2p ≥ 2^256, exceeding
+    // log_t_f and truncating the quotient commitment).
+    let two_y_val = (BigUint::from(2u32) * &self.w[y]) % &self.p;
+    let two_y = self.alloc(two_y_val);
+    self.push_row(row, &[(y, 2)], &[(cc, 1)], &[(two_y, 1)]);
+    row += 1;
+    // λ = r3 / (2y) ⇒ λ·two_y ≡ r3 (mod p)
+    let lam_val = (&self.w[r3] * mod_inv(&self.w[two_y], &self.p)) % &self.p;
     let lam = self.alloc(lam_val);
-    self.push_row(row, &[(lam, 1)], &[(y, 2)], &[(r3, 1)]);
+    self.push_row(row, &[(lam, 1)], &[(two_y, 1)], &[(r3, 1)]);
     row += 1;
     let t = self.mul(row, lam, lam); // t = λ²
     row += 1;
@@ -387,7 +393,7 @@ mod tests {
     let x = cb.alloc(gx);
     let y = cb.alloc(gy);
     let (x3, y3, n_rows) = cb.ec_double(0, x, y);
-    assert_eq!(n_rows, 8, "affine double should be 8 rows");
+    assert_eq!(n_rows, 9, "affine double should be 9 rows");
     assert_eq!(cb.w[x3], expected.0, "x3 mismatch");
     assert_eq!(cb.w[y3], expected.1, "y3 mismatch");
 
@@ -618,11 +624,25 @@ mod tests {
     use crate::imod_spartan_modp::IntModSpartanModpSNARK;
     use crate::provider::pcs::integer_modpcs::IntEvalParams;
     let p = secp256k1_p();
-    let (gx, gy) = g();
+    let g_pt = g();
+    let acc0 = scalar_mul(&BigUint::from(100u32), &g_pt, &p).unwrap(); // 100G
+    let t = scalar_mul(&BigUint::from(7u32), &g_pt, &p).unwrap(); // 7G
     let mut cb = CircuitBuilder::new(1 << 16, p.clone());
-    let x = cb.alloc(gx);
-    let y = cb.alloc(gy);
-    cb.ec_double(0, x, y); // ec_double has coeff-2/3 rows the add lacks
+    // 7 CHAINED rounds of (double; add T) with safe large-multiple points
+    // (acc grows 100G→207G→…, never collides with 7G) — MSM depth, no correction.
+    let mut ax = cb.alloc(acc0.0);
+    let mut ay = cb.alloc(acc0.1);
+    let mut row = 0;
+    for _ in 0..2 {
+      let (dx, dy, r) = cb.ec_double(row, ax, ay);
+      row = r;
+      let tx = cb.alloc(t.0.clone());
+      let ty = cb.alloc(t.1.clone());
+      let (sx, sy, r) = cb.ec_add(row, dx, dy, tx, ty);
+      row = r;
+      ax = sx;
+      ay = sy;
+    }
     let (shape, w, q) = to_shape(&cb);
     let log_n = (shape.num_vars() as u64).ilog2() as usize;
     let params = IntEvalParams::derive(256, 32, 7, log_n).unwrap();
