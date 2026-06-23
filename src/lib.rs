@@ -40,6 +40,7 @@ pub mod traits;
 // internal modules
 mod big_num;
 mod dyn_prime;
+mod ecdsa_msm; // ECDSA-verify MSM circuit gadgets (secp256k1) for integer Mod-R1CS
 mod polys;
 mod polys_modp;
 mod sumcheck;
