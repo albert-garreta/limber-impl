@@ -565,6 +565,76 @@ mod tests {
     (shape, w, q)
   }
 
+  /// Isolation: a minimal hand-built mod-p shape (one `w0·w1 = w2 + p·q` row)
+  /// through the same SNARK. If this verifies, the harness bug is in `to_shape`.
+  #[test]
+  #[ignore = "diagnostic"]
+  fn snark_minimal_modp() {
+    use crate::imod_r1cs_modp::{IntModR1CSShapeModp, IntModR1CSWitnessModp};
+    use crate::imod_spartan_modp::IntModSpartanModpSNARK;
+    use crate::provider::pcs::integer_modpcs::IntEvalParams;
+    let p = secp256k1_p();
+    let num_vars = 8usize;
+    let num_cons = 4usize;
+    // row 0: w0·w1 = w2 (+ p·0). w0=3, w1=5, w2=15.
+    let w: Vec<BigUint> = vec![
+      BigUint::from(3u32),
+      BigUint::from(5u32),
+      BigUint::from(8u32), // w0+w1 = 8 (const-column diff-style row)
+      BigUint::ZERO,
+      BigUint::ZERO,
+      BigUint::ZERO,
+      BigUint::ZERO,
+      BigUint::ZERO,
+    ];
+    let q = vec![BigUint::ZERO; num_cons];
+    // diff-style row using the CONST column (z[num_vars]=1): (w0+w1)·1 = w2.
+    // w2 set to 8 = 3+5 below via the witness override.
+    let a = vec![
+      (0usize, 0usize, BigUint::from(1u32)),
+      (0usize, 1usize, BigUint::from(1u32)),
+    ];
+    let b = vec![(0usize, num_vars, BigUint::from(1u32))]; // const column
+    let c = vec![(0usize, 2usize, BigUint::from(1u32))];
+    let mut mods = vec![p.clone()];
+    mods.resize(num_cons, BigUint::from(2u32));
+    let shape = IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, a, b, c, mods).unwrap();
+    let params = IntEvalParams::derive(256, 32, 7, 3).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    shape.is_sat(pk.ck(), &instance, &witness).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+    println!("minimal mod-p SNARK: OK");
+  }
+
+  /// Isolation: ONE `ec_add` built via `CircuitBuilder` + `to_shape` → SNARK.
+  /// If this fails (but `snark_minimal_modp` passes), the bug is in `to_shape`.
+  #[test]
+  #[ignore = "diagnostic"]
+  fn snark_one_ec_add() {
+    use crate::imod_r1cs_modp::IntModR1CSWitnessModp;
+    use crate::imod_spartan_modp::IntModSpartanModpSNARK;
+    use crate::provider::pcs::integer_modpcs::IntEvalParams;
+    let p = secp256k1_p();
+    let (gx, gy) = g();
+    let mut cb = CircuitBuilder::new(1 << 16, p.clone());
+    let x = cb.alloc(gx);
+    let y = cb.alloc(gy);
+    cb.ec_double(0, x, y); // ec_double has coeff-2/3 rows the add lacks
+    let (shape, w, q) = to_shape(&cb);
+    let log_n = (shape.num_vars() as u64).ilog2() as usize;
+    let params = IntEvalParams::derive(256, 32, 7, log_n).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    shape.is_sat(pk.ck(), &instance, &witness).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+    println!("one ec_add via to_shape SNARK: OK");
+  }
+
   /// Prover-time benchmark on the plain-Shamir MSM (Hyrax Mod-PCS baseline).
   /// `RAYON_NUM_THREADS=1 cargo test --release --lib -- --ignored --nocapture ecdsa_msm_prove_time`
   #[test]
@@ -575,7 +645,7 @@ mod tests {
     use crate::provider::pcs::integer_modpcs::IntEvalParams;
     use std::time::Instant;
 
-    let cb = build_msm_circuit(32); // diagnostic size; 256 for the real bench
+    let cb = build_msm_circuit(256); // diagnostic size; 256 for the real bench
     let real_rows = cb.mods.len();
     let (shape, w, q) = to_shape(&cb);
     let nv = shape.num_vars();
