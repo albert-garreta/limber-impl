@@ -111,10 +111,17 @@ impl CircuitBuilder {
     col
   }
 
-  /// Push a modular-mult row `(Σa)·(Σb) = (Σc) + p·q` with modulus `p`,
-  /// computing and storing the quotient. Panics (in tests) if `q` would be
-  /// negative — the soundness guard.
-  fn push_row(&mut self, row: usize, a: &[(usize, u32)], b: &[(usize, u32)], c: &[(usize, u32)]) {
+  /// Push a row `(Σa)·(Σb) = (Σc) + m·q` with modulus `m`, computing and
+  /// storing the quotient. `m = 0` is an *exact* integer row (`q = 0`). Panics
+  /// (in tests) if `q` would be negative — the soundness guard.
+  fn push_row_m(
+    &mut self,
+    row: usize,
+    a: &[(usize, u32)],
+    b: &[(usize, u32)],
+    c: &[(usize, u32)],
+    m: BigUint,
+  ) {
     let lc = |terms: &[(usize, u32)], this: &Self| -> BigUint {
       terms
         .iter()
@@ -126,8 +133,14 @@ impl CircuitBuilder {
     let cz = lc(c, self);
     let lhs = &az * &bz;
     assert!(lhs >= cz, "negative quotient at row {row} (unsound wiring)");
-    let (qv, rem) = (&lhs - &cz).div_rem(&self.p);
-    assert!(rem == BigUint::ZERO, "row {row} not satisfied mod p");
+    let qv = if m == BigUint::ZERO {
+      assert!(lhs == cz, "exact row {row} not satisfied over Z");
+      BigUint::ZERO
+    } else {
+      let (qv, rem) = (&lhs - &cz).div_rem(&m);
+      assert!(rem == BigUint::ZERO, "row {row} not satisfied mod m");
+      qv
+    };
     for (col, k) in a {
       self.a.push((row, *col, BigUint::from(*k)));
     }
@@ -137,11 +150,21 @@ impl CircuitBuilder {
     for (col, k) in c {
       self.c.push((row, *col, BigUint::from(*k)));
     }
-    self.mods.push(self.p.clone());
+    self.mods.push(m);
     if row >= self.q.len() {
       self.q.resize(row + 1, BigUint::ZERO);
     }
     self.q[row] = qv;
+  }
+
+  /// Push a modular row with modulus `p` (the EC base field).
+  fn push_row(&mut self, row: usize, a: &[(usize, u32)], b: &[(usize, u32)], c: &[(usize, u32)]) {
+    self.push_row_m(row, a, b, c, self.p.clone());
+  }
+
+  /// Constrain `col` to be boolean: `b·b = b` over ℤ (exact, `m=0`).
+  fn boolean(&mut self, row: usize, col: usize) {
+    self.push_row_m(row, &[(col, 1)], &[(col, 1)], &[(col, 1)], BigUint::ZERO);
   }
 
   /// Difference witness `d = (a − b) mod p` with the row `d + b ≡ a (mod p)`.
@@ -234,6 +257,47 @@ impl CircuitBuilder {
     let y3 = self.diff(row, u, y); // y3 = u − y
     row += 1;
     (x3, y3, row)
+  }
+
+  /// Shamir joint MSM `R = u1·G + u2·Q` for `n`-bit scalars (MSB-first bit
+  /// vectors `b1`,`b2`), given the precomputed table
+  /// `[SEED, SEED+G, SEED+Q, SEED+G+Q]` (indexed `b1 + 2·b2`) and the
+  /// `neg_correction` point `−(2ⁿ−1)·SEED`. The SEED offset keeps the
+  /// accumulator off the point at infinity. Per-round addend is a constant
+  /// point (public bits ⇒ addend selection done off-circuit, matching Zinc+'s
+  /// public `u1,u2`). Returns `(Rx,Ry)` columns and the next free row.
+  ///
+  /// Cost: round 0 = select only; rounds 1..n = double (8) + add (9); plus one
+  /// final add for the correction ⇒ `17·(n−1) + 9` EC rows.
+  fn shamir_msm(
+    &mut self,
+    mut row: usize,
+    b1: &[u8],
+    b2: &[u8],
+    table: &[(BigUint, BigUint); 4],
+    neg_correction: &(BigUint, BigUint),
+  ) -> (usize, usize, usize) {
+    let n = b1.len();
+    let idx0 = (b1[0] + 2 * b2[0]) as usize;
+    let mut ax = self.alloc(table[idx0].0.clone());
+    let mut ay = self.alloc(table[idx0].1.clone());
+    for i in 1..n {
+      let (dx, dy, r) = self.ec_double(row, ax, ay); // acc ← 2·acc
+      row = r;
+      let idx = (b1[i] + 2 * b2[i]) as usize;
+      let tx = self.alloc(table[idx].0.clone());
+      let ty = self.alloc(table[idx].1.clone());
+      let (sx, sy, r) = self.ec_add(row, dx, dy, tx, ty); // acc ← acc + T_i
+      row = r;
+      ax = sx;
+      ay = sy;
+    }
+    // R = acc − (2ⁿ−1)·SEED.
+    let cx = self.alloc(neg_correction.0.clone());
+    let cy = self.alloc(neg_correction.1.clone());
+    let (rx, ry, r) = self.ec_add(row, ax, ay, cx, cy);
+    row = r;
+    (rx, ry, row)
   }
 }
 
@@ -345,5 +409,141 @@ mod tests {
 
     // Sanity: 2G via the gadget equals 2G via direct doubling (g2()).
     assert_eq!((cb.w[x3].clone(), cb.w[y3].clone()), g2());
+  }
+
+  /// Generic point add over secp256k1 (handles identity/doubling). `None` = O.
+  fn pt_add(
+    a: &Option<(BigUint, BigUint)>,
+    b: &Option<(BigUint, BigUint)>,
+    p: &BigUint,
+  ) -> Option<(BigUint, BigUint)> {
+    match (a, b) {
+      (None, _) => b.clone(),
+      (_, None) => a.clone(),
+      (Some(a), Some(b)) => {
+        if a.0 == b.0 {
+          if (&a.1 + &b.1) % p == BigUint::ZERO {
+            None // a = −b
+          } else {
+            Some(ref_ec_double(&a.0, &a.1, p)) // a = b
+          }
+        } else {
+          Some(ref_ec_add(&a.0, &a.1, &b.0, &b.1, p))
+        }
+      }
+    }
+  }
+
+  /// Reference scalar multiplication `k·P` (double-and-add). `None` = O.
+  fn scalar_mul(k: &BigUint, pt: &(BigUint, BigUint), p: &BigUint) -> Option<(BigUint, BigUint)> {
+    let mut acc: Option<(BigUint, BigUint)> = None;
+    for i in (0..k.bits()).rev() {
+      acc = acc.map(|a| ref_ec_double(&a.0, &a.1, p));
+      if (k >> i) & BigUint::from(1u32) == BigUint::from(1u32) {
+        acc = pt_add(&acc, &Some(pt.clone()), p);
+      }
+    }
+    acc
+  }
+
+  /// MSB-first `n`-bit decomposition of `k`.
+  fn bits_msb(k: &BigUint, n: usize) -> Vec<u8> {
+    (0..n)
+      .rev()
+      .map(|i| ((k >> i) & BigUint::from(1u32) == BigUint::from(1u32)) as u8)
+      .collect()
+  }
+
+  /// Table `[SEED, SEED+G, SEED+Q, SEED+G+Q]` and `−(2ⁿ−1)·SEED`.
+  fn msm_setup(
+    g: &(BigUint, BigUint),
+    q: &(BigUint, BigUint),
+    seed: &(BigUint, BigUint),
+    n: usize,
+    p: &BigUint,
+  ) -> ([(BigUint, BigUint); 4], (BigUint, BigUint)) {
+    let unwrap = |o: Option<(BigUint, BigUint)>| o.unwrap();
+    let p00 = seed.clone();
+    let p10 = unwrap(pt_add(&Some(seed.clone()), &Some(g.clone()), p));
+    let p01 = unwrap(pt_add(&Some(seed.clone()), &Some(q.clone()), p));
+    let gq = unwrap(pt_add(&Some(g.clone()), &Some(q.clone()), p));
+    let p11 = unwrap(pt_add(&Some(seed.clone()), &Some(gq), p));
+    let mult = (BigUint::from(1u32) << n) - BigUint::from(1u32);
+    let corr = scalar_mul(&mult, seed, p).unwrap();
+    let neg = (corr.0.clone(), (p - &corr.1) % p);
+    ([p00, p10, p01, p11], neg)
+  }
+
+  /// O(entries+rows) self-check of `A·z ∘ B·z = C·z + m∘q`.
+  fn assert_relation(cb: &CircuitBuilder) {
+    let nrows = cb.mods.len();
+    let acc = |entries: &[Triple]| -> Vec<BigUint> {
+      let mut v = vec![BigUint::ZERO; nrows];
+      for (r, col, k) in entries {
+        v[*r] += k * &cb.w[*col];
+      }
+      v
+    };
+    let (az, bz, cz) = (acc(&cb.a), acc(&cb.b), acc(&cb.c));
+    for row in 0..nrows {
+      assert_eq!(
+        &az[row] * &bz[row],
+        &cz[row] + &cb.mods[row] * &cb.q[row],
+        "row {row} unsatisfied"
+      );
+    }
+  }
+
+  #[test]
+  fn shamir_msm_8bit_correct_and_satisfied() {
+    let p = secp256k1_p();
+    let g_pt = g();
+    let q_pt = scalar_mul(&BigUint::from(7u32), &g_pt, &p).unwrap(); // Q = 7G
+    let seed = scalar_mul(&BigUint::from(11u32), &g_pt, &p).unwrap(); // SEED = 11G
+    let n = 8;
+    let u1 = BigUint::from(181u32);
+    let u2 = BigUint::from(108u32);
+    let (table, neg) = msm_setup(&g_pt, &q_pt, &seed, n, &p);
+    let expected = pt_add(&scalar_mul(&u1, &g_pt, &p), &scalar_mul(&u2, &q_pt, &p), &p).unwrap();
+
+    let mut cb = CircuitBuilder::new(1 << 12, p.clone());
+    let (rx, ry, _) = cb.shamir_msm(0, &bits_msb(&u1, n), &bits_msb(&u2, n), &table, &neg);
+    assert_eq!(cb.w[rx], expected.0, "Rx mismatch");
+    assert_eq!(cb.w[ry], expected.1, "Ry mismatch");
+    assert_relation(&cb);
+  }
+
+  #[test]
+  fn shamir_msm_256bit_row_count() {
+    let p = secp256k1_p();
+    let g_pt = g();
+    let q_pt = scalar_mul(&BigUint::from(7u32), &g_pt, &p).unwrap();
+    let seed = scalar_mul(&BigUint::from(11u32), &g_pt, &p).unwrap();
+    let n = 256;
+    let u1 = BigUint::parse_bytes(
+      b"A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90",
+      16,
+    )
+    .unwrap();
+    let u2 = BigUint::parse_bytes(
+      b"0123456789ABCDEFFEDCBA98765432100123456789ABCDEFFEDCBA9876543210",
+      16,
+    )
+    .unwrap();
+    let (table, neg) = msm_setup(&g_pt, &q_pt, &seed, n, &p);
+    let expected = pt_add(&scalar_mul(&u1, &g_pt, &p), &scalar_mul(&u2, &q_pt, &p), &p).unwrap();
+
+    let mut cb = CircuitBuilder::new(1 << 16, p.clone());
+    let (rx, ry, _) = cb.shamir_msm(0, &bits_msb(&u1, n), &bits_msb(&u2, n), &table, &neg);
+    assert_eq!(cb.w[rx], expected.0);
+    assert_eq!(cb.w[ry], expected.1);
+    assert_relation(&cb);
+
+    let num_cons = cb.mods.len();
+    println!(
+      "\nECDSA 2-scalar MSM (256-bit secp256k1, affine, public addends): \
+       {num_cons} constraint rows → pad to {}",
+      num_cons.next_power_of_two()
+    );
   }
 }
