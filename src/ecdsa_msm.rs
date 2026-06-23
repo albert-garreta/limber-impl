@@ -48,6 +48,21 @@ fn ref_ec_add(
   (x3, y3)
 }
 
+/// Reference affine EC doubling over secp256k1 (`a = 0`) for a non-identity,
+/// non-2-torsion point `2·P`. Returns `(x3, y3)`.
+fn ref_ec_double(x: &BigUint, y: &BigUint, p: &BigUint) -> (BigUint, BigUint) {
+  let xsq = (x * x) % p;
+  let r3 = (BigUint::from(3u32) * &xsq) % p;
+  let two_y = (BigUint::from(2u32) * y) % p;
+  let lam = (&r3 * mod_inv(&two_y, p)) % p;
+  let t = (&lam * &lam) % p;
+  let x3 = (&t + p + p - x - x) % p;
+  let dx3 = (x + p - &x3) % p;
+  let u = (&lam * &dx3) % p;
+  let y3 = (&u + p - y) % p;
+  (x3, y3)
+}
+
 /// A single (row, col, coeff) triple for one of the A/B/C matrices.
 type Triple = (usize, usize, BigUint);
 
@@ -187,6 +202,39 @@ impl CircuitBuilder {
     row += 1;
     (x3, y3, row)
   }
+
+  /// Affine EC doubling `2·P` for `P` at columns `(x,y)` (secp256k1, `a=0`).
+  /// Returns `(x3,y3)` columns and the next free row. 8 rows.
+  fn ec_double(&mut self, mut row: usize, x: usize, y: usize) -> (usize, usize, usize) {
+    let cc = self.const_col;
+    let xsq = self.mul(row, x, x); // xsq = x²
+    row += 1;
+    // r3 = 3·xsq mod p ; row: 3·xsq ≡ r3 (mod p)
+    let r3_val = (BigUint::from(3u32) * &self.w[xsq]) % &self.p;
+    let r3 = self.alloc(r3_val);
+    self.push_row(row, &[(xsq, 3)], &[(cc, 1)], &[(r3, 1)]);
+    row += 1;
+    // λ = r3 / (2y) ⇒ λ·(2y) ≡ r3 (mod p)
+    let two_y = (BigUint::from(2u32) * &self.w[y]) % &self.p;
+    let lam_val = (&self.w[r3] * mod_inv(&two_y, &self.p)) % &self.p;
+    let lam = self.alloc(lam_val);
+    self.push_row(row, &[(lam, 1)], &[(y, 2)], &[(r3, 1)]);
+    row += 1;
+    let t = self.mul(row, lam, lam); // t = λ²
+    row += 1;
+    // x3 = t − 2x ; row: (x3 + 2x) ≡ t (mod p)
+    let x3_val = (&self.w[t] + &self.p + &self.p - &self.w[x] - &self.w[x]) % &self.p;
+    let x3 = self.alloc(x3_val);
+    self.push_row(row, &[(x3, 1), (x, 2)], &[(cc, 1)], &[(t, 1)]);
+    row += 1;
+    let dx3 = self.diff(row, x, x3); // dx3 = x − x3
+    row += 1;
+    let u = self.mul(row, lam, dx3); // u = λ·(x − x3)
+    row += 1;
+    let y3 = self.diff(row, u, y); // y3 = u − y
+    row += 1;
+    (x3, y3, row)
+  }
 }
 
 #[cfg(test)]
@@ -262,5 +310,40 @@ mod tests {
         "row {row} unsatisfied"
       );
     }
+  }
+
+  #[test]
+  fn ec_double_gadget_is_satisfied_and_correct() {
+    let p = secp256k1_p();
+    let (gx, gy) = g();
+    let expected = ref_ec_double(&gx, &gy, &p); // 2G
+
+    let const_col = 64usize;
+    let mut cb = CircuitBuilder::new(const_col, p.clone());
+    let x = cb.alloc(gx);
+    let y = cb.alloc(gy);
+    let (x3, y3, n_rows) = cb.ec_double(0, x, y);
+    assert_eq!(n_rows, 8, "affine double should be 8 rows");
+    assert_eq!(cb.w[x3], expected.0, "x3 mismatch");
+    assert_eq!(cb.w[y3], expected.1, "y3 mismatch");
+
+    let z = &cb.w;
+    for row in 0..cb.mods.len() {
+      let lc = |entries: &[Triple]| -> BigUint {
+        entries
+          .iter()
+          .filter(|(r, _, _)| *r == row)
+          .map(|(_, col, k)| k * &z[*col])
+          .sum()
+      };
+      assert_eq!(
+        lc(&cb.a) * lc(&cb.b),
+        lc(&cb.c) + &cb.mods[row] * &cb.q[row],
+        "row {row} unsatisfied"
+      );
+    }
+
+    // Sanity: 2G via the gadget equals 2G via direct doubling (g2()).
+    assert_eq!((cb.w[x3].clone(), cb.w[y3].clone()), g2());
   }
 }
