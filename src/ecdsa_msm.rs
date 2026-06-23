@@ -513,6 +513,94 @@ mod tests {
     assert_relation(&cb);
   }
 
+  /// Build the `n`-bit 2-scalar MSM circuit used by the benchmarks.
+  fn build_msm_circuit(n: usize) -> CircuitBuilder {
+    let p = secp256k1_p();
+    let g_pt = g();
+    let q_pt = scalar_mul(&BigUint::from(7u32), &g_pt, &p).unwrap();
+    let seed = scalar_mul(&BigUint::from(11u32), &g_pt, &p).unwrap();
+    let u1 = BigUint::parse_bytes(
+      b"A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90",
+      16,
+    )
+    .unwrap();
+    let u2 = BigUint::parse_bytes(
+      b"0123456789ABCDEFFEDCBA98765432100123456789ABCDEFFEDCBA9876543210",
+      16,
+    )
+    .unwrap();
+    let (table, neg) = msm_setup(&g_pt, &q_pt, &seed, n, &p);
+    let mut cb = CircuitBuilder::new(1 << 16, p);
+    cb.shamir_msm(0, &bits_msb(&u1, n), &bits_msb(&u2, n), &table, &neg);
+    cb
+  }
+
+  type ME = crate::provider::T256DynPrimeEngine;
+
+  /// Convert a built circuit into an `IntModR1CSShapeModp` + witness `(w, q)`,
+  /// remapping the constant column to `num_vars` and padding to powers of two.
+  fn to_shape(
+    cb: &CircuitBuilder,
+  ) -> (
+    crate::imod_r1cs_modp::IntModR1CSShapeModp<ME>,
+    Vec<BigUint>,
+    Vec<BigUint>,
+  ) {
+    let num_vars = cb.next_col.next_power_of_two();
+    let num_cons = cb.mods.len().next_power_of_two();
+    let cc = cb.const_col;
+    let rm = |c: usize| if c == cc { num_vars } else { c };
+    let map =
+      |e: &[Triple]| -> Vec<Triple> { e.iter().map(|(r, c, v)| (*r, rm(*c), v.clone())).collect() };
+    let (a, b, c) = (map(&cb.a), map(&cb.b), map(&cb.c));
+    let mut w = cb.w[..cb.next_col].to_vec();
+    w.resize(num_vars, BigUint::ZERO);
+    let mut q = cb.q.clone();
+    q.resize(num_cons, BigUint::ZERO);
+    let mut mods = cb.mods.clone();
+    mods.resize(num_cons, BigUint::from(2u32)); // pad rows: m=2, empty LCs ⇒ 0=0
+    let shape =
+      crate::imod_r1cs_modp::IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, a, b, c, mods)
+        .unwrap();
+    (shape, w, q)
+  }
+
+  /// Prover-time benchmark on the plain-Shamir MSM (Hyrax Mod-PCS baseline).
+  /// `RAYON_NUM_THREADS=1 cargo test --release --lib -- --ignored --nocapture ecdsa_msm_prove_time`
+  #[test]
+  #[ignore = "benchmark; run with --release --ignored --nocapture"]
+  fn ecdsa_msm_prove_time() {
+    use crate::imod_r1cs_modp::IntModR1CSWitnessModp;
+    use crate::imod_spartan_modp::IntModSpartanModpSNARK;
+    use crate::provider::pcs::integer_modpcs::IntEvalParams;
+    use std::time::Instant;
+
+    let cb = build_msm_circuit(32); // diagnostic size; 256 for the real bench
+    let real_rows = cb.mods.len();
+    let (shape, w, q) = to_shape(&cb);
+    let nv = shape.num_vars();
+    let log_n = (nv.max(real_rows.next_power_of_two()) as u64).ilog2() as usize;
+    let params = IntEvalParams::derive(256, 32, 7, log_n).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    shape.is_sat(pk.ck(), &instance, &witness).unwrap();
+
+    let t0 = Instant::now();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = Instant::now();
+    proof.verify(&vk, &instance).unwrap();
+    let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+    println!(
+      "\nECDSA 2-scalar MSM (secp256k1, affine Shamir, {real_rows} rows → 2^{}): \
+       prove {prove_ms:.1} ms, verify {verify_ms:.2} ms (threads={})",
+      (nv.max(real_rows.next_power_of_two()) as u64).ilog2(),
+      rayon::current_num_threads()
+    );
+  }
+
   #[test]
   fn shamir_msm_256bit_row_count() {
     let p = secp256k1_p();
