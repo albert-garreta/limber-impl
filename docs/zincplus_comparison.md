@@ -162,11 +162,11 @@ preprocessing/SPARK version) but does not affect the verify-time win.
 
 A measured (size × k × log_t) sweep found `log_t = 64, k = 9` optimal at every
 size and bit-width (see `imod_followups.md`, "IntEvalParams (k, T) retune").
-New single-thread numbers with the retuned defaults:
+New single-thread numbers with the re-tuned defaults:
 
 | | prove | verify | proof |
 |---|---|---|---|
-| Ours (multiswap 2¹³, retuned) | **3.11 s** | **42.5 ms** | ~KB |
+| Ours (multiswap 2¹³, re-tuned) | **3.11 s** | **42.5 ms** | ~KB |
 | Zinc+ (MulModN 2¹³) | 1.10 s | 483 ms | 1.21 MB |
 | ratio | ~2.8× them | **~11× us** | ~1000× us |
 
