@@ -7,7 +7,7 @@
     width=0.95\linewidth, height=5.2cm,
     ymode=log,
     xtick={10,12,14}, xticklabels={$2^{10}$,$2^{12}$,$2^{14}$},
-    ytick={5,10,20,50}, log ticks with fixed point,
+    ytick={20,50}, log ticks with fixed point,
     xlabel={Constraints}, ylabel={Verifier time (ms)},
     grid=both, grid style={gray!20},
     % legend above the axes so it never occludes either series
@@ -17,13 +17,13 @@
     error bars/y dir=both, error bars/y explicit,
   ]
     \addplot[ourscolor, thick, mark=*, mark size=1.8pt]
-      coordinates {(10,23.194) +- (0.084,0.203) (12,38.660) +- (0.254,0.165) (14,53.083) +- (0.145,0.266)};
+      coordinates {(10,34.984) +- (0.063,0.192) (12,38.787) +- (0.282,0.451) (14,35.628) +- (0.437,0.163)};
     \addlegendentry{IntMod-Spartan}
     \addplot[basecolor, thick, mark=square*, mark size=1.8pt]
-      coordinates {(10,5.961) +- (0.128,0.238) (12,6.635) +- (0.078,0.096) (14,7.687) +- (0.014,0.045)};
+      coordinates {(10,14.534) +- (0.118,0.353) (12,15.121) +- (0.136,0.149) (14,16.396) +- (0.038,0.061)};
     \addlegendentry{Spartan (native baseline)}
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:10,23.194) {3.9$\times$};
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:12,38.660) {5.8$\times$};
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:14,53.083) {6.9$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:10,34.984) {2.4$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:12,38.787) {2.6$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:14,35.628) {2.2$\times$};
   \end{axis}
 \end{tikzpicture}
