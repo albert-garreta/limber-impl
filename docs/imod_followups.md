@@ -758,3 +758,26 @@ regions include witness gen + commit):
   from today's (18.8/45.1/94.6) — toolchain/bench-region drift — so ratios are
   only comparable within one snapshot. `docs/plots/*` (msshape figures) still
   predate the re-tune and need regeneration from this data before resubmission.
+
+## T (limb/norm bound) coverage — complete grid (2026-07-14)
+
+Closing the "is T=2^64 optimal everywhere?" question with measurements at
+every cell (single-threaded, KSWEEP harnesses, best k per cell):
+
+| config | T=2^16 | T=2^32 | **T=2^64** | T=2^128 |
+|---|---|---|---|---|
+| msshape 2^11–2^14 (256-bit) | dominated | dominated | **best (k=9)** | — |
+| msshape 2^13 (256-bit) | 564 | 608 | **555 (k=9)** | 557 (k=6, tie) |
+| msshape 2^15 (256-bit) | — | 2159 | **1964 (k=9)** | 2016 (k=6) |
+| MultiSwap 2^13 (2048-bit) | 3540 | 3437 | **3053 (k=9/11)** | 3240 (k=7) |
+
+**T=2^64 is optimal or tied at every measured cell.** Notes:
+- T=2^128 at 256-bit is a near-tie (k≈6): halving numlimb again nearly pays
+  for losing the `is_small` u64 fast-path MSM (limbs > 64 bits use the
+  full-width path). At 2048-bit it clearly loses (+6%) — the wider witness
+  makes the slow-path commit costlier. No reason to prefer it anywhere.
+- T=2^64 is also the natural boundary: the max width whose limbs fill u64
+  exactly and legitimately claim `is_small=true` (see the gate at
+  `integer_modpcs.rs` f_limb commit and the >64-bit truncation regression
+  test).
+- At T=2^128 the optimal k drops to ~6–7 (s explodes beyond: k=9 → s≈93–98).
