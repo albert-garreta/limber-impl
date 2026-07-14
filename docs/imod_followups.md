@@ -734,3 +734,27 @@ in `benches/multiswap_modp.rs`), single-threaded, every config verified:
   437 ms; multiswap 3.54 vs 3.44 s; both lose to T=64's 386 ms / 3.11 s). Don't
   redo. (If CHUNK_BITS ever grows to 32/64, revisit — reuse at T=64 would not
   double limbs.)
+
+## Regenerated fig:nativeoverhead data — post-re-tune (2026-07-14)
+
+Same-day, same-toolchain (rustc 1.97), single-threaded criterion pairs
+(`imod_spartan_modp -- msshape` vs `spartan_synthetic -- msshape`; both prove
+regions include witness gen + commit):
+
+| cons | imod prove (T=2^64, k=9) | native prove | overhead | imod verify | native verify |
+|---|---|---|---|---|---|
+| 2^10 | 204 ms  | 18.8 ms | **10.8×** | 34.9 ms | 14.5 ms |
+| 2^12 | 565 ms  | 45.1 ms | **12.5×** | 39.2 ms | 15.1 ms |
+| 2^14 | 1.99 s  | 94.6 ms | **21.1×** | 35.6 ms | 16.4 ms |
+
+- Down from ~23–35× pre-re-tune; paper (`e9e9be5`) claimed ~9× — we are within
+  ~1.2–1.4× of that at 2^10/2^12; the 2^14 point remains ~2.3× off.
+- **k=9 confirmed optimal at 2^15 vars too** (sweep: k=9 1968 ms < k=8 2051 <
+  k=10 2010) — the 2^14 gap is NOT parameter mistuning but genuine
+  super-linear scaling of the range-check/opens machinery vs the baseline;
+  that residual is the remaining e9e9be5 delta and/or the Brakedown lever.
+- Verify overhead is now only **~2.2–2.4×** (imod verify ~flat 35–39 ms).
+- Caveat vs the paper table: the paper's baseline (17.6/26.8/42.7 ms) differs
+  from today's (18.8/45.1/94.6) — toolchain/bench-region drift — so ratios are
+  only comparable within one snapshot. `docs/plots/*` (msshape figures) still
+  predate the re-tune and need regeneration from this data before resubmission.
