@@ -1115,9 +1115,12 @@ pub struct IntegerModPCS {
 ///
 /// Default polynomial norm bound used by trait `setup` (`log_2(T_f)`).
 pub const DEFAULT_LOG_T_F: usize = 32;
-/// Default per-iteration variable count used by trait `setup`. Matches
-/// the paper's recommended `k = ⌈log λ⌉`.
-pub const DEFAULT_K: usize = 7;
+/// Default per-iteration variable count used by trait `setup`. The paper
+/// recommends `k = ⌈log λ⌉ = 7`, but a measured (size × k × log_t) sweep on
+/// the msshape family (vars 2^11–2^14, 256-bit) and MultiSwap (2^13,
+/// 2048-bit) found `k = 9` (with `log_t = 64`) fastest at every size, with a
+/// flat basin k=8–10 (2026-07; see docs/imod_followups.md).
+pub const DEFAULT_K: usize = 9;
 
 impl IntegerModPCS {
   /// Explicit-params setup. Validates the params against `num_vars =

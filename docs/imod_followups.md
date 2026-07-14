@@ -4,6 +4,68 @@ Running list of optimizations, hygiene items, and tests we've identified but
 not yet implemented. Each entry links to its phase of origin and an estimated
 size; promote into a phase plan when picked up.
 
+## Zinc+ comparison & performance recovery (2026-06-24)
+
+Full head-to-head in [zincplus_comparison.md](zincplus_comparison.md) (measured
+single-thread numbers, mechanism, caveats). Key takeaways for follow-up:
+
+- **~2× prover regression vs `e9e9be5` — NOT recoverable from a branch
+  (checked 2026-06-24).** `main` prove-proper is ~3.6 s on multiswap-2¹³; the
+  collaborator's out-of-repo `e9e9be5` (paper figures) was ~2× faster. The 2×
+  was a real prior measurement (gen/commit ruled out), but the faster code is
+  **not in the repo**: `e9e9be5` is a dangling local-only commit (not an object
+  here, not on origin). Checked all candidate branches — `msm_opt` is a year-old
+  MSM tweak (behind 158); `improv2`'s perf commits (`z_buffer`/`matvec` caches,
+  `Parallelize NIFS`, digest streaming) are **already in main**. So there is no
+  unmerged "faster" branch. Recovery requires the collaborator to push
+  `e9e9be5` (`git push origin e9e9be5:refs/heads/recover` from their local repo)
+  or recall the change — otherwise drop the chase and optimize `main` directly
+  (commit MSMs ~50%, the GKR).
+- **Commits (Pedersen MSMs) are the Brakedown lever — NOT the range check.**
+  The range check is ~48% of prove, but its cost splits into a *commit* part
+  (`rc_chunk_commit` Pedersen MSM, 1.33 s) and the *GKR* part (`rc_logup_gkr`,
+  655 ms). Mod-PCS-over-Brakedown replaces the Pedersen-MSM commits
+  (`wq_commit` ~855 ms + `rc_chunk_commit` ~1.33 s) with hash-based commits →
+  projects prove toward ~2.5–2.9 s (~1.5×). **The range check itself stays** —
+  it is load-bearing for soundness (proves committed integers are bounded;
+  without it the mod-random-prime reduction is unsound). Brakedown only speeds
+  its *commitment* step, not the GKR/bound logic. Same rewrite as
+  `brakedown_design.md`.
+- **Don't chase Zinc+ on ECDSA.** They specialize to native q=p (no range
+  checks) → 23×. Point "we win" at native-emulation (arkworks/xJsnark, the
+  ~10M→8k collapse); frame Zinc+ as concurrent complementary design (their fast
+  prover vs our ~7× verify + ~1000× proof-size wins).
+
+## Multi-threading: the GKR is the scaling bottleneck (2026-06-24, deferred)
+
+Measured MT prover speedups (this machine, ~14 cores): **multiswap 2¹³/2048-bit
+scales 3.2×** (4.35 s → 1.36 s) but **ECDSA 2¹³/256-bit only ~1.2×** (548 ms →
+452 ms). The difference is *what dominates*: MT works great when the prover is
+**MSM-bound** (MSM commits parallelize 7–10×: `rc_chunk_commit` 1330→137 ms,
+`wq_commit` 855→~125 ms) and stalls when it's **GKR-bound**. Small-field circuits
+(ECDSA, 256-bit) have small MSM work, so the GKR + serial overheads dominate.
+
+The laggard is **`rc_logup_gkr` (the LogUp-GKR range check): ~1.45× MT** (655→450
+ms), capping prove-proper at 2.9×. The round-polynomial *is* already parallel
+(`logup_gkr.rs` `into_par_iter` ~line 337, above `PAR_THRESHOLD`), so it is **not**
+a missing `par_iter` (a `par_iter` on the table-build at 797/805 was a wash —
+reverted). The limit is **structural**: the range check proves *many* independent
+fraction-trees (`chunk_vals_all` + `top_vals_all`, one per chunk batch), and the
+loop at `logup_gkr.rs:795` runs them **strictly serially** because each
+`gkr_prove` threads the shared Fiat–Shamir transcript — N sequential GKRs, each
+only ~1.45× internally.
+
+**Deferred fix — batch the per-witness GKRs into one combined sumcheck.** Build
+all witness trees' levels in parallel (`par_iter` over witnesses — pure
+computation, no transcript), absorb all roots, then run **one** combined
+layer-sumcheck over all witnesses via a random-linear-combination of their
+per-layer claims (standard batched-GKR). Gives one set of sequential layers with
+**N× parallel width** and removes the serial witness loop → lifts ECDSA toward
+~3× and pushes multiswap past 3.2×. Soundness-sensitive: the batched sumcheck +
+FS reorder + re-verifying range-check soundness and the `logup_gkr` tests.
+**Focusing on single-thread for now** — this is the multi-thread lever when we
+return to it.
+
 ## Phase 1 follow-ups (identified during 2026-05-26 audit)
 
 ### Performance
@@ -643,3 +705,32 @@ Things to watch for:
 Sanity check before locking in the step-2 method signatures: look at
 Plonky2, RISC0, and Binius's PCS trait conventions and verify our shape
 doesn't accidentally exclude them.
+
+## IntEvalParams (k, T) retune — measured sweep (2026-07-13)
+
+Full (size × k × log_t) sweep on msshape (vars 2^11–2^14, 256-bit; KSWEEP=1
+harness in `benches/imod_spartan_modp.rs`) + MultiSwap 2^13 (2048-bit; KSWEEP=1
+in `benches/multiswap_modp.rs`), single-threaded, every config verified:
+
+- **T = 2^64 (log_t=64) is fastest at every size and both bit-widths** —
+  halving numlimb beats the larger `s`. T=2^16 and T=2^32 are dominated.
+- **Under T=2^64 the optimal k ≈ 9 at every size** (flat basin k=8–10, ±2%).
+  No per-size k table needed. The apparent size-drift of the optimum seen
+  earlier was a T=2^32 phenomenon (and the old 2^12 datapoint predated the
+  LogUp-GKR merge). Optimum is insensitive to bit-width (256 vs 2048 agree) —
+  `derive`'s (log_p, s) depends on n only logarithmically.
+- **Defaults changed: `DEFAULT_K = 9`, bench `LOG_T/MSSHAPE_LOG_T = 64`,
+  ECDSA derive → (256, 64, 9, ·).** New single-thread headlines:
+  ECDSA MSM 2^13: prove **386 ms** / verify **24 ms** (was 545/43, −29%/−44%);
+  MultiSwap 2^13: prove **3.11 s** / verify **42.5 ms** (was 4.35 s/71 ms,
+  −29%/−40%). vs Zinc+ MulModN (1.10 s): prove gap now ~2.8×, verify win ~11×.
+- This is very plausibly (a chunk of) e9e9be5's "per-input-length IntEvalParams
+  optimization" — recovered by measurement, no protocol change, soundness
+  unchanged (`derive` validates every config; k=14+/T=64 correctly rejected).
+- **T=2^16 witness-commit reuse: implemented, measured, REVERTED.** Reusing the
+  witness commitment as the range-check chunk commitment (valid when
+  log_t == CHUNK_BITS = 16) is correct but dominated: T=16 doubles numlimb and
+  the extra limb bulk outweighs the saved chunk-commit MSM (ECDSA wash 434 vs
+  437 ms; multiswap 3.54 vs 3.44 s; both lose to T=64's 386 ms / 3.11 s). Don't
+  redo. (If CHUNK_BITS ever grows to 32/64, revisit — reuse at T=64 would not
+  double limbs.)

@@ -605,7 +605,7 @@ mod tests {
     let mut mods = vec![p.clone()];
     mods.resize(num_cons, BigUint::from(2u32));
     let shape = IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, a, b, c, mods).unwrap();
-    let params = IntEvalParams::derive(256, 32, 7, 3).unwrap();
+    let params = IntEvalParams::derive(256, 64, 7, 3).unwrap();
     let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
     let (witness, instance) =
       IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
@@ -645,7 +645,7 @@ mod tests {
     }
     let (shape, w, q) = to_shape(&cb);
     let log_n = (shape.num_vars() as u64).ilog2() as usize;
-    let params = IntEvalParams::derive(256, 32, 7, log_n).unwrap();
+    let params = IntEvalParams::derive(256, 64, 9, log_n).unwrap();
     let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
     let (witness, instance) =
       IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
@@ -670,25 +670,29 @@ mod tests {
     let (shape, w, q) = to_shape(&cb);
     let nv = shape.num_vars();
     let log_n = (nv.max(real_rows.next_power_of_two()) as u64).ilog2() as usize;
-    let params = IntEvalParams::derive(256, 32, 7, log_n).unwrap();
-    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
-    let (witness, instance) =
-      IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
-    shape.is_sat(pk.ck(), &instance, &witness).unwrap();
-
-    let t0 = Instant::now();
-    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
-    let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
-    let t1 = Instant::now();
-    proof.verify(&vk, &instance).unwrap();
-    let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
-
     println!(
-      "\nECDSA 2-scalar MSM (secp256k1, affine Shamir, {real_rows} rows → 2^{}): \
-       prove {prove_ms:.1} ms, verify {verify_ms:.2} ms (threads={})",
+      "\nECDSA 2-scalar MSM (secp256k1, affine Shamir, {real_rows} rows → 2^{}, threads={}):",
       (nv.max(real_rows.next_power_of_two()) as u64).ilog2(),
       rayon::current_num_threads()
     );
+    for k in [7usize, 8, 9, 10, 11, 12] {
+      let params = IntEvalParams::derive(256, 64, k, log_n).unwrap();
+      let (sval, lpval, nl) = (params.s, params.log_p, params.numlimb);
+      let (pk, vk) =
+        IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+      let (witness, instance) =
+        IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+      let t0 = Instant::now();
+      let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+      let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+      let t1 = Instant::now();
+      proof.verify(&vk, &instance).unwrap();
+      let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
+      println!(
+        "  k={k:<2} (s={sval}, log_p={lpval}, numlimb={nl}): \
+         prove {prove_ms:7.1} ms, verify {verify_ms:.1} ms"
+      );
+    }
   }
 
   #[test]

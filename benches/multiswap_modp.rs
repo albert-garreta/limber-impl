@@ -53,7 +53,7 @@ use tracing_subscriber::EnvFilter;
 type M = T256DynPrimeEngine;
 
 /// Limb bound (bits) for the IntEval range checks.
-const LOG_T: usize = 32;
+const LOG_T: usize = 64;
 
 /// Base-hash model: imod rows charged per `H` invocation.
 const H_ROWS: usize = 8;
@@ -415,6 +415,32 @@ fn paper_fp_constraints(k: usize) -> u64 {
 
 fn multiswap_modp_benches(c: &mut Criterion) {
   let ks: &[usize] = &[0];
+
+  // KSWEEP=1: time (commit + prove) per k at the current LOG_T, verify each
+  // (soundness gate), print, and return (skip criterion). Used to re-find the
+  // optimal k after a LOG_T change.
+  if std::env::var_os("KSWEEP").is_some() {
+    use std::time::Instant;
+    let dims = Dims::multiswap(0);
+    let (shape, w, q) = multiswap_shape_and_witness(dims);
+    println!(
+      "\nMultiSwap k-sweep (LOG_T={LOG_T}, 2^{} rows):",
+      (shape.num_cons() as u64).ilog2(),
+    );
+    for k in [9usize, 10, 11, 12, 13] {
+      let params = params_for(&shape, k);
+      let (sval, lpval, nl) = (params.s, params.log_p, params.numlimb);
+      let (pk, vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
+      let t0 = Instant::now();
+      let (witness, instance) =
+        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+      let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+      let ms = t0.elapsed().as_secs_f64() * 1e3;
+      proof.verify(&vk, &instance).unwrap();
+      println!("  k={k:<2} (s={sval}, log_p={lpval}, numlimb={nl}): commit+prove {ms:8.1} ms");
+    }
+    return;
+  }
 
   if std::env::var_os("RUST_LOG").is_some() {
     let _ = tracing_subscriber::fmt()

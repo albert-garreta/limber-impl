@@ -34,7 +34,7 @@ type M = T256DynPrimeEngine;
 
 /// Limb bound (bits) for the MultiSwap-shaped config; matches the
 /// MultiSwap bench's `LOG_T`.
-const MSSHAPE_LOG_T: usize = 32;
+const MSSHAPE_LOG_T: usize = 64;
 /// Norm bound (bits) on committed values for the MultiSwap-shaped
 /// config: operands are full T256-scalar-field elements (< 2^256).
 const MSSHAPE_LOG_T_F: usize = 256;
@@ -237,6 +237,44 @@ fn make_shape_and_witness(
 }
 
 fn imod_spartan_modp_benches(c: &mut Criterion) {
+  // KSWEEP=1: msshape size × k × log_t sweep. Times (witness-commit + prove)
+  // per config with Instant, verifies each (soundness gate), prints a table,
+  // and returns (skips criterion). Maps the optimal (k, T) per circuit size.
+  if std::env::var_os("KSWEEP").is_some() {
+    use std::time::Instant;
+    for &gates in &[682usize, 1365, 2730, 5461] {
+      let (shape, w, q) = make_msshape_shape_and_witness(gates);
+      let n = shape.num_vars().max(shape.num_cons());
+      let log_n = (n as u64).ilog2() as usize;
+      println!(
+        "\nmsshape gates={gates} (cons=2^{}, vars=2^{}):",
+        (shape.num_cons() as u64).ilog2(),
+        (shape.num_vars() as u64).ilog2()
+      );
+      for &log_t in &[16usize, 32, 64] {
+        for k in [7usize, 8, 9, 10, 11, 12] {
+          let Ok(params) = IntEvalParams::derive(MSSHAPE_LOG_T_F, log_t, k, log_n) else {
+            continue;
+          };
+          let (sval, lpval, nl) = (params.s, params.log_p, params.numlimb);
+          let (pk, vk) =
+            IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
+          let t0 = Instant::now();
+          let (witness, instance) =
+            IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+          let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+          let ms = t0.elapsed().as_secs_f64() * 1e3;
+          proof.verify(&vk, &instance).unwrap();
+          println!(
+            "  T=2^{log_t:<2} k={k:<2} (s={sval:<2} log_p={lpval:<2} numlimb={nl:<2}): \
+             commit+prove {ms:8.1} ms"
+          );
+        }
+      }
+    }
+    return;
+  }
+
   // (num_cons, num_vars) — num_vars is the next power-of-two ≥ 4·num_cons.
   // The Mod-PCS open point has length log_2(num_vars); for num_vars > 2^k
   // (default k = 7) this exercises IntEval's partial-eval iteration path.
