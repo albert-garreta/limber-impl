@@ -759,6 +759,62 @@ regions include witness gen + commit):
   only comparable within one snapshot. `docs/plots/*` (msshape figures) still
   predate the re-tune and need regeneration from this data before resubmission.
 
+## Committed-chunk representation: witness commit = range-check chunk commit (2026-07-22)
+
+Picked up the "batched Hyrax opens" follow-up; a fresh span profile at the
+re-tuned (k=9, T=2^64) showed the opens are ALREADY fully batched (one
+interleaved sumcheck + one merged same-column IPA, ~354 ms of a 2.95 s
+multiswap-2^13 prove) — the real duplicate was the *commits*: `wq_commit`
+committed the 64-bit limb polynomial (712 ms) and `rc_chunk_commit` committed
+the SAME data again as 16-bit chunks (777 ms of which ~570 ms was the w/q
+chunks). Implemented instead:
+
+- **`IntegerModPCS::commit` now commits the base-2^16 chunk decomposition**
+  of the limb-split polynomial (layout identical to the range check's F
+  batch: `index = limb_index·stride + c`). The limb polynomial is never
+  committed. Chunks are < 2^16, so the small-scalar MSM fast path is
+  legitimate for EVERY `log_t` — the old `is_small = log_t <= 64` gate is
+  gone.
+- **Limb evaluation claims fold to single chunk claims** at a public tensor
+  point: the weight vector `[2^{16c}]_c` is product-structured over the
+  chunk-index bits, so `f_limb(z) = α^{-1}·chunk(z ++ x_*)` with
+  `x_b = u_b/(1+u_b)`, `u_b = 2^{16·2^b}` (`chunk_fold_point`; unit-tested
+  against direct MLE evaluation). Requires `⌈log_t/16⌉` to be a power of two
+  — `validate()` enforces it (log_t ∈ {16, 32, 64, 128} all qualify).
+- **F batches in the shared range check reuse the input commitment**: no
+  fresh chunk commitment, no value-reconstruction sumcheck (the chunk→limb
+  relation is definitional), and the LogUp-GKR witness claims land directly
+  on the input commitment. Only the `a_j`/`b_j` batches still commit fresh
+  chunk polys and reconstruct. Proof shrinks accordingly (2 fewer Hyrax
+  commitments + 2 fewer reconstruction sumchecks per SNARK).
+
+Measured single-thread (same machine/toolchain, criterion):
+
+| workload | prove before | prove after | verify |
+|---|---|---|---|
+| MultiSwap 2^13 (2048-bit) | 3.11 s | **2.43 s (−22%)** | 41.8 ms (unchanged) |
+| ECDSA MSM 2^13 (256-bit) | 386 ms | **271 ms (−30%)** | 24.6 ms (unchanged) |
+
+Span deltas (multiswap): `rc_chunk_commit` 777→211 ms, `rc_reconstr` 53→5 ms,
+batched opens 354→291 ms (9 targets instead of 11), `wq_commit` 712→787 ms
+(now the 16-bit chunk MSM — same cost as the old limb MSM, but it's the ONLY
+commit of that data).
+
+**Re-tuned (k, T) after the change — (T=2^64, k=9) still optimal.** Commit
+cost is now T-independent (total chunk bits are fixed), but T still gates
+`log_p` through the Partial Eval Norm bound `k + k·log_p + max(log_t, log_p)
+< 256`, so wider limbs shrink `log_p` → s explodes → chain work dominates:
+
+| MultiSwap 2^13, chunked commit | best k | commit+prove |
+|---|---|---|
+| T=2^32 | k=10 | 2696 ms |
+| **T=2^64** | **k=9** | **2385 ms** |
+| T=2^128 | k=7 | 2929 ms |
+
+ECDSA sweep confirms k=9 (271 ms; basin k=8–10). `DEFAULT_K = 9` and bench
+`LOG_T = 64` unchanged. The msshape plots/table and the native-overhead
+numbers predate this change and need regeneration before resubmission.
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at

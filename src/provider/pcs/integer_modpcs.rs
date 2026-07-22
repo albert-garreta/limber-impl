@@ -245,6 +245,21 @@ impl IntEvalParams {
       });
     }
 
+    // Committed-chunk representation: the Mod-PCS commitment is the
+    // base-2^16 chunk decomposition of the limb polynomial, and limb
+    // evaluations fold back through `chunk_fold_point`, which needs the
+    // per-limb chunk count to be a power of two.
+    let numchunks = self.log_t.div_ceil(CHUNK_BITS);
+    if !numchunks.is_power_of_two() {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "IntEvalParams: log_t = {} gives ⌈log_t/{CHUNK_BITS}⌉ = {} chunks per limb; the \
+           committed-chunk layout requires a power of two (log_t ∈ {{16, 32, 64, 128, ...}})",
+          self.log_t, numchunks
+        ),
+      });
+    }
+
     // Final Evaluation Bound: 2^k * P^(k+1) < q
     //   log: k + (k+1)·log_p < log_q
     let final_eval_lhs = self.k + (self.k + 1) * self.log_p;
@@ -508,8 +523,13 @@ pub struct IntegerModVerifierKey {
   pub(crate) params: IntEvalParams,
 }
 
-/// Commitment is just the underlying Hyrax commitment to the F-cast
-/// polynomial. The IntEval protocol runs entirely at eval time.
+/// Commitment is the underlying Hyrax commitment to the polynomial's
+/// base-2^16 CHUNK decomposition (limb-split, then each limb split into
+/// `chunk_stride(log_t)` 16-bit slots — the same layout the range
+/// check's F batch consumes, so no separate chunk commitment is ever
+/// made). Limb evaluations fold to chunk evaluations at the public
+/// [`chunk_fold_point`]. The IntEval protocol runs entirely at eval
+/// time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegerModCommitment {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
@@ -599,9 +619,11 @@ pub struct IntEvalArgument {
   /// ONE shared LogUp-GKR range check covering all `(bound, size)`
   /// batch groups. Canonical batch order is `f_limb`, then for each
   /// iteration `j = 1..=t` the `a_j` batch (all `s` chains) and the
-  /// `b_j` batch — `1 + 2t` batches (just `f_limb` when `t = 0`), each
-  /// with its own 16-bit-chunk commitment and reconstruction sumcheck,
-  /// all sharing one multiplicity table and one table-side GKR. See
+  /// `b_j` batch — `1 + 2t` batches (just `f_limb` when `t = 0`), all
+  /// sharing one multiplicity table and one table-side GKR. The
+  /// `f_limb` batch's chunk polynomial IS the input commitment
+  /// (committed-chunk representation), so only the `a_j`/`b_j` batches
+  /// carry fresh chunk commitments and reconstruction sumchecks. See
   /// [`prove_shared_range_check`].
   pub(crate) range_check: SharedRangeCheck,
   /// ONE combined opening discharging every evaluation claim made
@@ -714,8 +736,11 @@ pub struct SharedRangeCheck {
   pub(crate) mult_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
   /// The multi-witness LogUp-GKR membership argument.
   pub(crate) logup: crate::logup_gkr::LogUpMultiRangeProof<T256HyraxEngine>,
-  /// Per-batch commitments, openings, and reconstruction sumchecks, in
-  /// canonical batch order (`f_limb`, then `a_j`/`b_j` per iteration).
+  /// Per-batch commitments, openings, and reconstruction sumchecks for
+  /// the batches that commit a FRESH chunk polynomial (`a_j`/`b_j`), in
+  /// canonical batch order. `f_limb` batches carry no entry — their
+  /// chunk polynomial is the target's own commitment and the
+  /// chunk→value relation is definitional via [`chunk_fold_point`].
   pub(crate) batches: Vec<RangeCheckBatchData>,
 }
 
@@ -824,6 +849,83 @@ fn chunk_decompose_value(v: &BigUint, log_bound: usize) -> Vec<u64> {
   (0..numchunks)
     .map(|c| byte_at(2 * c) | (byte_at(2 * c + 1) << 8))
     .collect()
+}
+
+/// Chunk slots per value in a chunk-decomposed layout: `⌈log_bound/16⌉`
+/// rounded up to a power of two, min 2 (the extra slots are zero-valued
+/// and zero-weighted). Single source of truth shared by
+/// [`BatchDims::new`] and the committed-chunk layout of [`commit`].
+fn chunk_stride(log_bound: usize) -> usize {
+  log_bound.div_ceil(CHUNK_BITS).next_power_of_two().max(2)
+}
+
+/// Build the stacked chunk polynomial of one `(num_polys, n_values,
+/// log_bound)` batch: index `((p·n_values + within)·stride + c)` holds
+/// chunk `c` of `values[p][within]`; padding polys (`p ≥ num_polys`) and
+/// slots `c ≥ numchunks` stay zero. This IS the committed representation
+/// of an integer polynomial (see [`ModPCSEngineTrait::commit`] for
+/// `IntegerModPCS`), and also every range-check batch's witness layout.
+fn build_chunk_poly(values: &[&[BigUint]], n_values: usize, log_bound: usize) -> Vec<u64> {
+  let d = BatchDims::new(values.len(), n_values, log_bound);
+  let num_polys = values.len();
+  let mut chunk_vals: Vec<u64> = vec![0u64; d.n_chunks];
+  chunk_vals
+    .par_chunks_mut(d.stride)
+    .enumerate()
+    .for_each(|(gv, slot)| {
+      let p = gv / n_values;
+      if p >= num_polys {
+        return; // padding poly: all-zero
+      }
+      let within = gv % n_values;
+      for (c, ch) in chunk_decompose_value(&values[p][within], log_bound)
+        .into_iter()
+        .enumerate()
+      {
+        slot[c] = ch;
+      }
+    });
+  chunk_vals
+}
+
+/// The chunk-axis folding point and scale of the committed-chunk layout:
+/// coordinates `x_*` (one per chunk-axis variable, big-endian over the
+/// chunk index) and `α` such that any multilinear `chunk` whose boolean
+/// slices satisfy `value(z) = Σ_c 2^{16c}·chunk(z, c)` (slots `c ≥
+/// numchunks` zero-weighted) satisfies `chunk(z ++ x_*) = α·value(z)`
+/// for ALL `z` — so a value-polynomial evaluation claim is ONE ordinary
+/// opening claim on the chunk commitment.
+///
+/// Works because the weight vector `[2^{16c}]_c` is a tensor product
+/// over the index bits: bit `b` contributes the factor `u_b = 2^{16·2^b}`
+/// when set, so `x_b = u_b/(1+u_b)` (and `x_b = 0` for dead bits `2^b ≥
+/// numchunks`) gives `eq(x_*, c) = α·2^{16c}` with `α = Π_{2^b <
+/// numchunks} (1+u_b)^{-1}`. Requires `numchunks` to be a power of two
+/// (enforced on `log_t` by [`IntEvalParams::validate`]); a non-power-of-
+/// two count would need some boolean slot to weigh both `2^{16c}` and
+/// zero, which no product structure provides.
+fn chunk_fold_point(log_bound: usize, log_stride: usize) -> (Vec<t256::Scalar>, t256::Scalar) {
+  let numchunks = log_bound.div_ceil(CHUNK_BITS);
+  debug_assert!(numchunks.is_power_of_two());
+  let mut coords_lsb_first = Vec::with_capacity(log_stride);
+  let mut alpha = t256::Scalar::ONE;
+  for b in 0..log_stride {
+    if (1usize << b) >= numchunks {
+      coords_lsb_first.push(t256::Scalar::ZERO);
+    } else {
+      // u_b = 2^(16·2^b), by repeated squaring of 2^16.
+      let mut u = t256::Scalar::from(1u64 << CHUNK_BITS);
+      for _ in 0..b {
+        u = u.square();
+      }
+      let denom_inv = SumcheckField::invert(&(t256::Scalar::ONE + u))
+        .expect("1 + 2^(16·2^b) is invertible in a prime field of odd order");
+      coords_lsb_first.push(u * denom_inv);
+      alpha *= denom_inv;
+    }
+  }
+  coords_lsb_first.reverse(); // big-endian: first coordinate = top chunk-index bit
+  (coords_lsb_first, alpha)
 }
 
 /// Helper for `chunk_decompose_value`'s debug_assert: checks that the
@@ -1140,18 +1242,19 @@ impl IntegerModPCS {
   > {
     let num_vars = ceil_log2(n.max(1));
     params.validate(num_vars)?;
-    // Hyrax CK must be sized for the *limb-split* polynomial: the
-    // input poly has `n` coefficients, but after limb-splitting each
-    // coefficient becomes `2^numlimb_var` slots. For numlimb_var=0
-    // (no-limb-split) this is `n` unchanged.
-    let inflated_n =
-      n.checked_shl(params.numlimb_var as u32)
-        .ok_or(SpartanError::InvalidInputLength {
-          reason: format!(
-            "n={n} * 2^numlimb_var={} overflows usize",
-            params.numlimb_var
-          ),
-        })?;
+    // Hyrax CK must be sized for the *committed chunk* polynomial: the
+    // input poly has `n` coefficients, each limb-split into
+    // `2^numlimb_var` slots and each limb chunk-decomposed into
+    // `chunk_stride(log_t)` base-2^16 slots.
+    let inflated_n = n
+      .checked_shl(params.numlimb_var as u32)
+      .and_then(|x| x.checked_mul(chunk_stride(params.log_t)))
+      .ok_or(SpartanError::InvalidInputLength {
+        reason: format!(
+          "n={n} * 2^numlimb_var={} * chunk_stride overflows usize",
+          params.numlimb_var
+        ),
+      })?;
     let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
     // Size-1 eval key for the internal `G^{f_y}` eval commitments (kept
     // inside the Mod-PCS key, off the PCS-agnostic trait surface).
@@ -1227,7 +1330,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     );
     let inflated_n = n
       .checked_shl(params.numlimb_var as u32)
-      .expect("n * 2^numlimb_var overflows usize");
+      .and_then(|x| x.checked_mul(chunk_stride(params.log_t)))
+      .expect("n * 2^numlimb_var * chunk_stride overflows usize");
     let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
     let (eval_ck, _) = Hyrax::setup(b"imod_modpcs_eval", 1, 1);
     // Precompute the eval key once at setup (see `setup_with_params`).
@@ -1255,12 +1359,12 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
     // `commit` limb-splits an `n`-coefficient polynomial to
-    // `2^numlimb_var · n` coefficients before reaching the inner Hyrax
-    // PCS, so the blind must cover that inflated length. For
-    // `numlimb_var = 0` (no-limb-split) this is `n` unchanged. (Size-1
-    // eval commits use a `ck_eval` with `numlimb_var = 0`, and `commit`
-    // skips splitting for `v.len() == 1`, so they are unaffected.)
-    let inflated = n << ck.params.numlimb_var;
+    // `2^numlimb_var · n` coefficients and chunk-decomposes each limb
+    // into `chunk_stride(log_t)` base-2^16 slots before reaching the
+    // inner Hyrax PCS, so the blind must cover that inflated length.
+    // (Size-1 eval commits skip splitting in `commit`; an over-long
+    // blind is harmless there.)
+    let inflated = (n << ck.params.numlimb_var) * chunk_stride(ck.params.log_t);
     IntegerModBlind {
       inner: Hyrax::blind(&ck.inner, inflated),
     }
@@ -1271,36 +1375,34 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     v: &[BigUint],
     r: &Self::Blind,
   ) -> Result<Self::Commitment, SpartanError> {
-    // Limb-split the integer-valued polynomial: each coefficient
-    // becomes `numlimb` limbs each in `[0, T)`. For `numlimb = 1`
-    // (no-limb-split mode) this returns `v` unchanged. The underlying
-    // F PCS commits the limb polynomial, which has `numlimb * v.len()`
-    // (or `2^numlimb_var * v.len()` after padding) coefficients.
+    // The commitment is the Hyrax commitment of the polynomial's
+    // base-2^16 CHUNK decomposition: each coefficient limb-splits into
+    // `numlimb` limbs in `[0, T)`, and each limb chunk-decomposes into
+    // `chunk_stride(log_t)` 16-bit slots (index `limb_index·stride + c`,
+    // matching the range-check batch layout). Committing the chunks —
+    // not the limbs — means the range check's chunk oracle IS the input
+    // commitment (no duplicate MSM), and every limb evaluation claim
+    // folds to one chunk claim through `chunk_fold_point`. Chunk values
+    // are `< 2^16`, so the small-scalar MSM fast path (`is_small`) is
+    // always legitimate regardless of `log_t`.
     //
     // Stopgap: size-1 commits are single-value commits used internally
     // (e.g. the eval-value commitment); the value may be any F element,
-    // not bounded by `T_f`, so skip limb-splitting in that case.
-    //
-    // The small-scalar MSM fast path (`is_small`) requires every committed
-    // value to be `< 2^64` — Hyrax takes the low 8 bytes with no check, so a
-    // wider value would be silently truncated to a wrong commitment. Limbs
-    // are `< 2^log_t`, so claim `is_small` only when `log_t <= 64`; wider
-    // limbs (e.g. a `log_t = 128` choice from `derive_optimized`) take the
-    // checked full-MSM path. The size-1 stopgap value may be a full-width
-    // `Z_p` element, so `is_small = false` there too.
-    //
-    // TODO Phase 3 step D5: per-limb range check `|limb| < T`.
+    // not bounded by `T_f`, so skip splitting/chunking and the small-
+    // scalar path in that case.
     let params = &ck.params;
-    let (v_limbs, is_small) = if v.len() == 1 {
-      (v.to_vec(), false)
-    } else {
-      (
-        limb_split_polynomial(v, params.log_t, params.log_t_f),
-        params.log_t <= 64,
-      )
-    };
-    let v_fq: Vec<t256::Scalar> = v_limbs.iter().map(biguint_to_scalar).collect();
-    let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, is_small)?;
+    if v.len() == 1 {
+      let v_fq: Vec<t256::Scalar> = v.iter().map(biguint_to_scalar).collect();
+      let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, false)?;
+      return Ok(IntegerModCommitment { inner });
+    }
+    let v_limbs = limb_split_polynomial(v, params.log_t, params.log_t_f);
+    let chunk_vals = build_chunk_poly(&[&v_limbs], v_limbs.len(), params.log_t);
+    let chunk_fq: Vec<t256::Scalar> = chunk_vals
+      .par_iter()
+      .map(|&c| t256::Scalar::from(c))
+      .collect();
+    let inner = Hyrax::commit(&ck.inner, &chunk_fq, &r.inner, true)?;
     Ok(IntegerModCommitment { inner })
   }
 
@@ -1853,15 +1955,22 @@ fn finish_batch_open(
   let log_bound_b = LOG_Q - params.log_p + 1;
 
   // ONE shared LogUp-GKR range check across every polynomial's batches.
+  // Each poly's F batch is PRECOMMITTED: the input commitment already
+  // is its chunk polynomial, so the range check reuses it instead of
+  // committing again. `f_batch_idx[p]` is poly `p`'s canonical batch
+  // index.
+  let mut f_batch_idx: Vec<usize> = Vec::with_capacity(states.len());
   let (range_check, rc_art) = {
     let mut rc_batches: Vec<RangeBatchInputs<'_>> = Vec::new();
     for (p, st) in states.iter().enumerate() {
+      f_batch_idx.push(rc_batches.len());
       rc_batches.push(RangeBatchInputs {
         target: RcTarget::F { poly: p },
         value_polys_fq: vec![st.poly_fq.as_slice()],
         values: vec![st.f_limb.as_slice()],
         n_values: st.f_limb.len(),
         log_bound: params.log_t,
+        precommitted: Some((comms[p], blinds[p])),
       });
       for j in 0..st.t_layers {
         for (role, log_bound) in [(0u8, log_bound_a), (1u8, log_bound_b)] {
@@ -1898,6 +2007,7 @@ fn finish_batch_open(
             values,
             n_values,
             log_bound,
+            precommitted: None,
           });
         }
       }
@@ -1909,10 +2019,11 @@ fn finish_batch_open(
   };
 
   // Route the range check's value claims to each polynomial's target
-  // commitment claim sets.
+  // commitment claim sets. F batches are precommitted and produce no
+  // value claims (no reconstruction sumcheck).
   for (target, z, y) in rc_art.value_claims {
     match target {
-      RcTarget::F { poly } => states[poly].f_claims.push(z, y),
+      RcTarget::F { .. } => unreachable!("precommitted F batches emit no value claims"),
       RcTarget::Ab { poly, layer, role } => {
         let mut pt = Vec::with_capacity(1 + z.len());
         pt.push(if role == 1 {
@@ -1926,12 +2037,39 @@ fn finish_batch_open(
     }
   }
 
-  // ONE combined opening over all commitments.
+  // Per poly: fold every f_limb claim into a chunk claim on the input
+  // commitment (`f_limb(z) · α = chunk(z ++ x_*)`), then append the F
+  // batch's GKR chunk claims — they are claims on the same commitment.
+  let mut f_target_claims: Vec<OpenClaims> = Vec::with_capacity(states.len());
+  for (p, st) in states.iter().enumerate() {
+    let d = BatchDims::new(1, st.f_limb.len(), params.log_t);
+    let (fold_pt, alpha) = chunk_fold_point(params.log_t, d.log_stride);
+    let mut cl = OpenClaims::default();
+    for (z, y) in st.f_claims.points.iter().zip(st.f_claims.evals.iter()) {
+      let mut zc = Vec::with_capacity(z.len() + fold_pt.len());
+      zc.extend_from_slice(z);
+      zc.extend_from_slice(&fold_pt);
+      cl.push(zc, alpha * *y);
+    }
+    let (_, _, rc_claims) = &rc_art.chunk_data[f_batch_idx[p]];
+    for (z, y) in rc_claims.points.iter().zip(rc_claims.evals.iter()) {
+      cl.push(z.clone(), *y);
+    }
+    f_target_claims.push(cl);
+  }
+
+  // ONE combined opening over all commitments. The input commitments
+  // open as their chunk polynomials.
   let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
   let mut bsub = spawn_batch_subtranscript(transcript)?;
   let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &OpenClaims)> = Vec::new();
   for (p, st) in states.iter().enumerate() {
-    bo_targets.push((comms[p], st.poly_fq.as_slice(), blinds[p], &st.f_claims));
+    bo_targets.push((
+      comms[p],
+      rc_art.chunk_data[f_batch_idx[p]].0.as_slice(),
+      blinds[p],
+      &f_target_claims[p],
+    ));
     for j in 0..st.t_layers {
       bo_targets.push((
         &st.ab_comms[j],
@@ -1941,13 +2079,18 @@ fn finish_batch_open(
       ));
     }
   }
+  let mut ab_ci = 0usize;
   for (bi, (chunk_fq, chunk_blind, claims)) in rc_art.chunk_data.iter().enumerate() {
+    if f_batch_idx.contains(&bi) {
+      continue; // F batch: discharged on the input commitment above
+    }
     bo_targets.push((
-      &range_check.batches[bi].chunk_comm,
+      &range_check.batches[ab_ci].chunk_comm,
       chunk_fq.as_slice(),
       chunk_blind,
       claims,
     ));
+    ab_ci += 1;
   }
   bo_targets.push((
     &range_check.mult_comm,
@@ -2213,13 +2356,16 @@ fn finish_batch_verify(
   let log_bound_b = LOG_Q - params.log_p + 1;
 
   let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
-  let mut rc_metas: Vec<RangeBatchMeta> = Vec::new();
+  let mut rc_metas: Vec<RangeBatchMeta<'_>> = Vec::new();
+  let mut f_batch_idx: Vec<usize> = Vec::with_capacity(verifiers.len());
   for (p, v) in verifiers.iter().enumerate() {
+    f_batch_idx.push(rc_metas.len());
     rc_metas.push(RangeBatchMeta {
       target: RcTarget::F { poly: p },
       num_polys: 1,
       n_values: 1usize << v.num_vars,
       log_bound: params.log_t,
+      precommitted_comm: Some(comms[p]),
     });
     for j in 0..v.t {
       let n_values = 1usize << (v.num_vars - (j + 1) * params.k);
@@ -2233,6 +2379,7 @@ fn finish_batch_verify(
           num_polys: params.s,
           n_values,
           log_bound,
+          precommitted_comm: None,
         });
       }
     }
@@ -2240,7 +2387,7 @@ fn finish_batch_verify(
   let rc_claims = verify_shared_range_check(&rc_metas, range_check, transcript)?;
   for (target, z, y) in rc_claims.value_claims {
     match target {
-      RcTarget::F { poly } => verifiers[poly].f_claims.push(z, y),
+      RcTarget::F { .. } => unreachable!("precommitted F batches emit no value claims"),
       RcTarget::Ab { poly, layer, role } => {
         let mut pt = Vec::with_capacity(1 + z.len());
         pt.push(if role == 1 {
@@ -2255,6 +2402,29 @@ fn finish_batch_verify(
   }
   info!(elapsed_ms = %vrc_t.elapsed().as_millis(), "imod_pcs_verify_rc");
 
+  // Per poly: fold every f_limb claim into a chunk claim on the input
+  // commitment and append the F batch's GKR chunk claims (mirror of the
+  // prover's `f_target_claims` construction).
+  let mut f_target_claims: Vec<OpenClaims> = Vec::with_capacity(verifiers.len());
+  let mut f_log_stride: Vec<usize> = Vec::with_capacity(verifiers.len());
+  for (p, v) in verifiers.iter().enumerate() {
+    let d = BatchDims::new(1, 1usize << v.num_vars, params.log_t);
+    let (fold_pt, alpha) = chunk_fold_point(params.log_t, d.log_stride);
+    let mut cl = OpenClaims::default();
+    for (z, y) in v.f_claims.points.iter().zip(v.f_claims.evals.iter()) {
+      let mut zc = Vec::with_capacity(z.len() + fold_pt.len());
+      zc.extend_from_slice(z);
+      zc.extend_from_slice(&fold_pt);
+      cl.push(zc, alpha * *y);
+    }
+    let rc_cl = &rc_claims.chunk_claims[f_batch_idx[p]];
+    for (z, y) in rc_cl.points.iter().zip(rc_cl.evals.iter()) {
+      cl.push(z.clone(), *y);
+    }
+    f_target_claims.push(cl);
+    f_log_stride.push(d.log_stride);
+  }
+
   let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
   let mut bsub = spawn_batch_subtranscript(transcript)?;
   let mut bo_targets: Vec<(
@@ -2263,19 +2433,24 @@ fn finish_batch_verify(
     &OpenClaims,
   )> = Vec::new();
   for (p, v) in verifiers.iter().enumerate() {
-    bo_targets.push((comms[p], v.num_vars, &v.f_claims));
+    bo_targets.push((comms[p], v.num_vars + f_log_stride[p], &f_target_claims[p]));
     for (j, ab_comm) in ab_comms_per_poly[p].iter().enumerate() {
       let m_vars = v.num_vars - (j + 1) * params.k;
       bo_targets.push((ab_comm, 1 + v.log_spad + m_vars, &v.ab_claims[j]));
     }
   }
+  let mut ab_ci = 0usize;
   for (bi, meta) in rc_metas.iter().enumerate() {
+    if meta.precommitted_comm.is_some() {
+      continue; // F batch: discharged on the input commitment above
+    }
     let d = BatchDims::new(meta.num_polys, meta.n_values, meta.log_bound);
     bo_targets.push((
-      &range_check.batches[bi].chunk_comm,
+      &range_check.batches[ab_ci].chunk_comm,
       ceil_log2(d.n_chunks.max(1)),
       &rc_claims.chunk_claims[bi],
     ));
+    ab_ci += 1;
   }
   bo_targets.push((&range_check.mult_comm, CHUNK_BITS, &rc_claims.mult_claims));
   verify_combined_batch_open(&vk.inner, &vk.eval, &mut bsub, &bo_targets, combined_open)?;
@@ -2415,14 +2590,28 @@ struct RangeBatchInputs<'a> {
   n_values: usize,
   /// Bit-width of the shared bound (each value `< 2^log_bound`).
   log_bound: usize,
+  /// `Some((comm, blind))` when the batch's chunk polynomial is ALREADY
+  /// committed as the target's own commitment (F batches: the Mod-PCS
+  /// commitment IS the chunk polynomial). No fresh chunk commitment is
+  /// made and no value-reconstruction sumcheck runs — the chunk→value
+  /// relation is definitional via [`chunk_fold_point`] — and the GKR's
+  /// chunk claims are discharged against this commitment.
+  precommitted: Option<(
+    &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+    &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  )>,
 }
 
 /// Verifier-side metadata for one batch of the shared range check.
-struct RangeBatchMeta {
+struct RangeBatchMeta<'a> {
   target: RcTarget,
   num_polys: usize,
   n_values: usize,
   log_bound: usize,
+  /// Mirror of [`RangeBatchInputs::precommitted`]: the target's own
+  /// commitment, for batches whose chunk polynomial is the committed
+  /// representation itself (F batches).
+  precommitted_comm: Option<&'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
 }
 
 /// Sizes derived from a batch's public parameters, shared by prover and
@@ -2448,7 +2637,7 @@ impl BatchDims {
     // Min stride 2 keeps the reconstruction sumcheck non-degenerate when a
     // bound fits in a single chunk (the extra slot is zero-valued and
     // zero-weighted).
-    let stride = numchunks.next_power_of_two().max(2);
+    let stride = chunk_stride(log_bound);
     Self {
       log_np,
       log_nv,
@@ -3015,12 +3204,17 @@ fn prove_shared_range_check(
   // 1. Per batch: stacked chunk polynomial (u64 entries, each < 2^16).
   //    Index `((p·n_values + within)·stride + c)`. Padding polys
   //    (`p ≥ num_polys`) and slots `c ≥ numchunks` stay zero (zero is in
-  //    the table, and those slots carry zero weight).
+  //    the table, and those slots carry zero weight). Precommitted
+  //    batches (F: the input commitment IS the chunk polynomial) build
+  //    the chunk values for the GKR but make no fresh commitment.
   let (_rcc_span, rcc_t) = start_span!("rc_chunk_commit");
   let mut chunk_vals_all: Vec<Vec<u64>> = Vec::with_capacity(batches.len());
   let mut chunk_fq_all: Vec<Vec<t256::Scalar>> = Vec::with_capacity(batches.len());
   let mut chunk_blinds: Vec<HB> = Vec::with_capacity(batches.len());
-  let mut chunk_comms: Vec<HC> = Vec::with_capacity(batches.len());
+  // `Some` for batches that committed a fresh chunk polynomial here
+  // (these land in `SharedRangeCheck::batches`); `None` for
+  // precommitted batches.
+  let mut created_comms: Vec<Option<HC>> = Vec::with_capacity(batches.len());
   for (b, d) in batches.iter().zip(dims.iter()) {
     let num_polys = b.value_polys_fq.len();
     debug_assert!(num_polys >= 1);
@@ -3034,34 +3228,34 @@ fn prove_shared_range_check(
       n_chunks = d.n_chunks,
       "imod_pcs_range_batch"
     );
-    let mut chunk_vals: Vec<u64> = vec![0u64; d.n_chunks];
-    chunk_vals
-      .par_chunks_mut(d.stride)
-      .enumerate()
-      .for_each(|(gv, slot)| {
-        let p = gv / b.n_values;
-        if p >= num_polys {
-          return; // padding poly: all-zero
-        }
-        let within = gv % b.n_values;
-        for (c, ch) in chunk_decompose_value(&b.values[p][within], b.log_bound)
-          .into_iter()
-          .enumerate()
-        {
-          slot[c] = ch;
-        }
-      });
+    let chunk_vals = build_chunk_poly(&b.values, b.n_values, b.log_bound);
+    debug_assert_eq!(chunk_vals.len(), d.n_chunks);
     let chunk_fq: Vec<t256::Scalar> = chunk_vals
       .par_iter()
       .map(|&c| t256::Scalar::from(c))
       .collect();
-    let blind = Hyrax::blind(ck, d.n_chunks);
-    let comm = Hyrax::commit(ck, &chunk_fq, &blind, true)?;
+    if let Some((_, blind)) = b.precommitted {
+      chunk_blinds.push((*blind).clone());
+      created_comms.push(None);
+    } else {
+      let blind = Hyrax::blind(ck, d.n_chunks);
+      let comm = Hyrax::commit(ck, &chunk_fq, &blind, true)?;
+      chunk_blinds.push(blind);
+      created_comms.push(Some(comm));
+    }
     chunk_vals_all.push(chunk_vals);
     chunk_fq_all.push(chunk_fq);
-    chunk_blinds.push(blind);
-    chunk_comms.push(comm);
   }
+  // Canonical per-batch commitment references: the input commitment for
+  // precommitted batches, the fresh chunk commitment otherwise.
+  let chunk_comm_refs: Vec<&HC> = batches
+    .iter()
+    .zip(created_comms.iter())
+    .map(|(b, created)| match b.precommitted {
+      Some((comm, _)) => comm,
+      None => created.as_ref().expect("created for non-precommitted"),
+    })
+    .collect();
 
   info!(elapsed_ms = %rcc_t.elapsed().as_millis(), "rc_chunk_commit");
 
@@ -3100,7 +3294,8 @@ fn prove_shared_range_check(
   info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "rc_mult_commit");
 
   // 4. Sub-transcript bound to (parent, chunk comms, mult comm).
-  let mut sub = spawn_shared_range_subtranscript(parent, chunk_comms.iter(), &mult_comm)?;
+  let mut sub =
+    spawn_shared_range_subtranscript(parent, chunk_comm_refs.iter().copied(), &mult_comm)?;
 
   // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
   //    [0, 2^16). Its reduced claims become batched-open claims.
@@ -3132,16 +3327,22 @@ fn prove_shared_range_check(
   let mut mult_claims = OpenClaims::default();
   mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
 
-  // 6. Per batch: value-reconstruction sumcheck tying the chunks to the
-  //    batch's value polynomials. The folded value `V(r_v) =
-  //    Σ_p eq(r_v_poly, p)·value_p(r_v_within)` is sent as a claim on the
-  //    batch's target commitment, and the sumcheck's final chunk
-  //    evaluation is a claim on the chunk commitment.
+  // 6. Per non-precommitted batch: value-reconstruction sumcheck tying
+  //    the chunks to the batch's value polynomials. The folded value
+  //    `V(r_v) = Σ_p eq(r_v_poly, p)·value_p(r_v_within)` is sent as a
+  //    claim on the batch's target commitment, and the sumcheck's final
+  //    chunk evaluation is a claim on the chunk commitment.
+  //    Precommitted batches skip this entirely: their chunk polynomial
+  //    IS the committed representation, so the chunk→value relation is
+  //    definitional (`chunk_fold_point`) — nothing to tie.
   let (_rcr_span, rcr_t) = start_span!("rc_reconstr");
   let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
     Vec::with_capacity(batches.len());
   let mut batch_data: Vec<RangeCheckBatchData> = Vec::with_capacity(batches.len());
   for (bi, (b, d)) in batches.iter().zip(dims.iter()).enumerate() {
+    if b.precommitted.is_some() {
+      continue;
+    }
     let num_polys = b.value_polys_fq.len();
     let r_v: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
       .map(|_| sub.squeeze(b"range_rv"))
@@ -3187,7 +3388,9 @@ fn prove_shared_range_check(
     chunk_claims[bi].push(combined, reconstr_eval);
 
     batch_data.push(RangeCheckBatchData {
-      chunk_comm: chunk_comms[bi].clone(),
+      chunk_comm: created_comms[bi]
+        .clone()
+        .expect("non-precommitted batch has a fresh chunk commitment"),
       value_eval,
       reconstr_eval,
       value_reconstr_sumcheck,
@@ -3225,17 +3428,36 @@ fn prove_shared_range_check(
 /// reconstruction sumcheck against the claimed evaluations, and returns
 /// the claims for the batched-open verification.
 fn verify_shared_range_check(
-  metas: &[RangeBatchMeta],
+  metas: &[RangeBatchMeta<'_>],
   arg: &SharedRangeCheck,
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
 ) -> Result<RcVerifyClaims, SpartanError> {
-  if metas.is_empty() || arg.batches.len() != metas.len() {
+  // The proof carries per-batch data only for batches that committed a
+  // fresh chunk polynomial; precommitted batches (F) contribute their
+  // target's own commitment and skip reconstruction.
+  let n_fresh = metas
+    .iter()
+    .filter(|m| m.precommitted_comm.is_none())
+    .count();
+  if metas.is_empty() || arg.batches.len() != n_fresh {
     return Err(SpartanError::InvalidSumcheckProof);
   }
   let dims: Vec<BatchDims> = metas
     .iter()
     .map(|m| BatchDims::new(m.num_polys, m.n_values, m.log_bound))
     .collect();
+  // Canonical per-batch commitment references (input comm for
+  // precommitted batches, proof-carried chunk comm otherwise).
+  let chunk_comm_refs: Vec<&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment> = {
+    let mut fresh = arg.batches.iter();
+    metas
+      .iter()
+      .map(|m| match m.precommitted_comm {
+        Some(comm) => comm,
+        None => &fresh.next().expect("length checked above").chunk_comm,
+      })
+      .collect()
+  };
 
   // Tree-depth pinning: chunk trees (one per batch, sized by the public
   // batch shape), then shifted-top trees of the non-aligned batches.
@@ -3249,11 +3471,8 @@ fn verify_shared_range_check(
   }
 
   // 1. Spawn the same sub-transcript the prover used.
-  let mut sub = spawn_shared_range_subtranscript(
-    parent,
-    arg.batches.iter().map(|b| &b.chunk_comm),
-    &arg.mult_comm,
-  )?;
+  let mut sub =
+    spawn_shared_range_subtranscript(parent, chunk_comm_refs.iter().copied(), &arg.mult_comm)?;
 
   // 2. Multi-witness LogUp membership: every chunk (and shifted top) in
   //    [0, 2^16). Its reduced claims become batched-open claims.
@@ -3275,15 +3494,22 @@ fn verify_shared_range_check(
   let mut mult_claims = OpenClaims::default();
   mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
 
-  // 3. Per batch: r_v squeeze, claimed `V(r_v)` absorbed and recorded as
-  //    a claim on the batch's target, reconstruction sumcheck verified
-  //    against it, and the final integrand check
-  //    `w(r_b)·chunk(r_v, r_b) == final claim` using the claimed chunk
-  //    evaluation (itself a claim on the chunk commitment).
+  // 3. Per non-precommitted batch: r_v squeeze, claimed `V(r_v)`
+  //    absorbed and recorded as a claim on the batch's target,
+  //    reconstruction sumcheck verified against it, and the final
+  //    integrand check `w(r_b)·chunk(r_v, r_b) == final claim` using the
+  //    claimed chunk evaluation (itself a claim on the chunk
+  //    commitment). Precommitted batches (F) skip reconstruction — the
+  //    chunk→value relation is definitional via `chunk_fold_point`.
   let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
     Vec::with_capacity(metas.len());
+  let mut fresh_i = 0usize;
   for (bi, (m, d)) in metas.iter().zip(dims.iter()).enumerate() {
-    let b = &arg.batches[bi];
+    if m.precommitted_comm.is_some() {
+      continue;
+    }
+    let b = &arg.batches[fresh_i];
+    fresh_i += 1;
     let r_v: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
       .map(|_| sub.squeeze(b"range_rv"))
       .collect::<Result<Vec<_>, _>>()?;
@@ -3347,9 +3573,10 @@ mod tests {
   type DP = DynPrime<4>;
 
   /// Setup + commit round-trip: an IntEval-committed polynomial commits
-  /// to the same Hyrax handle as a direct Hyrax commit of the cast
-  /// F-valued polynomial. Sanity check that the wrapper isn't mangling
-  /// the underlying commitment.
+  /// to the same Hyrax handle as a direct Hyrax commit of its
+  /// limb-split, base-2^16-chunked representation (the committed-chunk
+  /// layout). Sanity check that the wrapper isn't mangling the
+  /// underlying commitment.
   #[test]
   fn commit_delegates_to_hyrax() {
     let n = 16usize;
@@ -3358,10 +3585,43 @@ mod tests {
     let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
-    // Re-commit directly via Hyrax and confirm equality.
-    let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
-    let direct = Hyrax::commit(&ck.inner, &poly_fq, &blind.inner, false).unwrap();
+    // Re-commit the chunk layout directly via Hyrax and confirm equality.
+    let limbs = limb_split_polynomial(&poly, ck.params.log_t, ck.params.log_t_f);
+    let chunks = build_chunk_poly(&[&limbs], limbs.len(), ck.params.log_t);
+    let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| t256::Scalar::from(c)).collect();
+    let direct = Hyrax::commit(&ck.inner, &chunk_fq, &blind.inner, true).unwrap();
     assert_eq!(comm.inner, direct);
+  }
+
+  /// The chunk-axis folding identity behind the committed-chunk
+  /// representation: `chunk_mle(z ++ x_*) = α · limb_mle(z)` at
+  /// arbitrary (non-boolean) `z`, across limb widths including the
+  /// single-chunk (dead-bit) and multi-chunk tensor cases.
+  #[test]
+  fn chunk_fold_point_matches_limb_evaluation() {
+    for (log_t, log_t_f) in [(8usize, 8usize), (16, 64), (32, 64), (64, 256), (128, 512)] {
+      let n = 8usize;
+      let mask = (BigUint::one() << log_t_f) - BigUint::one();
+      let poly: Vec<BigUint> = (0..n)
+        .map(|i| ((BigUint::from(0x9e3779b97f4a7c15u64) << (7 * i)) + BigUint::from(i)) & &mask)
+        .collect();
+      let limbs = limb_split_polynomial(&poly, log_t, log_t_f);
+      let chunks = build_chunk_poly(&[&limbs], limbs.len(), log_t);
+      let limbs_fq: Vec<t256::Scalar> = limbs.iter().map(biguint_to_scalar).collect();
+      let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| t256::Scalar::from(c)).collect();
+      let d = BatchDims::new(1, limbs.len(), log_t);
+      let (fold_pt, alpha) = chunk_fold_point(log_t, d.log_stride);
+      let nv = limbs.len().trailing_zeros() as usize;
+      let z: Vec<t256::Scalar> = (0..nv)
+        .map(|i| t256::Scalar::from(0xACE1u64 + 77 * i as u64))
+        .collect();
+      let zc: Vec<t256::Scalar> = z.iter().copied().chain(fold_pt.iter().copied()).collect();
+      assert_eq!(
+        mle_evaluate_fq(&chunk_fq, &zc),
+        alpha * mle_evaluate_fq(&limbs_fq, &z),
+        "fold identity failed for log_t={log_t}, log_t_f={log_t_f}"
+      );
+    }
   }
 
   /// `derive` produces params that pass `validate` for the variable
@@ -4095,11 +4355,12 @@ mod tests {
       <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
         .unwrap();
 
-    // Three batches (f_limb, a_1, b_1) — the config must produce them.
+    // Two fresh-chunk batches (a_1, b_1) — the f_limb batch reuses the
+    // input commitment and carries no per-batch proof data.
     assert_eq!(
       arg.range_check.batches.len(),
-      3,
-      "expected f_limb + a_1 + b_1 batches"
+      2,
+      "expected a_1 + b_1 fresh-chunk batches"
     );
 
     // Tampering each batch's chunk opening (in turn) must be rejected
@@ -4213,10 +4474,12 @@ mod tests {
     // The bug manifested as an index-out-of-bounds panic here.
     let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
 
-    // Commit matches a direct Hyrax commit of the limb-split polynomial.
+    // Commit matches a direct Hyrax commit of the limb-split, chunked
+    // polynomial (the committed-chunk layout).
     let limbs = limb_split_polynomial(&poly, 4, 8);
-    let limbs_fq: Vec<t256::Scalar> = limbs.iter().map(biguint_to_scalar).collect();
-    let direct = Hyrax::commit(&ck.inner, &limbs_fq, &blind.inner, false).unwrap();
+    let chunks = build_chunk_poly(&[&limbs], limbs.len(), 4);
+    let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| t256::Scalar::from(c)).collect();
+    let direct = Hyrax::commit(&ck.inner, &chunk_fq, &blind.inner, true).unwrap();
     assert_eq!(comm.inner, direct);
   }
 }

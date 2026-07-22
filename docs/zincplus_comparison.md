@@ -173,3 +173,20 @@ New single-thread numbers with the re-tuned defaults:
 ECDSA MSM: 386 ms / 24 ms (was 545/43) — Zinc+ gap ~16× (was 23×). No protocol
 change; parameters only. The T=2^16 witness-commit-reuse idea was implemented,
 measured, and reverted (dominated by T=2^64 — details in imod_followups.md).
+
+## Update (2026-07-22): committed-chunk representation
+
+The witness commitment now IS the range check's 16-bit chunk commitment
+(the duplicate 64-bit limb MSM is gone; see imod_followups.md
+"Committed-chunk representation"). New single-thread numbers, same
+(k=9, T=2^64) — re-confirmed optimal post-change:
+
+| | prove | verify | proof |
+|---|---|---|---|
+| Ours (multiswap 2¹³, chunked commit) | **2.43 s** | **41.8 ms** | ~KB |
+| Zinc+ (MulModN 2¹³) | 1.10 s | 483 ms | 1.21 MB |
+| ratio | ~2.2× them | **~12× us** | ~1000× us |
+
+ECDSA MSM: 271 ms / 24.6 ms — Zinc+ gap ~11× (their native-q=p
+specialization). Cumulative since the 4.35 s starting point: −44% prove
+with verify/proof-size wins intact.
