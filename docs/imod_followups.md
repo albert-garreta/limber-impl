@@ -815,6 +815,17 @@ ECDSA sweep confirms k=9 (271 ms; basin k=8–10). `DEFAULT_K = 9` and bench
 `LOG_T = 64` unchanged. The msshape plots/table and the native-overhead
 numbers predate this change and need regeneration before resubmission.
 
+### Follow-on: one-pass limb split + u64 scalar-cast fast path
+
+`split_value_into_limbs` was `numlimb` bignum `div_rem`s per value (≈500k
+divisions + ~1M small allocations per multiswap polynomial); at T = 2^64
+the limbs are literally the u64 digits. Rewritten as a one-pass bit-window
+extraction over `to_bytes_le()`, plus a u64 fast path in
+`biguint_to_scalar` (values ≤ 64 bits skip the 512-bit uniform reduction —
+every limb at T ≤ 2^64 qualifies). Measured single-thread (multiswap 2¹³):
+`red_limb_split` 132→14 ms, `red_to_fq` 41→7 ms, `wq_commit` 787→~650 ms
+(its internal limb split got cheap too).
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at

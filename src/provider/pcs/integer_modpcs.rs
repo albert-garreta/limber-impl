@@ -749,6 +749,11 @@ pub struct SharedRangeCheck {
 /// step D will add the range check that turns this into a *sound*
 /// commitment to a bounded integer.
 fn biguint_to_scalar(v: &BigUint) -> t256::Scalar {
+  // Fast path: values that fit one u64 digit (e.g. every limb at
+  // T ≤ 2^64) skip the 512-bit uniform-reduction path.
+  if v.bits() <= 64 {
+    return t256::Scalar::from(v.iter_u64_digits().next().unwrap_or(0));
+  }
   let mut bytes = v.to_bytes_le();
   bytes.resize(64, 0);
   <t256::Scalar as PrimeFieldExt>::from_uniform(&bytes)
@@ -971,24 +976,48 @@ fn bool_point_of_index(idx: usize, num_bits: usize) -> Vec<t256::Scalar> {
 /// Split a single `BigUint` value `v ∈ [0, 2^log_t_f)` into `numlimb`
 /// limbs each in `[0, 2^log_t)`, base-`T` little-endian: `v = sum_i
 /// T^i · limbs[i]`. Asserts `v < 2^(numlimb · log_t)`; values that
-/// exceed the declared bound `T_f` are caller errors (Phase 3 step D5
-/// adds the soundness-grade range check).
+/// exceed the declared bound `T_f` are caller errors (the committed-
+/// chunk range check enforces the bound soundness-grade).
+///
+/// One pass over the LE byte representation — limb `i` is the bit
+/// window `[i·log_t, (i+1)·log_t)` — instead of `numlimb` bignum
+/// `div_rem`s (which dominated the reduction span at ~2^13 × 32
+/// limbs).
 fn split_value_into_limbs(v: &BigUint, log_t: usize, numlimb: usize) -> Vec<BigUint> {
-  let t = BigUint::one() << log_t;
-  let mut out = Vec::with_capacity(numlimb);
-  let mut rem = v.clone();
-  for _ in 0..numlimb {
-    let (q, r) = (&rem / &t, &rem % &t);
-    out.push(r);
-    rem = q;
-  }
+  let bytes = v.to_bytes_le();
   debug_assert!(
-    rem.is_zero(),
+    bit_decompose_check_no_overflow(&bytes, numlimb * log_t),
     "value 0x{:x} exceeds bound 2^{}",
     v,
     numlimb * log_t
   );
-  out
+  (0..numlimb)
+    .map(|i| extract_bit_window(&bytes, i * log_t, log_t))
+    .collect()
+}
+
+/// Extract the `len`-bit window starting at bit `start` (LSB-first bit
+/// order) of an LE byte string, as a `BigUint`.
+fn extract_bit_window(bytes: &[u8], start: usize, len: usize) -> BigUint {
+  let byte_at = |i: usize| -> u16 { if i < bytes.len() { bytes[i] as u16 } else { 0 } };
+  let shift = start % 8;
+  let first = start / 8;
+  let n_out = len.div_ceil(8);
+  let mut out = vec![0u8; n_out];
+  for (j, o) in out.iter_mut().enumerate() {
+    let lo = byte_at(first + j) >> shift;
+    let hi = if shift == 0 {
+      0
+    } else {
+      byte_at(first + j + 1) << (8 - shift)
+    };
+    *o = (lo | hi) as u8;
+  }
+  let rem = len % 8;
+  if rem != 0 {
+    out[n_out - 1] &= (1u8 << rem) - 1;
+  }
+  BigUint::from_bytes_le(&out)
 }
 
 /// Build the public limb-weight polynomial `limb` as a `DynPrime<4>`
