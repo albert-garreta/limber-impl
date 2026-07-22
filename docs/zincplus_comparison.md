@@ -183,10 +183,32 @@ The witness commitment now IS the range check's 16-bit chunk commitment
 
 | | prove | verify | proof |
 |---|---|---|---|
-| Ours (multiswap 2¹³, chunked commit) | **2.43 s** | **41.8 ms** | ~KB |
+| Ours (multiswap 2¹³, chunked commit) | **2.03 s** | **40.1 ms** | ~KB |
 | Zinc+ (MulModN 2¹³) | 1.10 s | 483 ms | 1.21 MB |
-| ratio | ~2.2× them | **~12× us** | ~1000× us |
+| ratio | ~1.85× them | **~12× us** | ~1000× us |
 
-ECDSA MSM: 271 ms / 24.6 ms — Zinc+ gap ~11× (their native-q=p
-specialization). Cumulative since the 4.35 s starting point: −44% prove
-with verify/proof-size wins intact.
+ECDSA MSM: 255 ms / 24.0 ms — Zinc+ gap ~10× (their native-q=p
+specialization). Cumulative since the 4.35 s starting point: −53% prove
+with verify/proof-size wins intact. (2.03 s reflects three same-day
+rounds: chunked witness commit 3.11→2.43 s, the limb-split/scalar-cast
+rewrite →~2.06 s, and the a/b chunk-only layer commitments →2.03 s —
+see imod_followups.md "Committed-chunk representation".)
+
+Current prover breakdown (multiswap 2¹³, single-thread spans; supersedes
+the 4.35 s table above for the current code):
+
+| component | time | share of 2.03 s |
+|---|---|---|
+| `wq_commit` (16-bit chunk MSM, the only witness commit) | 673 ms | ~33% |
+| `rc_logup_gkr` | 479 ms | ~24% |
+| combined batch open (weight build + interleaved SC + merged IPA) | 297 ms | ~15% |
+| chain build (integer partial-evals) | ~225 ms | ~11% |
+| `ab_commit` (per-layer `a`/`b` chunk MSMs) | 166 ms | ~8% |
+| reduction (limb split + casts + integer eval + sumcheck) | ~85 ms | ~4% |
+| GKR chunk-value rebuild + mult commit + Spartan sumchecks | ~90 ms | ~4% |
+
+Verify 40.1 ms: batch-open verification ~28 ms (~70%), range-check
+verify ~4 ms, matrix eval 1–2 ms. Total Pedersen MSM work is now
+~840 ms (~41%) — the honest size of the Mod-PCS-over-Brakedown lever
+(projects prove toward ~1.2–1.3 s); the GKR (479 ms) is the second
+lever and the known multithreading bottleneck.

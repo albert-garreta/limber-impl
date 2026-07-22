@@ -824,7 +824,42 @@ extraction over `to_bytes_le()`, plus a u64 fast path in
 `biguint_to_scalar` (values ≤ 64 bits skip the 512-bit uniform reduction —
 every limb at T ≤ 2^64 qualifies). Measured single-thread (multiswap 2¹³):
 `red_limb_split` 132→14 ms, `red_to_fq` 41→7 ms, `wq_commit` 787→~650 ms
-(its internal limb split got cheap too).
+(its internal limb split got cheap too). Criterion: multiswap prove
+2.43 → 2.13 s (−12%), verify unchanged.
+
+### Follow-on: a/b layers commit as chunks too (zero-pad claims)
+
+The `a_j`/`b_j` layers were the last double commit (stacked full-width
+value commit ~83 ms + range-check chunk commits ~211 ms of the same
+values). Now each layer commits its `a` and `b` chunk decompositions
+directly (2 chunk commitments per layer, always `is_small`); chain
+identity claims fold through `chunk_fold_point` like the F claims.
+`b_j`'s 15-chunk bound (237 bits) is not tensor-friendly, so the fold
+uses the FULL 16-slot weight tensor and the padding slot is pinned to
+zero by a `range_zpad` claim — a free random-point opening claim
+(Schwartz–Zippel) squeezed after the commitments. This generalizes to
+any chunk count, so the power-of-two `⌈log_t/16⌉` restriction on
+`validate()` is REMOVED. `SharedRangeCheck` now carries no per-batch
+proof data at all (every chunk oracle is its target's own commitment;
+reconstruction sumchecks gone entirely). Criterion: multiswap prove
+2.13 → 2.03 s (−5%), verify 40.1 ms.
+
+Cumulative across the three same-day rounds (criterion, single-thread):
+
+| workload | prove (start of day → now) | verify |
+|---|---|---|
+| MultiSwap 2^13 | 3.11 s → 2.43 → 2.13 → **2.03 s (−35%)** | 40.1 ms |
+| ECDSA MSM 2^13 | 386 ms → 271 → **255 ms (−34%)** | 24.0 ms |
+
+k=9 re-confirmed optimal on the ECDSA sweep after all changes. Current
+multiswap span shape: `wq_commit` 673 (33%), `rc_logup_gkr` 479 (24%),
+batched opens 297 (15%), chain build ~225 (11%), `ab_commit` 166 (8%),
+reduction ~85 (4%), GKR chunk-value rebuild 52 (3%).
+
+Remaining small deferred item: phase 1 builds the a/b chunk values and
+the range check rebuilds the same u64 chunk vectors for the GKR witness
+trees (~52 ms) — thread them through `RangeBatchInputs` to skip the
+rebuild.
 
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
