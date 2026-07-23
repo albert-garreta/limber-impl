@@ -881,6 +881,36 @@ reduction's `integer_mle_evaluate` stays `BigInt` — its chi factors are
 full ~128-bit point coordinates over all 18 variables, unbounded by the
 norm bound.)
 
+### Follow-on (2026-07-23): breakdown scrutiny — three constant-factor fixes
+
+A line-by-line audit of the 1.87 s profile against first-principles cost
+models found three soft constants (everything else runs at its
+arithmetic floor — see the justification table in
+`zincplus_comparison.md`):
+
+1. **MSM window sizing for short scalars.** `msm_small_rest`'s window
+   heuristic `c = 0.69·log2(n) + 2` is tuned for full-width scalars; for
+   16-bit chunks on 2048-point Hyrax rows it picked c=9 (2 windows, 511
+   buckets each), making bucket aggregation ~⅓ of all adds. Shrinking
+   `c` to the smallest value with the same window count (c=8, 255
+   buckets) costs no extra data passes: `wq_commit` 686 → ~590 ms.
+2. **Single-word chunk building.** `build_chunk_poly` went through
+   `to_bytes_le()` + a Vec per limb; a T ≤ 2^64 limb is one u64 digit
+   whose chunks are three shifts.
+3. **Chunk→scalar table.** `t256::Scalar::from(u64)` is a Montgomery
+   multiplication (~15 ns); the chunk pipelines convert ~4.7M sub-2^16
+   values per proof (~70 ms) that take only 65,536 distinct values. A
+   `OnceLock` table converts each once: GKR witness prep
+   (`rc_chunk_commit` span) 38 → 4 ms.
+
+Criterion: multiswap 2¹³ prove **1.87 → 1.71 s (−8.6%)**, verify
+unchanged (42 ms); ECDSA MSM ~flat (226 ms — its MSM share is 8×
+smaller). Zinc+ prove gap now **~1.55×**. Identified-but-deferred
+constant-factor lever: batch-affine bucket accumulation in the MSM
+(Montgomery inversion trick) — the remaining ~110 ns/add is Jacobian
+mixed adds; batch-affine is typically ~2× on the ~750 ms of MSMs, but
+it is an MSM-internals rewrite.
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at

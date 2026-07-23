@@ -518,6 +518,13 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
     } else {
       compute_ln(bases.len()) + 2
     };
+    // Refine the window size for short scalars: the add count is
+    // `W·(n + 2^{c+1})` for `W = ⌈max_bits/c⌉` windows, so among all
+    // `c` yielding the same `W` the smallest wins (halving the
+    // bucket-aggregation term costs no extra data passes). With the
+    // 16-bit chunk commits (n = 2048 per Hyrax row, W = 2) this cuts
+    // the aggregation from 2·2·511 to 2·2·255 adds per row.
+    let c = max_num_bits.div_ceil(max_num_bits.div_ceil(c));
 
     let zero = C::Curve::identity();
 

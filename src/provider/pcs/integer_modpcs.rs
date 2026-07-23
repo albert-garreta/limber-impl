@@ -862,6 +862,10 @@ fn build_chunk_poly(values: &[&[BigUint]], n_values: usize, log_bound: usize) ->
   let d = BatchDims::new(values.len(), n_values, log_bound);
   let num_polys = values.len();
   let mut chunk_vals: Vec<u64> = vec![0u64; d.n_chunks];
+  // Values bounded below 2^64 are a single u64 digit; their chunks are
+  // three shifts, no byte-buffer round-trip (the per-limb
+  // `chunk_decompose_value` allocation dominated this pass otherwise).
+  let single_word = log_bound <= 64;
   chunk_vals
     .par_chunks_mut(d.stride)
     .enumerate()
@@ -871,14 +875,31 @@ fn build_chunk_poly(values: &[&[BigUint]], n_values: usize, log_bound: usize) ->
         return; // padding poly: all-zero
       }
       let within = gv % n_values;
-      for (c, ch) in chunk_decompose_value(&values[p][within], log_bound)
-        .into_iter()
-        .enumerate()
-      {
-        slot[c] = ch;
+      let v = &values[p][within];
+      if single_word {
+        let w = v.iter_u64_digits().next().unwrap_or(0);
+        debug_assert!(v.bits() as usize <= log_bound);
+        for (c, s) in slot.iter_mut().take(d.numchunks).enumerate() {
+          *s = (w >> (CHUNK_BITS * c)) & ((1u64 << CHUNK_BITS) - 1);
+        }
+      } else {
+        for (c, ch) in chunk_decompose_value(v, log_bound).into_iter().enumerate() {
+          slot[c] = ch;
+        }
       }
     });
   chunk_vals
+}
+
+/// Montgomery-form scalar for a base-2^16 chunk value, from a table
+/// built once per process — `t256::Scalar::from` costs a Montgomery
+/// multiplication, and the chunk pipelines (commit, layer commits, GKR
+/// witness prep) convert millions of sub-2^16 values per proof.
+fn scalar_from_chunk(c: u64) -> t256::Scalar {
+  static TABLE: std::sync::OnceLock<Vec<t256::Scalar>> = std::sync::OnceLock::new();
+  let table = TABLE.get_or_init(|| (0..(1u64 << CHUNK_BITS)).map(t256::Scalar::from).collect());
+  debug_assert!(c < (1u64 << CHUNK_BITS));
+  table[c as usize]
 }
 
 /// The chunk-axis folding point and scale of the committed-chunk layout:
@@ -1609,7 +1630,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let chunk_vals = build_chunk_poly(&[&v_limbs], v_limbs.len(), params.log_t);
     let chunk_fq: Vec<t256::Scalar> = chunk_vals
       .par_iter()
-      .map(|&c| t256::Scalar::from(c))
+      .map(|&c| scalar_from_chunk(c))
       .collect();
     let inner = Hyrax::commit(&ck.inner, &chunk_fq, &r.inner, true)?;
     Ok(IntegerModCommitment { inner })
@@ -2077,7 +2098,7 @@ fn prove_one_poly(
       let chunk_vals = build_chunk_poly(&values, m, log_bound);
       let chunk_fq: Vec<t256::Scalar> = chunk_vals
         .par_iter()
-        .map(|&c| t256::Scalar::from(c))
+        .map(|&c| scalar_from_chunk(c))
         .collect();
       let blind = Hyrax::blind(&ck.inner, chunk_fq.len());
       let comm = Hyrax::commit(&ck.inner, &chunk_fq, &blind, true)?;
@@ -3499,7 +3520,7 @@ fn prove_shared_range_check(
     debug_assert_eq!(chunk_vals.len(), d.n_chunks);
     let chunk_fq: Vec<t256::Scalar> = chunk_vals
       .par_iter()
-      .map(|&c| t256::Scalar::from(c))
+      .map(|&c| scalar_from_chunk(c))
       .collect();
     if let Some((_, blind)) = b.precommitted {
       chunk_blinds.push((*blind).clone());
@@ -3888,7 +3909,7 @@ mod tests {
     // Re-commit the chunk layout directly via Hyrax and confirm equality.
     let limbs = limb_split_polynomial(&poly, ck.params.log_t, ck.params.log_t_f);
     let chunks = build_chunk_poly(&[&limbs], limbs.len(), ck.params.log_t);
-    let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| t256::Scalar::from(c)).collect();
+    let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| scalar_from_chunk(c)).collect();
     let direct = Hyrax::commit(&ck.inner, &chunk_fq, &blind.inner, true).unwrap();
     assert_eq!(comm.inner, direct);
   }
@@ -3908,7 +3929,7 @@ mod tests {
       let limbs = limb_split_polynomial(&poly, log_t, log_t_f);
       let chunks = build_chunk_poly(&[&limbs], limbs.len(), log_t);
       let limbs_fq: Vec<t256::Scalar> = limbs.iter().map(biguint_to_scalar).collect();
-      let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| t256::Scalar::from(c)).collect();
+      let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| scalar_from_chunk(c)).collect();
       let d = BatchDims::new(1, limbs.len(), log_t);
       let (fold_pt, alpha) = chunk_fold_point(d.log_stride);
       let nv = limbs.len().trailing_zeros() as usize;
@@ -4839,7 +4860,7 @@ mod tests {
     // polynomial (the committed-chunk layout).
     let limbs = limb_split_polynomial(&poly, 4, 8);
     let chunks = build_chunk_poly(&[&limbs], limbs.len(), 4);
-    let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| t256::Scalar::from(c)).collect();
+    let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| scalar_from_chunk(c)).collect();
     let direct = Hyrax::commit(&ck.inner, &chunk_fq, &blind.inner, true).unwrap();
     assert_eq!(comm.inner, direct);
   }
