@@ -595,6 +595,7 @@ fn gkr_prove_multi<E: Engine>(
 ) -> Result<Vec<GkrOut<E>>, SpartanError> {
   let nt = inputs.len();
   // Build every tree's levels — pure computation, parallel over trees.
+  let (_bl_span, bl_t) = crate::start_span!("gkr_build_levels");
   let mut built: Vec<(Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>, bool)> = inputs
     .into_par_iter()
     .map(|(p, q, ones)| {
@@ -603,6 +604,7 @@ fn gkr_prove_multi<E: Engine>(
       (lp, lq, ones)
     })
     .collect();
+  tracing::info!(elapsed_ms = %bl_t.elapsed().as_millis(), "gkr_build_levels");
   let depths: Vec<usize> = built.iter().map(|(lp, _, _)| lp.len() - 1).collect();
   let max_d = depths.iter().copied().max().unwrap_or(0);
   let cubic = CubicConsts::<E::Scalar>::new();
