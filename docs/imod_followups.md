@@ -929,6 +929,35 @@ data adds ≈ ~110–120 ms of prove. Needs the halo2curves-style
 scheduler (conflict stamps, doubling/cancellation edge cases) — real
 but bounded complexity.
 
+### Lockstep (batched) LogUp-GKR — the MT bottleneck fix, landed (2026-07-23)
+
+The deferred "batch the per-witness GKRs" fix, implemented as a
+**lockstep restructure**: `gkr_prove_multi` absorbs ALL trees' roots
+before any challenge, then advances every still-active tree through
+layers/rounds together — per round, every active tree's round
+polynomial is absorbed before the ONE shared challenge is squeezed.
+Soundness per tree is the single-tree argument verbatim; per-tree proof
+objects are structurally unchanged (only the transcript interleaving
+differs, plus all roots move up front). Trees of different depths all
+start at layer 0 and exit after their own last layer with leaf claims
+at the then-current shared point — so equal-depth trees (the w/q chunk
+trees) now get IDENTICAL leaf points, which the combined batch open
+groups into shared weight passes. Bonus fixes in the same change: the
+leaf denominators `r + w` are built from an incremental table
+(2^16 adds) instead of a Montgomery multiplication per leaf (~55 ms),
+the all-ones numerator leaf tables are never allocated, and the
+verifier computes one eq evaluation per layer instead of one per tree.
+
+Measured (multiswap 2¹³):
+- **Single-thread (criterion): prove 1.47 → 1.37 s (−7%), verify
+  42 → 39.4 ms.** ECDSA 212 → 188.7 ms / 21.8 ms.
+- **Multithreaded (~14 cores): `rc_logup_gkr` 460 → 143 ms (3.2×
+  scaling — the serial per-tree loop capped it at ~1.45×);
+  prove-proper ≈ 530 ms.** ECDSA MT verify 13.5 ms.
+
+The old serial-loop analysis in the "Multi-threading" section above is
+superseded by this change.
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at

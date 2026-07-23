@@ -142,7 +142,12 @@ fn build_levels<E: Engine>(
   q_leaves: Vec<E::Scalar>,
   ones_numerator: bool,
 ) -> (Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>) {
-  let n = p_leaves.len();
+  // With all-ones numerators the leaf `p` table is never read (the leaf
+  // combine uses `q` only, and the leaf layer's sumcheck treats the
+  // numerator MLE as the constant 1), so callers may pass an empty
+  // `p_leaves` to skip the allocation.
+  let n = q_leaves.len();
+  debug_assert!(p_leaves.len() == n || (ones_numerator && p_leaves.is_empty()));
   let d = n.trailing_zeros() as usize;
   let mut levels_p = vec![Vec::new(); d + 1];
   let mut levels_q = vec![Vec::new(); d + 1];
@@ -186,6 +191,97 @@ fn build_levels<E: Engine>(
     levels_q[k] = oq;
   }
   (levels_p, levels_q)
+}
+
+/// One sumcheck round's unweighted integrand sums `(h(0), h(∞))` over the
+/// halved cube, with the Gruen/Dao–Thaler eq-split weights (`lo` block
+/// table, optional `hi` per-block factors, `blk_len` block size). The
+/// integrand is `g = p0·q1 + p1·q0 + λ·q0·q1`; for all-ones leaf
+/// numerators (`leaf_ones`) the `a`-tables are implicit. Shared by the
+/// single-tree and lockstep multi-tree provers.
+#[allow(clippy::too_many_arguments)]
+fn round_h_sums<E: Engine>(
+  a0: &[E::Scalar],
+  a1: &[E::Scalar],
+  b0: &[E::Scalar],
+  b1: &[E::Scalar],
+  leaf_ones: bool,
+  lambda: E::Scalar,
+  lo: &[E::Scalar],
+  hi: &[E::Scalar],
+  blk_len: usize,
+) -> [E::Scalar; 2] {
+  let h = b0.len() / 2;
+  debug_assert_eq!(
+    if hi.is_empty() {
+      blk_len
+    } else {
+      hi.len() * blk_len
+    },
+    h
+  );
+  let g_at = |i: usize| -> [E::Scalar; 2] {
+    let b0d = b0[i + h] - b0[i];
+    let b1d = b1[i + h] - b1[i];
+    if leaf_ones {
+      let g0 = b0[i] + b1[i] + lambda * (b0[i] * b1[i]);
+      let ginf = lambda * (b0d * b1d);
+      return [g0, ginf];
+    }
+    let a0d = a0[i + h] - a0[i];
+    let a1d = a1[i + h] - a1[i];
+    let g0 = a0[i] * b1[i] + a1[i] * b0[i] + lambda * (b0[i] * b1[i]);
+    let ginf = a0d * b1d + a1d * b0d + lambda * (b0d * b1d);
+    [g0, ginf]
+  };
+  let add2 = |mut a: [E::Scalar; 2], b: [E::Scalar; 2]| {
+    a[0] += b[0];
+    a[1] += b[1];
+    a
+  };
+  let block = |bh: usize, hi_w: E::Scalar| -> [E::Scalar; 2] {
+    let base = bh * blk_len;
+    let mut s = [E::Scalar::ZERO; 2];
+    for (il, lw) in lo[..blk_len].iter().enumerate() {
+      let g = g_at(base + il);
+      s[0] += *lw * g[0];
+      s[1] += *lw * g[1];
+    }
+    [hi_w * s[0], hi_w * s[1]]
+  };
+  if hi.is_empty() {
+    block(0, E::Scalar::ONE)
+  } else if h >= PAR_THRESHOLD {
+    (0..hi.len())
+      .into_par_iter()
+      .map(|bh| block(bh, hi[bh]))
+      .reduce(|| [E::Scalar::ZERO; 2], add2)
+  } else {
+    (0..hi.len()).fold([E::Scalar::ZERO; 2], |acc, bh| add2(acc, block(bh, hi[bh])))
+  }
+}
+
+/// Direct evaluation of `h(1)` (the `t = 1` half of the round integrand)
+/// — the negligible-probability fallback when the Gruen prefix factor
+/// isn't invertible.
+fn round_h1_direct<E: Engine>(
+  a0: &[E::Scalar],
+  a1: &[E::Scalar],
+  b0: &[E::Scalar],
+  b1: &[E::Scalar],
+  leaf_ones: bool,
+  lambda: E::Scalar,
+  w_full: &[E::Scalar],
+) -> E::Scalar {
+  let h = b0.len() / 2;
+  (0..h).fold(E::Scalar::ZERO, |s, i| {
+    let g = if leaf_ones {
+      b0[i + h] + b1[i + h] + lambda * (b0[i + h] * b1[i + h])
+    } else {
+      a0[i + h] * b1[i + h] + a1[i + h] * b0[i + h] + lambda * (b0[i + h] * b1[i + h])
+    };
+    s + w_full[i] * g
+  })
 }
 
 /// Prove that `(root_p, root_q)` is the sum of the leaf fractions
@@ -299,47 +395,7 @@ fn gkr_prove<E: Engine>(
         h
       );
 
-      // Unweighted per-index integrand values (g(0), g(∞)).
-      let g_at = |i: usize| -> [E::Scalar; 2] {
-        let b0d = b0[i + h] - b0[i];
-        let b1d = b1[i + h] - b1[i];
-        if leaf_ones {
-          let g0 = b0[i] + b1[i] + lambda * (b0[i] * b1[i]);
-          let ginf = lambda * (b0d * b1d);
-          return [g0, ginf];
-        }
-        let a0d = a0[i + h] - a0[i];
-        let a1d = a1[i + h] - a1[i];
-        let g0 = a0[i] * b1[i] + a1[i] * b0[i] + lambda * (b0[i] * b1[i]);
-        let ginf = a0d * b1d + a1d * b0d + lambda * (b0d * b1d);
-        [g0, ginf]
-      };
-      let add2 = |mut a: [E::Scalar; 2], b: [E::Scalar; 2]| {
-        a[0] += b[0];
-        a[1] += b[1];
-        a
-      };
-      // One lo-weighted block, then the hi factor applied once per block.
-      let block = |bh: usize, hi_w: E::Scalar| -> [E::Scalar; 2] {
-        let base = bh * blk_len;
-        let mut s = [E::Scalar::ZERO; 2];
-        for (il, lw) in lo[..blk_len].iter().enumerate() {
-          let g = g_at(base + il);
-          s[0] += *lw * g[0];
-          s[1] += *lw * g[1];
-        }
-        [hi_w * s[0], hi_w * s[1]]
-      };
-      let [h0, hinf] = if hi.is_empty() {
-        block(0, E::Scalar::ONE)
-      } else if h >= PAR_THRESHOLD {
-        (0..hi.len())
-          .into_par_iter()
-          .map(|bh| block(bh, hi[bh]))
-          .reduce(|| [E::Scalar::ZERO; 2], add2)
-      } else {
-        (0..hi.len()).fold([E::Scalar::ZERO; 2], |acc, bh| add2(acc, block(bh, hi[bh])))
-      };
+      let [h0, hinf] = round_h_sums::<E>(&a0, &a1, &b0, &b1, leaf_ones, lambda, lo, hi, blk_len);
 
       // s(t) = E_pref·E(t)·h(t), E(t) = (1−t)(1−c) + t·c.
       let e0 = e_pref * (E::Scalar::ONE - c);
@@ -356,15 +412,7 @@ fn gkr_prove<E: Engine>(
           } else {
             vec![E::Scalar::ONE]
           };
-          let acc = |i: usize| {
-            let g = if leaf_ones {
-              b0[i + h] + b1[i + h] + lambda * (b0[i + h] * b1[i + h])
-            } else {
-              a0[i + h] * b1[i + h] + a1[i + h] * b0[i + h] + lambda * (b0[i + h] * b1[i + h])
-            };
-            w_full[i] * g
-          };
-          (0..h).fold(E::Scalar::ZERO, |s, i| s + acc(i))
+          round_h1_direct::<E>(&a0, &a1, &b0, &b1, leaf_ones, lambda, &w_full)
         }
       };
       // h(t) = h0 + b·t + c2·t².
@@ -506,6 +554,360 @@ fn gkr_verify<E: Engine>(
   }
 
   Ok((point, claim_p, claim_q))
+}
+
+/// Prove several fraction trees IN LOCKSTEP with shared challenges: all
+/// roots are absorbed before any challenge, then every layer/round
+/// advances all still-active trees together — each round absorbs every
+/// active tree's round polynomial before the ONE shared challenge is
+/// squeezed. Soundness per tree is the single-tree argument verbatim
+/// (its messages are bound before each challenge); the lockstep gives
+/// (a) per-round work that is independent ACROSS trees — the
+/// multithreading unlock the serial per-tree loop lacked, (b) shared
+/// eq/suffix tables and Gruen prefix factors per round, and (c)
+/// identical leaf points for equal-depth trees, whose PCS claims then
+/// share batched-open weight passes. Trees may differ in depth: all
+/// start at layer 0 and a tree exits after its last layer with its leaf
+/// claim at the then-current shared point. Per-tree proof objects are
+/// structurally identical to [`gkr_prove`]'s — only the transcript
+/// interleaving differs.
+fn gkr_prove_multi<E: Engine>(
+  inputs: Vec<(Vec<E::Scalar>, Vec<E::Scalar>, bool)>,
+  transcript: &mut E::TE,
+) -> Result<Vec<GkrOut<E>>, SpartanError> {
+  let nt = inputs.len();
+  // Build every tree's levels — pure computation, parallel over trees.
+  let built: Vec<(Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>, bool)> = inputs
+    .into_par_iter()
+    .map(|(p, q, ones)| {
+      assert!(q.len().is_power_of_two() && !q.is_empty());
+      let (lp, lq) = build_levels::<E>(p, q, ones);
+      (lp, lq, ones)
+    })
+    .collect();
+  let depths: Vec<usize> = built.iter().map(|(lp, _, _)| lp.len() - 1).collect();
+  let max_d = depths.iter().copied().max().unwrap_or(0);
+
+  let root_p_of = |t: usize| -> E::Scalar {
+    if depths[t] == 0 && built[t].0[0].is_empty() {
+      // Single-leaf all-ones tree with the elided `p` table.
+      E::Scalar::ONE
+    } else {
+      built[t].0[0][0]
+    }
+  };
+
+  // Absorb ALL roots before any challenge.
+  for (t, (_, lq, _)) in built.iter().enumerate() {
+    transcript.absorb(b"gkr_root_p", &root_p_of(t));
+    transcript.absorb(b"gkr_root_q", &lq[0][0]);
+  }
+
+  let mut claim_p: Vec<E::Scalar> = (0..nt).map(root_p_of).collect();
+  let mut claim_q: Vec<E::Scalar> = built.iter().map(|(_, lq, _)| lq[0][0]).collect();
+  let mut layers_out: Vec<Vec<GkrLayerProof<E>>> =
+    depths.iter().map(|&d| Vec::with_capacity(d)).collect();
+  let mut leaf_points: Vec<Vec<E::Scalar>> = vec![Vec::new(); nt];
+  let mut point: Vec<E::Scalar> = Vec::new();
+
+  /// Per-active-tree working state for one layer.
+  struct Ls<F> {
+    t: usize,
+    a0: Vec<F>,
+    a1: Vec<F>,
+    b0: Vec<F>,
+    b1: Vec<F>,
+    leaf_ones: bool,
+    claim: F,
+    round_polys: Vec<[F; 4]>,
+  }
+
+  for k in 0..max_d {
+    let lambda = transcript.squeeze(b"gkr_lambda")?;
+    let half = 1usize << k;
+    let mut st: Vec<Ls<E::Scalar>> = Vec::new();
+    for t in 0..nt {
+      if k >= depths[t] {
+        continue;
+      }
+      let (lp, lq, ones) = &built[t];
+      let leaf_ones = *ones && k + 1 == depths[t];
+      let (a0, a1) = if leaf_ones {
+        (Vec::new(), Vec::new())
+      } else {
+        (
+          lp[k + 1][0..half].to_vec(),
+          lp[k + 1][half..2 * half].to_vec(),
+        )
+      };
+      st.push(Ls {
+        t,
+        a0,
+        a1,
+        b0: lq[k + 1][0..half].to_vec(),
+        b1: lq[k + 1][half..2 * half].to_vec(),
+        leaf_ones,
+        claim: claim_p[t] + lambda * claim_q[t],
+        round_polys: Vec::with_capacity(k),
+      });
+    }
+
+    // Shared Gruen/Dao–Thaler machinery (see `gkr_prove` for the
+    // derivation) — the split tables and prefix factors depend only on
+    // the shared point/challenges, so they are built once per round for
+    // ALL trees.
+    let m = k.saturating_sub(7);
+    let lo_tbl: Vec<E::Scalar> = if m < k {
+      EqPolynomial::evals_from_points(&point[m..k])
+    } else {
+      vec![E::Scalar::ONE]
+    };
+    let lo_len = lo_tbl.len();
+    let mut e_pref = E::Scalar::ONE;
+    let mut challenges: Vec<E::Scalar> = Vec::with_capacity(k);
+
+    for round in 0..k {
+      let c = point[round];
+      let (hi_tbl, blk_len) = if round + 1 < m {
+        (
+          EqPolynomial::<E::Scalar>::evals_from_points(&point[round + 1..m]),
+          lo_len,
+        )
+      } else {
+        let direct = if round + 1 < k {
+          EqPolynomial::<E::Scalar>::evals_from_points(&point[round + 1..k])
+        } else {
+          vec![E::Scalar::ONE]
+        };
+        let l = direct.len();
+        (direct, l)
+      };
+      let lo: &[E::Scalar] = if round + 1 < m { &lo_tbl } else { &hi_tbl };
+      let hi: &[E::Scalar] = if round + 1 < m { &hi_tbl } else { &[] };
+
+      let e0c = e_pref * (E::Scalar::ONE - c);
+      let e1c = e_pref * c;
+      let e1_inv = Option::<E::Scalar>::from(e1c.invert());
+      let two = E::Scalar::from(2);
+      let three = E::Scalar::from(3);
+      let e2 = e_pref * (three * c - E::Scalar::ONE);
+      let e3 = e_pref * (E::Scalar::from(5) * c - two);
+
+      // Per-tree round polynomials — independent across trees.
+      let ss: Vec<[E::Scalar; 4]> = st
+        .par_iter()
+        .map(|s| {
+          let [h0, hinf] = round_h_sums::<E>(
+            &s.a0,
+            &s.a1,
+            &s.b0,
+            &s.b1,
+            s.leaf_ones,
+            lambda,
+            lo,
+            hi,
+            blk_len,
+          );
+          let s0 = e0c * h0;
+          let s1 = s.claim - s0;
+          let h1 = match e1_inv {
+            Some(inv) => s1 * inv,
+            None => {
+              let w_full = if round + 1 < k {
+                EqPolynomial::<E::Scalar>::evals_from_points(&point[round + 1..k])
+              } else {
+                vec![E::Scalar::ONE]
+              };
+              round_h1_direct::<E>(&s.a0, &s.a1, &s.b0, &s.b1, s.leaf_ones, lambda, &w_full)
+            }
+          };
+          let c2 = hinf;
+          let bq = h1 - h0 - c2;
+          let h2 = h0 + two * bq + E::Scalar::from(4) * c2;
+          let h3 = h0 + three * bq + E::Scalar::from(9) * c2;
+          [s0, s1, e2 * h2, e3 * h3]
+        })
+        .collect();
+
+      for s in &ss {
+        for v in s {
+          transcript.absorb(b"gkr_rp", v);
+        }
+      }
+      let ri = transcript.squeeze(b"gkr_chal")?;
+      st.par_iter_mut().zip(ss.par_iter()).for_each(|(s, sp)| {
+        if !s.leaf_ones {
+          bind_top(&mut s.a0, ri);
+          bind_top(&mut s.a1, ri);
+        }
+        bind_top(&mut s.b0, ri);
+        bind_top(&mut s.b1, ri);
+        s.claim = eval_cubic::<E::Scalar>(sp, ri);
+        s.round_polys.push(*sp);
+      });
+      e_pref *= (E::Scalar::ONE - c) * (E::Scalar::ONE - ri) + c * ri;
+      challenges.push(ri);
+    }
+
+    // Layer end: absorb every active tree's input-layer evaluations,
+    // then one shared merge challenge.
+    let finals: Vec<(E::Scalar, E::Scalar, E::Scalar, E::Scalar)> = st
+      .iter()
+      .map(|s| {
+        let (p0, p1) = if s.leaf_ones {
+          (E::Scalar::ONE, E::Scalar::ONE)
+        } else {
+          (s.a0[0], s.a1[0])
+        };
+        (p0, p1, s.b0[0], s.b1[0])
+      })
+      .collect();
+    for (p0, p1, q0, q1) in &finals {
+      transcript.absorb(b"gkr_p0", p0);
+      transcript.absorb(b"gkr_p1", p1);
+      transcript.absorb(b"gkr_q0", q0);
+      transcript.absorb(b"gkr_q1", q1);
+    }
+    let cc = transcript.squeeze(b"gkr_c")?;
+    let mut next_point = Vec::with_capacity(k + 1);
+    next_point.push(cc);
+    next_point.extend_from_slice(&challenges);
+    point = next_point;
+
+    for (s, (p0, p1, q0, q1)) in st.into_iter().zip(finals) {
+      let t = s.t;
+      claim_p[t] = (E::Scalar::ONE - cc) * p0 + cc * p1;
+      claim_q[t] = (E::Scalar::ONE - cc) * q0 + cc * q1;
+      layers_out[t].push(GkrLayerProof {
+        round_polys: s.round_polys,
+        p0,
+        p1,
+        q0,
+        q1,
+      });
+      if k + 1 == depths[t] {
+        leaf_points[t] = point.clone();
+      }
+    }
+  }
+
+  Ok(
+    (0..nt)
+      .map(|t| GkrOut {
+        proof: GkrProof {
+          layers: core::mem::take(&mut layers_out[t]),
+        },
+        root_p: root_p_of(t),
+        root_q: built[t].1[0][0],
+        leaf_point: core::mem::take(&mut leaf_points[t]),
+        leaf_p: claim_p[t],
+        leaf_q: claim_q[t],
+      })
+      .collect(),
+  )
+}
+
+/// Verifier mirror of [`gkr_prove_multi`]: walk all trees' proofs in the
+/// same lockstep transcript order, applying exactly the per-tree checks
+/// of [`gkr_verify`]. Returns each tree's `(leaf point, p, q)` claims.
+fn gkr_verify_multi<E: Engine>(
+  roots: &[(E::Scalar, E::Scalar)],
+  depths: &[usize],
+  proofs: &[&GkrProof<E>],
+  transcript: &mut E::TE,
+) -> Result<Vec<(Vec<E::Scalar>, E::Scalar, E::Scalar)>, SpartanError> {
+  let nt = roots.len();
+  if depths.len() != nt || proofs.len() != nt {
+    return Err(SpartanError::ProofVerifyError {
+      reason: "logup-gkr multi: tree count mismatch".to_string(),
+    });
+  }
+  for t in 0..nt {
+    if proofs[t].layers.len() != depths[t] {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: wrong number of layers".to_string(),
+      });
+    }
+    transcript.absorb(b"gkr_root_p", &roots[t].0);
+    transcript.absorb(b"gkr_root_q", &roots[t].1);
+  }
+  let max_d = depths.iter().copied().max().unwrap_or(0);
+
+  let mut claim_p: Vec<E::Scalar> = roots.iter().map(|r| r.0).collect();
+  let mut claim_q: Vec<E::Scalar> = roots.iter().map(|r| r.1).collect();
+  let mut leaf_points: Vec<Vec<E::Scalar>> = vec![Vec::new(); nt];
+  let mut point: Vec<E::Scalar> = Vec::new();
+
+  for k in 0..max_d {
+    let lambda = transcript.squeeze(b"gkr_lambda")?;
+    let active: Vec<usize> = (0..nt).filter(|&t| k < depths[t]).collect();
+    for &t in &active {
+      if proofs[t].layers[k].round_polys.len() != k {
+        return Err(SpartanError::ProofVerifyError {
+          reason: "logup-gkr: wrong round count in layer".to_string(),
+        });
+      }
+    }
+    let mut claims: Vec<E::Scalar> = active
+      .iter()
+      .map(|&t| claim_p[t] + lambda * claim_q[t])
+      .collect();
+    let mut challenges: Vec<E::Scalar> = Vec::with_capacity(k);
+
+    for round in 0..k {
+      for (i, &t) in active.iter().enumerate() {
+        let s = &proofs[t].layers[k].round_polys[round];
+        if s[0] + s[1] != claims[i] {
+          return Err(SpartanError::ProofVerifyError {
+            reason: "logup-gkr: sumcheck round mismatch".to_string(),
+          });
+        }
+        for v in s {
+          transcript.absorb(b"gkr_rp", v);
+        }
+      }
+      let ri = transcript.squeeze(b"gkr_chal")?;
+      for (i, &t) in active.iter().enumerate() {
+        claims[i] = eval_cubic::<E::Scalar>(&proofs[t].layers[k].round_polys[round], ri);
+      }
+      challenges.push(ri);
+    }
+
+    let eq_val = EqPolynomial::new(point.clone()).evaluate(&challenges);
+    for (i, &t) in active.iter().enumerate() {
+      let lp = &proofs[t].layers[k];
+      transcript.absorb(b"gkr_p0", &lp.p0);
+      transcript.absorb(b"gkr_p1", &lp.p1);
+      transcript.absorb(b"gkr_q0", &lp.q0);
+      transcript.absorb(b"gkr_q1", &lp.q1);
+      let gate = lp.p0 * lp.q1 + lp.p1 * lp.q0 + lambda * (lp.q0 * lp.q1);
+      if eq_val * gate != claims[i] {
+        return Err(SpartanError::ProofVerifyError {
+          reason: "logup-gkr: layer gate check failed".to_string(),
+        });
+      }
+    }
+
+    let cc = transcript.squeeze(b"gkr_c")?;
+    let mut next_point = Vec::with_capacity(k + 1);
+    next_point.push(cc);
+    next_point.extend_from_slice(&challenges);
+    point = next_point;
+    for &t in &active {
+      let lp = &proofs[t].layers[k];
+      claim_p[t] = (E::Scalar::ONE - cc) * lp.p0 + cc * lp.p1;
+      claim_q[t] = (E::Scalar::ONE - cc) * lp.q0 + cc * lp.q1;
+      if k + 1 == depths[t] {
+        leaf_points[t] = point.clone();
+      }
+    }
+  }
+
+  Ok(
+    (0..nt)
+      .map(|t| (core::mem::take(&mut leaf_points[t]), claim_p[t], claim_q[t]))
+      .collect(),
+  )
 }
 
 /// Evaluation claims a [`LogUpRangeProof`] reduces to, for the caller to
@@ -788,23 +1190,48 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     transcript.dom_sep(b"logup_multi_range");
     let r = transcript.squeeze(b"logup_r")?;
 
-    // One fraction tree per witness: leaves (1, r + w_b[i]).
+    // Shared denominator table `r + j` for j < 2^bits, built with 2^bits
+    // field ADDS (each `Scalar::from` is a Montgomery multiplication;
+    // the witness trees would otherwise pay one per leaf — millions per
+    // proof).
+    let mut r_plus: Vec<E::Scalar> = Vec::with_capacity(table);
+    let mut acc = r;
+    for _ in 0..table {
+      r_plus.push(acc);
+      acc += E::Scalar::ONE;
+    }
+
+    // One fraction tree per witness — leaves (1, r + w_b[i]), the
+    // all-ones numerator table elided — plus the shared table tree with
+    // leaves (m_j, r + j), all proven IN LOCKSTEP with shared
+    // challenges (see `gkr_prove_multi`; this is what lets the
+    // per-round work parallelize across trees instead of running one
+    // serial GKR per witness).
+    let mut inputs: Vec<(Vec<E::Scalar>, Vec<E::Scalar>, bool)> =
+      Vec::with_capacity(witnesses.len() + 1);
+    for witness in witnesses {
+      let p = if witness.len() > 1 {
+        Vec::new()
+      } else {
+        vec![E::Scalar::ONE]
+      };
+      let q: Vec<E::Scalar> = witness.iter().map(|&w| r_plus[w as usize]).collect();
+      inputs.push((p, q, true));
+    }
+    let p_rhs: Vec<E::Scalar> = mult.iter().map(|&m| E::Scalar::from(m)).collect();
+    let q_rhs = r_plus;
+    inputs.push((p_rhs, q_rhs, false));
+
+    let mut outs = gkr_prove_multi::<E>(inputs, transcript)?;
+    let rhs = outs.pop().expect("table tree present");
     let mut wit_roots = Vec::with_capacity(witnesses.len());
     let mut wit_gkrs = Vec::with_capacity(witnesses.len());
     let mut wit_claims = Vec::with_capacity(witnesses.len());
-    for witness in witnesses {
-      let p = vec![E::Scalar::ONE; witness.len()];
-      let q: Vec<E::Scalar> = witness.iter().map(|&w| r + E::Scalar::from(w)).collect();
-      let out = gkr_prove::<E>(p, q, true, transcript)?;
+    for out in outs {
       wit_roots.push((out.root_p, out.root_q));
       wit_claims.push((out.leaf_point, out.leaf_q - r));
       wit_gkrs.push(out.proof);
     }
-
-    // One shared table tree: leaves (m_j, r + j).
-    let p_rhs: Vec<E::Scalar> = mult.iter().map(|&m| E::Scalar::from(m)).collect();
-    let q_rhs: Vec<E::Scalar> = (0..table).map(|j| r + E::Scalar::from(j as u64)).collect();
-    let rhs = gkr_prove::<E>(p_rhs, q_rhs, false, transcript)?;
 
     let claims = MultiRangeClaims {
       r,
@@ -847,11 +1274,19 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     transcript.dom_sep(b"logup_multi_range");
     let r = transcript.squeeze(b"logup_r")?;
 
+    // Lockstep verification mirroring `gkr_prove_multi`'s transcript
+    // order: witness trees in input order, then the table tree.
+    let mut roots: Vec<(E::Scalar, E::Scalar)> = self.wit_roots.clone();
+    roots.push((self.p_rhs_root, self.q_rhs_root));
+    let mut depths: Vec<usize> = expected_wit_depths.to_vec();
+    depths.push(bits);
+    let mut proofs: Vec<&GkrProof<E>> = self.wit_gkrs.iter().collect();
+    proofs.push(&self.rhs_gkr);
+    let mut leaf_outs = gkr_verify_multi::<E>(&roots, &depths, &proofs, transcript)?;
+
+    let (rhs_point, rhs_p, rhs_q) = leaf_outs.pop().expect("table tree present");
     let mut wit_claims = Vec::with_capacity(self.wit_gkrs.len());
-    for (i, gkr) in self.wit_gkrs.iter().enumerate() {
-      let (root_p, root_q) = self.wit_roots[i];
-      let (point, leaf_p, leaf_q) =
-        gkr_verify::<E>(root_p, root_q, expected_wit_depths[i], gkr, transcript)?;
+    for (i, (point, leaf_p, leaf_q)) in leaf_outs.into_iter().enumerate() {
       // Witness numerators are all 1.
       if leaf_p != E::Scalar::ONE {
         return Err(SpartanError::ProofVerifyError {
@@ -860,14 +1295,6 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
       }
       wit_claims.push((point, leaf_q - r));
     }
-
-    let (rhs_point, rhs_p, rhs_q) = gkr_verify::<E>(
-      self.p_rhs_root,
-      self.q_rhs_root,
-      bits,
-      &self.rhs_gkr,
-      transcript,
-    )?;
     // Table denominators are r + idx(j), checked in closed form.
     if rhs_q != r + idx_mle_eval::<E::Scalar>(&rhs_point) {
       return Err(SpartanError::ProofVerifyError {
