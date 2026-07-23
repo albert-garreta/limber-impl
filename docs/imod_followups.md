@@ -905,11 +905,29 @@ arithmetic floor — see the justification table in
 
 Criterion: multiswap 2¹³ prove **1.87 → 1.71 s (−8.6%)**, verify
 unchanged (42 ms); ECDSA MSM ~flat (226 ms — its MSM share is 8×
-smaller). Zinc+ prove gap now **~1.55×**. Identified-but-deferred
-constant-factor lever: batch-affine bucket accumulation in the MSM
-(Montgomery inversion trick) — the remaining ~110 ns/add is Jacobian
-mixed adds; batch-affine is typically ~2× on the ~750 ms of MSMs, but
-it is an MSM-internals rewrite.
+smaller). Zinc+ prove gap now **~1.55×**.
+
+### Follow-on (2026-07-23): vartime bucket adds in `msm_small_rest`
+
+Microbenchmarks (the `msm_op_cost_microbench` ignored test: mixed-add
+288 ns — throughput-bound, not latency —, base-field mul 16.5 ns,
+inversion 1.2 µs) exposed that `msm_small_rest`'s buckets used the
+COMPLETE projective addition (~17 field ops, 288 ns) while `msm_10`
+already had a vartime mixed-add `Bucket` enum (7M+3S ≈ 165 ns; safe —
+commitment-key generators are never the identity). They also showed the
+witness's chunk sparsity (~44% nonzero: bit columns, padding) means the
+MSM does ~0.9 adds/point, so the per-add constant IS the cost. Swapping
+`msm_small_rest` to the same `Bucket`: `wq_commit` 558 → 384 ms,
+`ab_commit` 103 ms; criterion multiswap prove **1.71 → 1.47 s (−14%)**,
+ECDSA **226 → 212 ms**, verify unchanged. Zinc+ prove gap **~1.33×**.
+
+Remaining MSM lever, quantified by the same microbenches: batch-affine
+bucket accumulation (~6 field ops + amortized 1.2 µs inversion ≈
+~110 ns effective incl. ~12% conflict spill at 255-bucket granularity)
+over the now-165 ns vartime adds → ~1.5× on the ~340 ms of remaining
+data adds ≈ ~110–120 ms of prove. Needs the halo2curves-style
+scheduler (conflict stamps, doubling/cancellation edge cases) — real
+but bounded complexity.
 
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 

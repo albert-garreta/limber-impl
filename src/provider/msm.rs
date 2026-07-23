@@ -537,8 +537,12 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
     let window_sums: Vec<_> = window_starts
       .map(|w_start| {
         let mut res = zero;
-        // We don't need the "zero" bucket, so we only have 2^c - 1 buckets.
-        let mut buckets = vec![zero; (1 << c) - 1];
+        // We don't need the "zero" bucket, so we only have 2^c - 1
+        // buckets. `Bucket` accumulates with vartime mixed addition
+        // (7M+3S) instead of the complete projective addition (~17
+        // field ops) — same trick `msm_10` uses; safe because
+        // commitment-key generators are never the identity.
+        let mut buckets = vec![Bucket::<C>::None; (1 << c) - 1];
         // This clone is cheap, because the iterator contains just a
         // pointer and an index into the original vectors.
         scalars_and_bases_iter.clone().for_each(|(&scalar, base)| {
@@ -562,28 +566,16 @@ fn msm_small_rest<C: CurveAffine, T: Into<u64> + Zero + Copy + Sync>(
             // bucket.
             // (Recall that `buckets` doesn't have a zero bucket.)
             if scalar != 0 {
-              buckets[(scalar - 1) as usize] += base;
+              buckets[(scalar - 1) as usize].add_assign(base);
             }
           }
         });
-
-        // Compute sum_{i in 0..num_buckets} (sum_{j in i..num_buckets} bucket[j])
-        // This is computed below for b buckets, using 2b curve additions.
-        //
-        // We could first normalize `buckets` and then use mixed-addition
-        // here, but that's slower for the kinds of groups we care about
-        // (Short Weierstrass curves and Twisted Edwards curves).
-        // In the case of Short Weierstrass curves,
-        // mixed addition saves ~4 field multiplications per addition.
-        // However normalization (with the inversion batched) takes ~6
-        // field multiplications per element,
-        // hence batch normalization is a slowdown.
 
         // `running_sum` = sum_{j in i..num_buckets} bucket[j],
         // where we iterate backward from i = num_buckets to 0.
         let mut running_sum = C::Curve::identity();
         buckets.into_iter().rev().for_each(|b| {
-          running_sum += &b;
+          running_sum = b.add(running_sum);
           res += &running_sum;
         });
         res
@@ -938,5 +930,68 @@ mod tests {
   fn test_msm_ux() {
     test_msm_ux_with::<pallas::Scalar, pallas::Affine>();
     test_msm_ux_with::<vesta::Scalar, vesta::Affine>();
+  }
+
+  /// Microbenchmark for the curve/field op costs that bound the
+  /// small-scalar MSM (run with --ignored --nocapture, single-thread).
+  #[test]
+  #[ignore]
+  fn msm_op_cost_microbench() {
+    use crate::provider::pt256::t256;
+    use group::Curve as _;
+    use std::time::Instant;
+    type Pt = t256::Point;
+    type Fb = t256::Base;
+
+    let mut rng = rand::rngs::OsRng;
+    let n = 1usize << 14;
+    let pts: Vec<Pt> = (0..n).map(|_| Pt::random(&mut rng)).collect();
+    let mut affs = vec![t256::Affine::default(); n];
+    Pt::batch_normalize(&pts, &mut affs);
+
+    let mut acc = Pt::random(&mut rng);
+    let reps = 64usize;
+    let t0 = Instant::now();
+    for _ in 0..reps {
+      for a in &affs {
+        acc += *a;
+      }
+    }
+    let dt = t0.elapsed().as_nanos() as f64 / (reps * n) as f64;
+    println!("mixed add latency (1 chain): {dt:.1} ns");
+
+    // Throughput: 8 independent accumulator chains, mirroring the ILP
+    // available to bucket accumulation.
+    let mut accs = [acc; 8];
+    let t0 = Instant::now();
+    for _ in 0..reps {
+      for ch in affs.chunks_exact(8) {
+        for (a, ac) in ch.iter().zip(accs.iter_mut()) {
+          *ac += *a;
+        }
+      }
+    }
+    let dt = t0.elapsed().as_nanos() as f64 / (reps * n) as f64;
+    let acc = accs.iter().fold(Pt::identity(), |s, a| s + a);
+    println!("mixed add throughput (8 chains): {dt:.1} ns");
+
+    let xs: Vec<Fb> = (0..n).map(|_| Fb::random(&mut rng)).collect();
+    let mut m = Fb::ONE;
+    let t0 = Instant::now();
+    for _ in 0..(reps * 16) {
+      for x in &xs {
+        m *= *x;
+      }
+    }
+    let dt = t0.elapsed().as_nanos() as f64 / (reps * 16 * n) as f64;
+    println!("base-field mul: {dt:.2} ns (sink {m:?})");
+
+    let t0 = Instant::now();
+    let mut inv_acc = Fb::ONE;
+    for x in xs.iter().take(4096) {
+      inv_acc += x.invert().unwrap();
+    }
+    let dt = t0.elapsed().as_nanos() as f64 / 4096.0;
+    println!("base-field invert: {dt:.0} ns (sink {inv_acc:?} {acc:?})");
   }
 }
