@@ -967,6 +967,19 @@ Remaining GKR gap vs the pure-mult floor (~200 ms) is the level build's
 materialization and bind-write traffic — further reduction needs
 build/round fusion (diminishing returns).
 
+### (k, T) re-sweep after the optimization series (2026-07-23)
+
+The k=9/T=2^64 defaults were tuned when chains cost 224 ms and commits
+~1.5 s; after the series (chains 5× cheaper, commits ~2.3× cheaper,
+`is_small` no longer T-dependent) the sweep was re-run. Result: the
+optimum is ROBUST — T=2^64 still beats T=2^128 (best k=7: 1797 ms vs
+1315), and k=9–11 is now a flat basin within run-to-run noise
+(1.27–1.34 s commit+prove; k≥12 clearly loses as s explodes). Keeping
+k=9: the basin's larger-k end pays s=21–30 chains (bigger proofs, more
+verifier chain work) for ≤3% prove inside the noise band. The
+parameter choice surviving a 2.3× cost-model shift is worth noting in
+the paper.
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at
