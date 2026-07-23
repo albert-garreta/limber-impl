@@ -861,6 +861,26 @@ the range check rebuilds the same u64 chunk vectors for the GKR witness
 trees (~52 ms) — thread them through `RangeBatchInputs` to skip the
 rebuild.
 
+### Follow-on (2026-07-23): fixed-width I256 chain arithmetic
+
+The chain partial evaluations ran on heap `BigInt` (~8.4M mult-adds with
+per-op allocation, plus a full `poly_bigint.clone()` per chain), but the
+Partial Eval Norm bound `2^k·P^k·max(T,P) ≤ (q−P)/2 < 2^255` — the very
+bound `validate()` enforces — guarantees every intermediate fits a
+signed 256-bit word. Added a stack-allocated sign-magnitude `I256`
+(`Copy`, length-aware schoolbook mul, single-word divmod) and a
+fixed-width `integer_partial_evaluate_top_k_i256`; the chain build uses
+it whenever `log_p ≤ 63` (the prime and reduced coordinates then fit
+u64; the `BigInt` path remains as fallback), with a differential test
+against the `BigInt` path on mixed-sign ~190-bit values.
+
+Measured single-thread: `chain_build` 224 → 43 ms (5×); criterion
+multiswap 2¹³ prove **2.03 → 1.87 s (−8%)**, ECDSA MSM 2¹³ **255 →
+227 ms**; verify unchanged; Zinc+ prove gap now **~1.7×**. (The
+reduction's `integer_mle_evaluate` stays `BigInt` — its chi factors are
+full ~128-bit point coordinates over all 18 variables, unbounded by the
+norm bound.)
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at

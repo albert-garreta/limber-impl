@@ -1130,6 +1130,204 @@ fn integer_partial_evaluate_top_k(poly: &[BigInt], r_lower: &[BigUint]) -> Vec<B
     .collect()
 }
 
+/// Signed 256-bit sign-magnitude integer (`Copy`, stack-allocated).
+/// Used by the per-prime chain partial evaluations, whose every
+/// intermediate is bounded by the Partial Evaluation Norm Bound
+/// `2^k · P^k · max(T, P) ≤ (q−P)/2 < 2^255` (enforced by
+/// [`IntEvalParams::validate`]) — so heap `BigInt` arithmetic there is
+/// pure allocation overhead. Overflow is a bug, caught by
+/// `debug_assert`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct I256 {
+  neg: bool,
+  mag: [u64; 4],
+}
+
+impl I256 {
+  const ZERO: Self = I256 {
+    neg: false,
+    mag: [0u64; 4],
+  };
+
+  fn from_u64(v: u64) -> Self {
+    I256 {
+      neg: false,
+      mag: [v, 0, 0, 0],
+    }
+  }
+
+  /// Non-negative value below 2^256.
+  fn from_biguint(v: &BigUint) -> Self {
+    let mut mag = [0u64; 4];
+    for (i, d) in v.iter_u64_digits().enumerate() {
+      assert!(i < 4, "I256::from_biguint: value exceeds 256 bits");
+      mag[i] = d;
+    }
+    I256 { neg: false, mag }
+  }
+
+  fn to_bigint(self) -> BigInt {
+    let mut bytes = [0u8; 32];
+    for (i, w) in self.mag.iter().enumerate() {
+      bytes[8 * i..8 * (i + 1)].copy_from_slice(&w.to_le_bytes());
+    }
+    let m = BigInt::from_bytes_le(Sign::Plus, &bytes);
+    if self.neg { -m } else { m }
+  }
+
+  /// Number of significant limbs (0 for zero).
+  fn limbs(&self) -> usize {
+    4 - self.mag.iter().rev().take_while(|&&w| w == 0).count()
+  }
+
+  fn mag_cmp(a: &[u64; 4], b: &[u64; 4]) -> core::cmp::Ordering {
+    for i in (0..4).rev() {
+      match a[i].cmp(&b[i]) {
+        core::cmp::Ordering::Equal => continue,
+        o => return o,
+      }
+    }
+    core::cmp::Ordering::Equal
+  }
+
+  fn add(self, other: Self) -> Self {
+    if self.neg == other.neg {
+      let mut mag = [0u64; 4];
+      let mut carry = 0u64;
+      for (i, m) in mag.iter_mut().enumerate() {
+        let (s1, c1) = self.mag[i].overflowing_add(other.mag[i]);
+        let (s2, c2) = s1.overflowing_add(carry);
+        *m = s2;
+        carry = u64::from(c1) + u64::from(c2);
+      }
+      debug_assert_eq!(carry, 0, "I256 add overflow");
+      I256 {
+        neg: self.neg && mag != [0u64; 4],
+        mag,
+      }
+    } else {
+      let (pos, neg) = if self.neg {
+        (other, self)
+      } else {
+        (self, other)
+      };
+      let (big, small, out_neg) = match Self::mag_cmp(&pos.mag, &neg.mag) {
+        core::cmp::Ordering::Less => (neg.mag, pos.mag, true),
+        core::cmp::Ordering::Equal => return I256::ZERO,
+        core::cmp::Ordering::Greater => (pos.mag, neg.mag, false),
+      };
+      let mut mag = [0u64; 4];
+      let mut borrow = 0u64;
+      for (i, m) in mag.iter_mut().enumerate() {
+        let (d1, b1) = big[i].overflowing_sub(small[i]);
+        let (d2, b2) = d1.overflowing_sub(borrow);
+        *m = d2;
+        borrow = u64::from(b1) + u64::from(b2);
+      }
+      debug_assert_eq!(borrow, 0);
+      I256 { neg: out_neg, mag }
+    }
+  }
+
+  /// Schoolbook product, length-aware; overflow is a caller bug.
+  fn mul(self, other: Self) -> Self {
+    let la = self.limbs();
+    let lb = other.limbs();
+    if la == 0 || lb == 0 {
+      return I256::ZERO;
+    }
+    let mut wide = [0u64; 8];
+    for i in 0..la {
+      let mut carry: u128 = 0;
+      for j in 0..lb {
+        let t = (self.mag[i] as u128) * (other.mag[j] as u128) + wide[i + j] as u128 + carry;
+        wide[i + j] = t as u64;
+        carry = t >> 64;
+      }
+      wide[i + lb] = (wide[i + lb] as u128 + carry) as u64;
+    }
+    debug_assert!(
+      wide[4..].iter().all(|&w| w == 0),
+      "I256 mul overflow (norm bound violated)"
+    );
+    let mag = [wide[0], wide[1], wide[2], wide[3]];
+    I256 {
+      neg: (self.neg != other.neg) && mag != [0u64; 4],
+      mag,
+    }
+  }
+
+  /// Truncated-toward-zero division by a positive word `d ≤ 2^63`:
+  /// `(q, r)` with `q·d + r = self`, `sign(r) = sign(self)`, `|r| < d`.
+  /// Matches `BigInt`'s `/`+`%` semantics.
+  fn div_rem_u64(self, d: u64) -> (Self, Self) {
+    debug_assert!((1..=(1u64 << 63)).contains(&d));
+    let mut q = [0u64; 4];
+    let mut rem: u128 = 0;
+    for i in (0..4).rev() {
+      let cur = (rem << 64) | self.mag[i] as u128;
+      q[i] = (cur / d as u128) as u64;
+      rem = cur % d as u128;
+    }
+    (
+      I256 {
+        neg: self.neg && q != [0u64; 4],
+        mag: q,
+      },
+      I256 {
+        neg: self.neg && rem != 0,
+        mag: [rem as u64, 0, 0, 0],
+      },
+    )
+  }
+}
+
+/// Fixed-width mirror of [`integer_partial_evaluate_top_k`]: bind the
+/// LAST `k` variables of `poly` at `r_lower` over ℤ, with all values and
+/// intermediates in signed 256-bit range (guaranteed by the Partial
+/// Evaluation Norm Bound). Requires every `r_lower[i] < 2^64` (the
+/// `log_p ≤ 63` fast-path gate).
+fn integer_partial_evaluate_top_k_i256(poly: &[I256], r_lower: &[u64]) -> Vec<I256> {
+  let k = r_lower.len();
+  let two_k = 1usize << k;
+  assert!(poly.len().is_multiple_of(two_k));
+  let new_size = poly.len() / two_k;
+
+  // chi(r_lower, y) over ℤ; variable i ↔ bit (k−1−i) of y, matching the
+  // BigInt path. The bit-0 factor is `1 − r` (negative for r ≥ 2).
+  let chi_table: Vec<I256> = (0..two_k)
+    .map(|y| {
+      let mut chi = I256::from_u64(1);
+      for (i, &ri) in r_lower.iter().enumerate().take(k) {
+        let bit = (y >> (k - 1 - i)) & 1;
+        let factor = if bit == 1 {
+          I256::from_u64(ri)
+        } else if ri == 0 {
+          I256::from_u64(1)
+        } else {
+          I256 {
+            neg: ri > 1,
+            mag: [ri - 1, 0, 0, 0],
+          }
+        };
+        chi = chi.mul(factor);
+      }
+      chi
+    })
+    .collect();
+
+  (0..new_size)
+    .into_par_iter()
+    .map(|x| {
+      let mut slot = I256::ZERO;
+      for (y, chi_y) in chi_table.iter().enumerate().take(two_k) {
+        slot = slot.add(poly[x * two_k + y].mul(*chi_y));
+      }
+      slot
+    })
+    .collect()
+}
+
 /// Compute the signed integer MLE evaluation `sum_k chi_int(k, point) ·
 /// poly[k]`, where `chi_int(k, point) = prod_i (k_i · point_i + (1-k_i) ·
 /// (1-point_i))` over Z (no reduction). Returns the full integer.
@@ -1727,7 +1925,19 @@ fn prove_one_poly(
 
   // Phase 1: per prime, sample p_i, run all t iterations (if any).
   let (_p1_span, p1_t) = start_span!("imod_pcs_chain_phase1");
-  let poly_bigint: Vec<BigInt> = if with_iter {
+  // Fast path: with `log_p ≤ 63` every chain intermediate fits signed
+  // 256 bits (the Partial Eval Norm bound), the prime and the reduced
+  // point coordinates fit u64, and the whole partial-eval/divmod loop
+  // runs on stack-allocated `I256` instead of heap `BigInt`. The
+  // shared read-only `poly_i256` also replaces the per-chain
+  // `poly_bigint.clone()`.
+  let fast = params.log_p <= 63;
+  let poly_i256: Vec<I256> = if with_iter && fast {
+    poly.par_iter().map(I256::from_biguint).collect()
+  } else {
+    Vec::new()
+  };
+  let poly_bigint: Vec<BigInt> = if with_iter && !fast {
     poly.par_iter().map(|x| BigInt::from(x.clone())).collect()
   } else {
     Vec::new()
@@ -1749,25 +1959,54 @@ fn prove_one_poly(
         let n = num_vars;
         let k = params.k;
         let d_big = BigInt::from(p_i.clone());
+        let p_u64 = if fast {
+          p_i.iter_u64_digits().next().expect("prime is nonzero")
+        } else {
+          0
+        };
         let s_a = BigInt::from(shift_a(params));
         let s_b = BigInt::from(shift_b(params));
 
-        let mut a_prev_int: Vec<BigInt> = poly_bigint.clone();
+        let mut a_prev_int: Vec<BigInt> = Vec::new();
+        let mut a_prev_i256: Vec<I256> = Vec::new();
 
         for j in 1..=t {
           let lo = n - j * k;
           let hi = n - (j - 1) * k;
           let r_lower = &r_i_int[lo..hi];
 
-          let g_j_int = integer_partial_evaluate_top_k(&a_prev_int, r_lower);
-          let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = g_j_int
-            .iter()
-            .map(|g| {
-              let q = g / &d_big;
-              let r = g - &q * &d_big;
-              (q, r)
-            })
-            .unzip();
+          let (b_j_int, a_j_int): (Vec<BigInt>, Vec<BigInt>) = if fast {
+            let src: &[I256] = if j == 1 { &poly_i256 } else { &a_prev_i256 };
+            let r_lower_u64: Vec<u64> = r_lower
+              .iter()
+              .map(|x| x.iter_u64_digits().next().unwrap_or(0))
+              .collect();
+            let g_j = integer_partial_evaluate_top_k_i256(src, &r_lower_u64);
+            let mut b_j = Vec::with_capacity(g_j.len());
+            let mut a_j = Vec::with_capacity(g_j.len());
+            let mut a_next = Vec::with_capacity(g_j.len());
+            for g in g_j {
+              let (q, r) = g.div_rem_u64(p_u64);
+              b_j.push(q.to_bigint());
+              a_j.push(r.to_bigint());
+              a_next.push(r);
+            }
+            a_prev_i256 = a_next;
+            (b_j, a_j)
+          } else {
+            let src: &[BigInt] = if j == 1 { &poly_bigint } else { &a_prev_int };
+            let g_j_int = integer_partial_evaluate_top_k(src, r_lower);
+            let (b_j, a_j): (Vec<BigInt>, Vec<BigInt>) = g_j_int
+              .iter()
+              .map(|g| {
+                let q = g / &d_big;
+                let r = g - &q * &d_big;
+                (q, r)
+              })
+              .unzip();
+            a_prev_int = a_j.clone();
+            (b_j, a_j)
+          };
 
           let a_j_shifted: Vec<BigUint> = a_j_int
             .iter()
@@ -1789,8 +2028,6 @@ fn prove_one_poly(
             b_shifted: b_j_shifted,
             b_shifted_fq: b_j_shifted_fq,
           });
-
-          a_prev_int = a_j_int;
         }
       }
 
@@ -3684,6 +3921,54 @@ mod tests {
         alpha * mle_evaluate_fq(&limbs_fq, &z),
         "fold identity failed for log_t={log_t}, log_t_f={log_t_f}"
       );
+    }
+  }
+
+  /// The fixed-width chain arithmetic (`I256` partial eval + divmod)
+  /// agrees with the `BigInt` path on mixed-sign, wide (≈190-bit)
+  /// values — the layer-1 (non-negative limbs) and layer-≥2 (signed
+  /// remainders) shapes both included.
+  #[test]
+  fn i256_partial_eval_matches_bigint_path() {
+    let k = 3usize;
+    let n = 1usize << 7;
+    let p: u64 = 1_048_573; // 20-bit prime
+    let poly_int: Vec<BigInt> = (0..n)
+      .map(|i| {
+        let base = (BigInt::from(0x9e3779b97f4a7c15u64) << (i % 120)) + BigInt::from(i);
+        if i % 3 == 0 { -base } else { base }
+      })
+      .collect();
+    let r: Vec<BigUint> = (0..k)
+      .map(|i| BigUint::from((0xACE1u64 * (i as u64 + 7)) % p))
+      .collect();
+
+    let expect = integer_partial_evaluate_top_k(&poly_int, &r);
+
+    let poly_i256: Vec<I256> = poly_int
+      .iter()
+      .map(|v| {
+        let mut x = I256::from_biguint(v.magnitude());
+        x.neg = v.sign() == Sign::Minus && !x.mag.iter().all(|&w| w == 0);
+        x
+      })
+      .collect();
+    let r_u64: Vec<u64> = r
+      .iter()
+      .map(|x| x.iter_u64_digits().next().unwrap_or(0))
+      .collect();
+    let got = integer_partial_evaluate_top_k_i256(&poly_i256, &r_u64);
+
+    assert_eq!(expect.len(), got.len());
+    let d_big = BigInt::from(p);
+    for (e, g) in expect.iter().zip(got.iter()) {
+      assert_eq!(*e, g.to_bigint(), "partial eval mismatch");
+      // Divmod agreement (truncated toward zero, sign(r) = sign(g)).
+      let (q, rem) = g.div_rem_u64(p);
+      let q_big = e / &d_big;
+      let rem_big = e - &q_big * &d_big;
+      assert_eq!(q.to_bigint(), q_big, "quotient mismatch");
+      assert_eq!(rem.to_bigint(), rem_big, "remainder mismatch");
     }
   }
 
