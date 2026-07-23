@@ -958,6 +958,15 @@ Measured (multiswap 2¹³):
 The old serial-loop analysis in the "Multi-threading" section above is
 superseded by this change.
 
+Follow-on memory pass (same day): layer tables MOVE out of the level
+build (`mem::take` + `split_off`) instead of two full copies each, and
+`eval_cubic`'s two per-call field inversions (~2.4 µs × ~1500 calls on
+EACH side) hoisted into per-walk constants. ST prove 1.37 → 1.36 s,
+GKR span 460 → 427 ms, MT GKR 143 → 126 ms, verify 39.4 → 38.4 ms.
+Remaining GKR gap vs the pure-mult floor (~200 ms) is the level build's
+materialization and bind-write traffic — further reduction needs
+build/round fusion (diminishing returns).
+
 ## T (limb/norm bound) coverage — complete grid (2026-07-14)
 
 Closing the "is T=2^64 optimal everywhere?" question with measurements at

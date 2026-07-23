@@ -183,7 +183,7 @@ The witness commitment now IS the range check's 16-bit chunk commitment
 
 | | prove | verify | proof |
 |---|---|---|---|
-| Ours (multiswap 2¹³, chunked commit) | **1.37 s** | **39.4 ms** | ~KB |
+| Ours (multiswap 2¹³, chunked commit) | **1.36 s** | **38.4 ms** | ~KB |
 | Zinc+ (MulModN 2¹³) | 1.10 s | 483 ms | 1.21 MB |
 | ratio | ~1.25× them | **~12× us** | ~1000× us |
 
@@ -203,7 +203,7 @@ the 4.35 s table above for the current code):
 | component | time | share of 1.37 s | justification (per-op model) |
 |---|---|---|---|
 | `wq_commit` (16-bit chunk MSM, the only witness commit) | 377 ms | ~28% | 2·2²⁰ points × ~0.9 actual adds/point (witness sparsity) at ~165 ns vartime mixed add; next ~1.5× needs batch-affine adds |
-| `rc_logup_gkr` (lockstep multi-tree) | 460 ms | ~34% | ~2.4M fraction-tree leaves × ~4–5 field mults at ~40 ns — field-mult floor; lever is batched GKR, not constants |
+| `rc_logup_gkr` (lockstep multi-tree) | 427 ms | ~31% | ~2.4M fraction-tree leaves × ~4–5 field mults at ~40 ns — field-mult floor; lever is batched GKR, not constants |
 | combined batch open | 304 ms | ~18% | weight build ≈ 2 eq-passes/target (~6M fused mul-adds) + sumcheck ≈ 4 mults/element over 2.45M elements — matches mult floor |
 | `ab_commit` (per-layer `a`/`b` chunk MSMs) | 100 ms | ~7% | ~300k-point MSMs + chunk builds, same MSM constant |
 | reduction (limb split + casts + integer eval + sumcheck) | ~91 ms | ~5% | format conversions at ~1 Montgomery mul/element over 2¹⁹ limbs ×3 domains; `int_v'` must stay `BigInt` (multi-thousand-bit) |
@@ -215,5 +215,5 @@ Verify 42 ms: batch-open verification ~28 ms (~67%), range-check verify
 (~34%) — the honest size of the Mod-PCS-over-Brakedown lever (projects
 prove toward ~1.0 s, i.e. Zinc+ parity); batch-affine MSM internals
 (~110–120 ms more) is the in-place alternative. The GKR is now lockstep-batched:
-multithreaded it scales 3.2× (143 ms), and multithreaded prove-proper
-is ~530 ms total.
+multithreaded it scales 3.4× (126 ms), and multithreaded prove-proper
+is ~520 ms total.

@@ -74,19 +74,35 @@ fn bind_top<F: PrimeField>(v: &mut Vec<F>, r: F) {
   v.truncate(h);
 }
 
+/// Precomputed constants for [`eval_cubic`] — the two field inversions
+/// cost ~2.4 µs per call, and provers/verifiers evaluate thousands of
+/// round polynomials per proof; build once per GKR walk.
+#[derive(Clone, Copy)]
+struct CubicConsts<F> {
+  inv2: F,
+  inv6: F,
+}
+
+impl<F: PrimeField> CubicConsts<F> {
+  fn new() -> Self {
+    Self {
+      inv2: F::from(2).invert().expect("2 invertible"),
+      inv6: F::from(6).invert().expect("6 invertible"),
+    }
+  }
+}
+
 /// Evaluate a degree-3 univariate at `r` from its evaluations at `0,1,2,3`
 /// via Lagrange interpolation.
-fn eval_cubic<F: PrimeField>(e: &[F; 4], r: F) -> F {
-  let inv2 = F::from(2).invert().expect("2 invertible");
-  let inv6 = F::from(6).invert().expect("6 invertible");
+fn eval_cubic_with<F: PrimeField>(cc: &CubicConsts<F>, e: &[F; 4], r: F) -> F {
   let r1 = r - F::ONE;
   let r2 = r - F::from(2);
   let r3 = r - F::from(3);
   // Lagrange basis at nodes {0,1,2,3}.
-  let l0 = r1 * r2 * r3 * (-inv6);
-  let l1 = r * r2 * r3 * inv2;
-  let l2 = r * r1 * r3 * (-inv2);
-  let l3 = r * r1 * r2 * inv6;
+  let l0 = r1 * r2 * r3 * (-cc.inv6);
+  let l1 = r * r2 * r3 * cc.inv2;
+  let l2 = r * r1 * r3 * (-cc.inv2);
+  let l3 = r * r1 * r2 * cc.inv6;
   e[0] * l0 + e[1] * l1 + e[2] * l2 + e[3] * l3
 }
 
@@ -297,6 +313,7 @@ fn gkr_prove<E: Engine>(
   assert!(n.is_power_of_two() && n == q_leaves.len() && n >= 1);
   let d = n.trailing_zeros() as usize;
   let (levels_p, levels_q) = build_levels::<E>(p_leaves, q_leaves, ones_numerator);
+  let cubic = CubicConsts::<E::Scalar>::new();
 
   let root_p = levels_p[0][0];
   let root_q = levels_q[0][0];
@@ -436,7 +453,7 @@ fn gkr_prove<E: Engine>(
       }
       bind_top(&mut b0, ri);
       bind_top(&mut b1, ri);
-      claim = eval_cubic::<E::Scalar>(&s, ri);
+      claim = eval_cubic_with(&cubic, &s, ri);
       e_pref *= (E::Scalar::ONE - c) * (E::Scalar::ONE - ri) + c * ri;
       round_polys.push(s);
       challenges.push(ri);
@@ -499,6 +516,7 @@ fn gkr_verify<E: Engine>(
   transcript.absorb(b"gkr_root_p", &root_p);
   transcript.absorb(b"gkr_root_q", &root_q);
 
+  let cubic = CubicConsts::<E::Scalar>::new();
   let mut point: Vec<E::Scalar> = Vec::new();
   let mut claim_p = root_p;
   let mut claim_q = root_q;
@@ -525,7 +543,7 @@ fn gkr_verify<E: Engine>(
         transcript.absorb(b"gkr_rp", v);
       }
       let ri = transcript.squeeze(b"gkr_chal")?;
-      claim = eval_cubic::<E::Scalar>(s, ri);
+      claim = eval_cubic_with(&cubic, s, ri);
       challenges.push(ri);
     }
 
@@ -577,7 +595,7 @@ fn gkr_prove_multi<E: Engine>(
 ) -> Result<Vec<GkrOut<E>>, SpartanError> {
   let nt = inputs.len();
   // Build every tree's levels — pure computation, parallel over trees.
-  let built: Vec<(Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>, bool)> = inputs
+  let mut built: Vec<(Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>, bool)> = inputs
     .into_par_iter()
     .map(|(p, q, ones)| {
       assert!(q.len().is_power_of_two() && !q.is_empty());
@@ -587,24 +605,29 @@ fn gkr_prove_multi<E: Engine>(
     .collect();
   let depths: Vec<usize> = built.iter().map(|(lp, _, _)| lp.len() - 1).collect();
   let max_d = depths.iter().copied().max().unwrap_or(0);
+  let cubic = CubicConsts::<E::Scalar>::new();
 
-  let root_p_of = |t: usize| -> E::Scalar {
-    if depths[t] == 0 && built[t].0[0].is_empty() {
-      // Single-leaf all-ones tree with the elided `p` table.
-      E::Scalar::ONE
-    } else {
-      built[t].0[0][0]
-    }
-  };
+  let roots: Vec<(E::Scalar, E::Scalar)> = built
+    .iter()
+    .map(|(lp, lq, _)| {
+      // Single-leaf all-ones trees elide the `p` table entirely.
+      let rp = if lp[0].is_empty() {
+        E::Scalar::ONE
+      } else {
+        lp[0][0]
+      };
+      (rp, lq[0][0])
+    })
+    .collect();
 
   // Absorb ALL roots before any challenge.
-  for (t, (_, lq, _)) in built.iter().enumerate() {
-    transcript.absorb(b"gkr_root_p", &root_p_of(t));
-    transcript.absorb(b"gkr_root_q", &lq[0][0]);
+  for (rp, rq) in &roots {
+    transcript.absorb(b"gkr_root_p", rp);
+    transcript.absorb(b"gkr_root_q", rq);
   }
 
-  let mut claim_p: Vec<E::Scalar> = (0..nt).map(root_p_of).collect();
-  let mut claim_q: Vec<E::Scalar> = built.iter().map(|(_, lq, _)| lq[0][0]).collect();
+  let mut claim_p: Vec<E::Scalar> = roots.iter().map(|r| r.0).collect();
+  let mut claim_q: Vec<E::Scalar> = roots.iter().map(|r| r.1).collect();
   let mut layers_out: Vec<Vec<GkrLayerProof<E>>> =
     depths.iter().map(|&d| Vec::with_capacity(d)).collect();
   let mut leaf_points: Vec<Vec<E::Scalar>> = vec![Vec::new(); nt];
@@ -630,22 +653,26 @@ fn gkr_prove_multi<E: Engine>(
       if k >= depths[t] {
         continue;
       }
-      let (lp, lq, ones) = &built[t];
+      let (lp, lq, ones) = &mut built[t];
       let leaf_ones = *ones && k + 1 == depths[t];
+      // Each level is read by exactly one layer, so MOVE it out of the
+      // build instead of copying (`split_off` pays one half-copy; the
+      // old `to_vec` pair paid two full ones).
       let (a0, a1) = if leaf_ones {
         (Vec::new(), Vec::new())
       } else {
-        (
-          lp[k + 1][0..half].to_vec(),
-          lp[k + 1][half..2 * half].to_vec(),
-        )
+        let mut v = core::mem::take(&mut lp[k + 1]);
+        let a1 = v.split_off(half);
+        (v, a1)
       };
+      let mut qv = core::mem::take(&mut lq[k + 1]);
+      let b1 = qv.split_off(half);
       st.push(Ls {
         t,
         a0,
         a1,
-        b0: lq[k + 1][0..half].to_vec(),
-        b1: lq[k + 1][half..2 * half].to_vec(),
+        b0: qv,
+        b1,
         leaf_ones,
         claim: claim_p[t] + lambda * claim_q[t],
         round_polys: Vec::with_capacity(k),
@@ -742,7 +769,7 @@ fn gkr_prove_multi<E: Engine>(
         }
         bind_top(&mut s.b0, ri);
         bind_top(&mut s.b1, ri);
-        s.claim = eval_cubic::<E::Scalar>(sp, ri);
+        s.claim = eval_cubic_with(&cubic, sp, ri);
         s.round_polys.push(*sp);
       });
       e_pref *= (E::Scalar::ONE - c) * (E::Scalar::ONE - ri) + c * ri;
@@ -797,8 +824,8 @@ fn gkr_prove_multi<E: Engine>(
         proof: GkrProof {
           layers: core::mem::take(&mut layers_out[t]),
         },
-        root_p: root_p_of(t),
-        root_q: built[t].1[0][0],
+        root_p: roots[t].0,
+        root_q: roots[t].1,
         leaf_point: core::mem::take(&mut leaf_points[t]),
         leaf_p: claim_p[t],
         leaf_q: claim_q[t],
@@ -832,6 +859,7 @@ fn gkr_verify_multi<E: Engine>(
     transcript.absorb(b"gkr_root_q", &roots[t].1);
   }
   let max_d = depths.iter().copied().max().unwrap_or(0);
+  let cubic = CubicConsts::<E::Scalar>::new();
 
   let mut claim_p: Vec<E::Scalar> = roots.iter().map(|r| r.0).collect();
   let mut claim_q: Vec<E::Scalar> = roots.iter().map(|r| r.1).collect();
@@ -868,7 +896,7 @@ fn gkr_verify_multi<E: Engine>(
       }
       let ri = transcript.squeeze(b"gkr_chal")?;
       for (i, &t) in active.iter().enumerate() {
-        claims[i] = eval_cubic::<E::Scalar>(&proofs[t].layers[k].round_polys[round], ri);
+        claims[i] = eval_cubic_with(&cubic, &proofs[t].layers[k].round_polys[round], ri);
       }
       challenges.push(ri);
     }
