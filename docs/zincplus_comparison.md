@@ -183,13 +183,20 @@ The witness commitment now IS the range check's 16-bit chunk commitment
 
 | | prove | verify | proof |
 |---|---|---|---|
-| Ours (multiswap 2¹³, chunked commit) | **1.36 s** | **38.4 ms** | ~KB |
-| Zinc+ (MulModN 2¹³) | 1.10 s | 483 ms | 1.21 MB |
-| ratio | ~1.25× them | **~12× us** | ~1000× us |
+| Ours (multiswap 2¹³, chunked commit) | **1.36 s** (1.46 throttled) | **38.4 ms** | ~KB |
+| Zinc+ (MulModN 2¹³, re-measured) | 1.10 s (1.20 throttled) | 510 ms | 1.21 MB zstd (4.76 MB raw) |
+| ratio | **~1.22–1.25× them** | **~12× us** | ~1000× us |
 
-ECDSA MSM: 189 ms / 21.8 ms — Zinc+ gap ~8× (their native-q=p
-specialization). Cumulative since the 4.35 s starting point: −69% prove
-with verify/proof-size wins intact. (1.37 s reflects seven rounds:
+**Same-hour pairing (2026-07-23):** both sides re-measured back-to-back
+on the same machine state after the full optimization series: ours
+1.46 s / 41.6 ms, Zinc+ 1.20 s / 510 ms. Both run ~+8% slower on a
+thermally loaded machine (sustained benchmarking lowers single-core
+boost clocks) versus their rested-machine numbers (1.36 s / 1.10 s) —
+two independent codebases drifting by the same factor at the same time
+is the signature of DVFS, not code. The RATIO is the stable quantity — ~1.22–1.25× prove under either
+condition. ECDSA MSM: 189 ms / 21.8 ms — Zinc+ gap ~8× (their
+native-q=p specialization). Cumulative since the 4.35 s starting
+point: −69% prove with verify/proof-size wins intact. (1.37 s reflects seven rounds:
 chunked witness commit 3.11→2.43 s, the limb-split/scalar-cast rewrite
 →2.13 s, the a/b chunk-only layer commitments →2.03 s, fixed-width I256
 chain arithmetic →1.87 s, the MSM-window/chunk-build/scalar-table
