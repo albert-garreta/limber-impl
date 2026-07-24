@@ -45,7 +45,7 @@ all-real (1.0956 s vs ~1.07 s): **their prover cost is padded-size-dominated**
 | workload | size | prove | verify | proof |
 |---|---|---|---|---|
 | ECDSA MSM (256-bit, 4599 rows) | 2¹³ | 559 ms | 44 ms | ~KB |
-| Multiswap k=0 (2048-bit, ~5028 real rows) | 2¹³ | 4.35 s¹ | 71 ms | ~KB |
+| Multiswap k=0 (2048-bit, 4831 real rows) | 2¹³ | 4.35 s¹ | 71 ms | ~KB |
 
 ¹ full pipeline = witness-gen (4.7 ms) + witness commit (813 ms) + prove-proper
 (~3.6 ms span). vs paper 𝔽_p emulation ≈ **10,152,845 constraints** → 8192 imod
