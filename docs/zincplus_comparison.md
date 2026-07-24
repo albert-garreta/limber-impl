@@ -183,9 +183,12 @@ The witness commitment now IS the range check's 16-bit chunk commitment
 
 | | prove | verify | proof |
 |---|---|---|---|
-| Ours (multiswap 2¹³, chunked commit) | **1.36 s** (1.46 throttled) | **38.4 ms** | ~KB |
-| Zinc+ (MulModN 2¹³, re-measured) | 1.10 s (1.20 throttled) | 510 ms | 1.21 MB zstd (4.76 MB raw) |
-| ratio | **~1.22–1.25× them** | **~12× us** | ~1000× us |
+| Ours (multiswap 2¹³, chunked commit) | **1.34 s** (1.46 throttled) | **37.9 ms** | ~KB |
+| Zinc+ (MulModN 2¹³, re-measured) | **1.13 s** (1.20 throttled) | 482 ms | 1.21 MB zstd (4.76 MB raw) |
+| ratio | **~1.19–1.22× them** | **~13× us** | ~1000× us |
+
+Official cold-machine pair (2026-07-24, rested machine, back-to-back):
+ours 1.344 s / 37.9 ms; Zinc+ 1.131 s / 482 ms — **prove ratio 1.19×**.
 
 **Same-hour pairing (2026-07-23):** both sides re-measured back-to-back
 on the same machine state after the full optimization series: ours
