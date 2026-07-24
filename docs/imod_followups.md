@@ -967,6 +967,22 @@ Remaining GKR gap vs the pure-mult floor (~200 ms) is the level build's
 materialization and bind-write traffic — further reduction needs
 build/round fusion (diminishing returns).
 
+### Regenerated fig:nativeoverhead — post-campaign (2026-07-24)
+
+Fresh single-threaded criterion pairs (rested machine) after the full
+optimization series — every point now BEATS the paper's original ~9×
+claim, and the super-linear 2¹⁴ anomaly is largely gone:
+
+| cons | imod prove | native prove | overhead (was) | imod verify | native verify |
+|---|---|---|---|---|---|
+| 2^10 | 117.9 ms | 18.7 ms | **6.3×** (10.8×) | 25.8 ms | 14.4 ms |
+| 2^12 | 257.6 ms | 44.6 ms | **5.8×** (12.5×) | 29.1 ms | 14.8 ms |
+| 2^14 | 786.8 ms | 95.0 ms | **8.3×** (21.1×) | 33.1 ms | 16.7 ms |
+
+Verify overhead ~1.8–2.0×. The `e9e9be5` recovery chase is moot: main
+now exceeds the lost version's figures. `docs/plots/*` regenerated from
+this data (annotations 6.3×/5.8×/8.3×).
+
 ### (k, T) re-sweep after the optimization series (2026-07-23)
 
 The k=9/T=2^64 defaults were tuned when chains cost 224 ms and commits
