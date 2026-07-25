@@ -21,6 +21,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRITERION = os.path.join(ROOT, "target", "criterion")
@@ -105,7 +106,19 @@ def plot_phase(phase: str, title: str, outname: str) -> bool:
 
     ax.set_xlabel("Constraints")
     ax.set_ylabel(f"{title} time (ms)")
-    ax.set_yscale("log")
+    # Log only when the data genuinely spans decades; otherwise a linear
+    # axis from zero (a narrow log range yields unreadable ticks like
+    # 3x10^1).
+    all_y = [est[0] for pts in data.values() for est in pts.values()]
+    if max(all_y) / min(all_y) >= 4:
+        ax.set_yscale("log")
+        lo, hi = min(all_y) / 1.25, max(all_y) * 1.3
+        ticks = [c * 10**k for k in range(0, 7) for c in (1, 2, 5) if lo <= c * 10**k <= hi]
+        ax.yaxis.set_major_locator(mticker.FixedLocator(ticks))
+        ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+        ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+    else:
+        ax.set_ylim(bottom=0)
     ax.set_xticks(SIZES)
     ax.set_xticklabels([f"$2^{{{lc}}}$" for lc in SIZES])
     ax.grid(True, which="both", linewidth=0.3, alpha=0.4)
@@ -203,13 +216,23 @@ def emit_pgfplots(phase: str, title: str, outname: str) -> bool:
     # narrow log ranges.
     all_y = [est[0] for pts in series.values() for _, est in pts]
     lo, hi = min(all_y) / 1.25, max(all_y) * 1.3
-    yticks = [
-        c * 10**k
-        for k in range(0, 7)
-        for c in (1, 2, 5)
-        if lo <= c * 10**k <= hi
-    ]
-    ytick_list = ",".join(str(t) for t in yticks)
+    if max(all_y) / min(all_y) >= 4:
+        yticks = [
+            c * 10**k
+            for k in range(0, 7)
+            for c in (1, 2, 5)
+            if lo <= c * 10**k <= hi
+        ]
+        ytick_list = ",".join(str(t) for t in yticks)
+        yaxis_opts = (
+            "    ymode=log,\n"
+            f"    ytick={{{ytick_list}}}, log ticks with fixed point,\n"
+        )
+    else:
+        step = 10
+        top = int(hi // step + 1) * step
+        lin_ticks = ",".join(str(t) for t in range(0, top + 1, step))
+        yaxis_opts = f"    ymin=0,\n    ytick={{{lin_ticks}}},\n"
 
     imod = dict(series["IntMod-Spartan"])
     base = dict(series["Spartan (native baseline)"])
@@ -235,9 +258,8 @@ def emit_pgfplots(phase: str, title: str, outname: str) -> bool:
         "\\begin{tikzpicture}\n"
         "  \\begin{axis}[\n"
         "    width=0.95\\linewidth, height=5.2cm,\n"
-        "    ymode=log,\n"
-        f"    xtick={{{ticks}}}, xticklabels={{{ticklabels}}},\n"
-        f"    ytick={{{ytick_list}}}, log ticks with fixed point,\n"
+        + yaxis_opts
+        + f"    xtick={{{ticks}}}, xticklabels={{{ticklabels}}},\n"
         "    xlabel={Constraints}, ylabel={" + title + " time (ms)},\n"
         "    grid=both, grid style={gray!20},\n"
         "    % legend above the axes so it never occludes either series\n"

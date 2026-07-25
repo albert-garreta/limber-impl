@@ -5,9 +5,9 @@
 \begin{tikzpicture}
   \begin{axis}[
     width=0.95\linewidth, height=5.2cm,
-    ymode=log,
+    ymin=0,
+    ytick={0,10,20,30,40,50},
     xtick={10,12,14}, xticklabels={$2^{10}$,$2^{12}$,$2^{14}$},
-    ytick={20}, log ticks with fixed point,
     xlabel={Constraints}, ylabel={Verifier time (ms)},
     grid=both, grid style={gray!20},
     % legend above the axes so it never occludes either series
