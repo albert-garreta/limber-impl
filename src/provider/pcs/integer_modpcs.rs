@@ -28,7 +28,7 @@
 //! `s` independent primes implies the integer evaluation is correct
 //! with high probability.
 
-use crate::provider::pcs::commit_backend::{CommitBackend, OpenTarget};
+use crate::provider::pcs::commit_backend::{BdBackend, CommitBackend, OpenTarget};
 use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
@@ -619,7 +619,7 @@ pub struct IntEvalArgument<B: CommitBackend> {
   /// anywhere in the protocol, over all commitments in canonical order:
   /// the input `f`, the stacked layers `ab_1..ab_t`, the `1+2t` chunk
   /// commitments, and the multiplicity table.
-  pub(crate) combined_open: CombinedBatchOpen<HyBackend>,
+  pub(crate) combined_open: CombinedBatchOpen<B>,
 }
 
 /// Per-polynomial portion of a batched [`IntEvalBatchArgument`]: the same
@@ -656,7 +656,7 @@ pub struct IntEvalBatchArgument<B: CommitBackend> {
   /// ONE shared LogUp-GKR range check covering every batch of every poly.
   pub(crate) range_check: SharedRangeCheck<B>,
   /// ONE combined opening discharging every evaluation claim of every poly.
-  pub(crate) combined_open: CombinedBatchOpen<HyBackend>,
+  pub(crate) combined_open: CombinedBatchOpen<B>,
 }
 
 /// ONE combined multi-point opening for ALL commitments of a Mod-PCS
@@ -1664,8 +1664,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     eval: &BigUint,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove");
-    let mut st = prove_one_poly::<HyBackend>(&ck.params, ck, transcript, poly, point, eval)?;
-    let (range_check, combined_open) = finish_batch_open::<HyBackend>(
+    let mut st = prove_one_poly::<HyBackend, T256DynPrimeEngine>(
+      &ck.params, ck, transcript, poly, point, eval,
+    )?;
+    let (range_check, combined_open) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
       &ck.params,
       ck,
       transcript,
@@ -1705,13 +1707,13 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // product opening are then run ONCE over every polynomial's batches.
     let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
     for i in 0..n {
-      states.push(prove_one_poly::<HyBackend>(
+      states.push(prove_one_poly::<HyBackend, T256DynPrimeEngine>(
         &ck.params, ck, transcript, polys[i], points[i], evals[i],
       )?);
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
     let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
-    let (range_check, combined_open) = finish_batch_open::<HyBackend>(
+    let (range_check, combined_open) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
       &ck.params,
       ck,
       transcript,
@@ -1745,7 +1747,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("integer_modpcs_verify");
-    let mut v = verify_one_poly(
+    let mut v = verify_one_poly::<HyBackend, T256DynPrimeEngine>(
       &vk.params,
       transcript,
       point,
@@ -1755,7 +1757,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &arg.chains,
       &arg.ab_comms,
     )?;
-    finish_batch_verify::<HyBackend>(
+    finish_batch_verify::<HyBackend, T256DynPrimeEngine>(
       &vk.params,
       vk,
       transcript,
@@ -1785,7 +1787,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
     for i in 0..n {
       let pp = &arg.per_poly[i];
-      vs.push(verify_one_poly(
+      vs.push(verify_one_poly::<HyBackend, T256DynPrimeEngine>(
         &vk.params,
         transcript,
         points[i],
@@ -1802,7 +1804,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       .iter()
       .map(|pp| pp.ab_comms.as_slice())
       .collect();
-    finish_batch_verify::<HyBackend>(
+    finish_batch_verify::<HyBackend, T256DynPrimeEngine>(
       &vk.params,
       vk,
       transcript,
@@ -1813,6 +1815,291 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &arg.combined_open,
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify_batch");
+    Ok(())
+  }
+}
+
+/// The Brakedown-backed integer Mod-PCS: the same IntEval protocol as
+/// [`IntegerModPCS`], with commitments and final openings going through
+/// [`BdBackend`] (hash-based, non-hiding — this instantiation is NOT
+/// zero-knowledge). Used for the code-commitment comparison
+/// instantiation: no elliptic-curve operations anywhere in the prover,
+/// at the cost of megabyte-scale proofs and slower verification.
+#[derive(Clone, Debug)]
+pub struct IntegerModPCSBd;
+
+/// Commitment key for the Brakedown Mod-PCS: only the IntEval
+/// parameters (Brakedown itself needs no key material — its code
+/// matrices derive from a public seed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BdModCommitmentKey {
+  pub(crate) params: IntEvalParams,
+}
+
+/// Verifier key: same content as the commitment key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BdModVerifierKey {
+  pub(crate) params: IntEvalParams,
+}
+
+/// A Brakedown Mod-PCS commitment: the Merkle root of the chunk
+/// polynomial's encoded-column tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BdModCommitment {
+  pub(crate) root: [u8; 32],
+}
+
+impl TranscriptReprTrait for BdModCommitment {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    self.root.to_vec()
+  }
+}
+
+impl BdModCommitmentKey {
+  /// Key from explicit IntEval params (Brakedown needs no key material).
+  pub fn new(params: IntEvalParams) -> Self {
+    Self { params }
+  }
+}
+
+impl BdModVerifierKey {
+  /// Key from explicit IntEval params.
+  pub fn new(params: IntEvalParams) -> Self {
+    Self { params }
+  }
+}
+
+impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSBd {
+  type CommitmentKey = BdModCommitmentKey;
+  type VerifierKey = BdModVerifierKey;
+  type Commitment = BdModCommitment;
+  type Blind = ();
+  type EvaluationArgument = IntEvalArgument<BdBackend>;
+  type BatchEvaluationArgument = IntEvalBatchArgument<BdBackend>;
+
+  fn setup(
+    _label: &'static [u8],
+    n: usize,
+    _width: usize,
+  ) -> (Self::CommitmentKey, Self::VerifierKey) {
+    let num_vars = ceil_log2(n.max(1));
+    let params = IntEvalParams::derive_optimized(DEFAULT_LOG_T_F, num_vars).expect(
+      "default IntEvalParams derivation must satisfy the paper's bounds; \
+         override with `setup_with_params` to use tighter parameters",
+    );
+    (
+      BdModCommitmentKey {
+        params: params.clone(),
+      },
+      BdModVerifierKey { params },
+    )
+  }
+
+  fn precompute_ck(_ck: &Self::CommitmentKey) {}
+
+  fn blind(_ck: &Self::CommitmentKey, _n: usize) -> Self::Blind {}
+
+  fn commit(
+    ck: &Self::CommitmentKey,
+    v: &[BigUint],
+    _r: &Self::Blind,
+  ) -> Result<Self::Commitment, SpartanError> {
+    // Identical chunk layout to the Hyrax Mod-PCS (the protocol's
+    // committed-chunk representation), committed with Brakedown.
+    let params = &ck.params;
+    let v_limbs = limb_split_polynomial(v, params.log_t, params.log_t_f);
+    let chunk_vals = build_chunk_poly(&[&v_limbs], v_limbs.len(), params.log_t);
+    let chunk_fq: Vec<t256::Scalar> = chunk_vals
+      .par_iter()
+      .map(|&c| scalar_from_chunk(c))
+      .collect();
+    let (root, _data) = BdBackend::commit(&(), &chunk_fq, &(), true)?;
+    Ok(BdModCommitment { root })
+  }
+
+  fn check_commitment(
+    _comm: &Self::Commitment,
+    _n: usize,
+    _width: usize,
+  ) -> Result<(), SpartanError> {
+    Ok(())
+  }
+
+  fn prove(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    comm: &Self::Commitment,
+    poly: &[BigUint],
+    blind: &Self::Blind,
+    point: &[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar],
+    eval: &BigUint,
+  ) -> Result<Self::EvaluationArgument, SpartanError> {
+    let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove");
+    let mut st = prove_one_poly::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+      &ck.params,
+      &(),
+      transcript,
+      poly,
+      point,
+      eval,
+    )?;
+    let (range_check, combined_open) =
+      finish_batch_open::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+        &ck.params,
+        &(),
+        transcript,
+        std::slice::from_mut(&mut st),
+        &[&comm.root],
+        &[blind],
+      )?;
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_bd_prove");
+    Ok(IntEvalArgument {
+      reduction_round_polys: st.reduction_round_polys,
+      int_v_prime: st.int_v_prime,
+      chains: st.chains,
+      ab_comms: st.ab_comms,
+      range_check,
+      combined_open,
+    })
+  }
+
+  fn prove_batch(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove_batch");
+    let n = polys.len();
+    if n == 0 || comms.len() != n || blinds.len() != n || points.len() != n || evals.len() != n {
+      return Err(SpartanError::InternalError {
+        reason: "IntegerModPCSBd::prove_batch: empty or mismatched inputs".to_string(),
+      });
+    }
+    let mut states: Vec<PerPolyProver<BdBackend>> = Vec::with_capacity(n);
+    for i in 0..n {
+      states.push(prove_one_poly::<
+        BdBackend,
+        crate::provider::T256DynPrimeBdEngine,
+      >(
+        &ck.params,
+        &(),
+        transcript,
+        polys[i],
+        points[i],
+        evals[i],
+      )?);
+    }
+    let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
+    let (range_check, combined_open) =
+      finish_batch_open::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+        &ck.params,
+        &(),
+        transcript,
+        &mut states,
+        &comm_roots,
+        blinds,
+      )?;
+    let per_poly = states
+      .into_iter()
+      .map(|st| IntEvalPerPolyArgument {
+        reduction_round_polys: st.reduction_round_polys,
+        int_v_prime: st.int_v_prime,
+        chains: st.chains,
+        ab_comms: st.ab_comms,
+      })
+      .collect();
+    info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_bd_prove_batch");
+    Ok(IntEvalBatchArgument {
+      per_poly,
+      range_check,
+      combined_open,
+    })
+  }
+
+  fn verify(
+    vk: &Self::VerifierKey,
+    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    comm: &Self::Commitment,
+    point: &[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar],
+    eval: &BigUint,
+    arg: &Self::EvaluationArgument,
+  ) -> Result<(), SpartanError> {
+    let (_verify_span, verify_t) = start_span!("integer_modpcs_bd_verify");
+    let mut v = verify_one_poly::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+      &vk.params,
+      transcript,
+      point,
+      eval,
+      &arg.reduction_round_polys,
+      &arg.int_v_prime,
+      &arg.chains,
+      &arg.ab_comms,
+    )?;
+    finish_batch_verify::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+      &vk.params,
+      &(),
+      transcript,
+      &[&comm.root],
+      std::slice::from_mut(&mut v),
+      &[arg.ab_comms.as_slice()],
+      &arg.range_check,
+      &arg.combined_open,
+    )?;
+    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_bd_verify");
+    Ok(())
+  }
+
+  fn verify_batch(
+    vk: &Self::VerifierKey,
+    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+  ) -> Result<(), SpartanError> {
+    let (_verify_span, verify_t) = start_span!("integer_modpcs_bd_verify_batch");
+    let n = arg.per_poly.len();
+    if comms.len() != n || points.len() != n || evals.len() != n {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
+    for i in 0..n {
+      let pp = &arg.per_poly[i];
+      vs.push(verify_one_poly::<
+        BdBackend,
+        crate::provider::T256DynPrimeBdEngine,
+      >(
+        &vk.params,
+        transcript,
+        points[i],
+        evals[i],
+        &pp.reduction_round_polys,
+        &pp.int_v_prime,
+        &pp.chains,
+        &pp.ab_comms,
+      )?);
+    }
+    let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
+    let ab_comms_per_poly: Vec<_> = arg
+      .per_poly
+      .iter()
+      .map(|pp| pp.ab_comms.as_slice())
+      .collect();
+    finish_batch_verify::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+      &vk.params,
+      &(),
+      transcript,
+      &comm_roots,
+      &mut vs,
+      &ab_comms_per_poly,
+      &arg.range_check,
+      &arg.combined_open,
+    )?;
+    info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_bd_verify_batch");
     Ok(())
   }
 }
@@ -1853,10 +2140,16 @@ struct PerPolyProver<B: CommitBackend> {
 /// a standalone open would through the chain-claim phase, and returns the
 /// proof outputs plus the witness data [`finish_batch_open`]'s shared
 /// range check and combined opening borrow from.
-fn prove_one_poly<B: CommitBackend>(
+fn prove_one_poly<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
   params: &IntEvalParams,
   backend_ck: &B::Ck,
-  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  transcript: &mut Keccak256Transcript<ME>,
   poly: &[BigUint],
   point: &[crate::dyn_prime::DynPrime<4>],
   eval: &BigUint,
@@ -1908,14 +2201,13 @@ fn prove_one_poly<B: CommitBackend>(
   let mut poly_lhs = crate::polys_modp::multilinear::MultilinearPolynomial::new(limb_p, monty);
   let mut poly_rhs =
     crate::polys_modp::multilinear::MultilinearPolynomial::new(f_limb_at_int_r, monty);
-  let (red_sc, r_k, final_claims) =
-    crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine>::prove_quad(
-      &eval_p,
-      params.numlimb_var,
-      &mut poly_lhs,
-      &mut poly_rhs,
-      transcript,
-    )?;
+  let (red_sc, r_k, final_claims) = crate::sumcheck_modp::SumcheckProof::<ME>::prove_quad(
+    &eval_p,
+    params.numlimb_var,
+    &mut poly_lhs,
+    &mut poly_rhs,
+    transcript,
+  )?;
   // `final_claims = [limb(r_k), f_limb(int_r, r_k)]`.
   let f_eval_p = final_claims[1];
 
@@ -2272,10 +2564,16 @@ fn prove_one_poly<B: CommitBackend>(
 /// polynomial in turn (its `f_limb` batch then its `a_j`/`b_j` layer
 /// batches), then all chunk commitments in that batch order, then the
 /// shared multiplicity table.
-fn finish_batch_open<B: CommitBackend>(
+fn finish_batch_open<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
   params: &IntEvalParams,
   backend_ck: &B::Ck,
-  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  transcript: &mut Keccak256Transcript<ME>,
   states: &mut [PerPolyProver<B>],
   comms: &[&B::Comm],
   blinds: &[&B::Blind],
@@ -2345,7 +2643,7 @@ fn finish_batch_open<B: CommitBackend>(
       }
     }
     let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
-    let out = prove_shared_range_check::<B>(backend_ck, &rc_batches, transcript)?;
+    let out = prove_shared_range_check::<B, ME>(backend_ck, &rc_batches, transcript)?;
     info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
     out
   };
@@ -2459,15 +2757,21 @@ struct PerPolyVerifier {
 /// advancing `transcript` identically, and return the open claims and
 /// dimensions for [`finish_batch_verify`].
 #[allow(clippy::too_many_arguments)]
-fn verify_one_poly(
+fn verify_one_poly<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
   params: &IntEvalParams,
-  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  transcript: &mut Keccak256Transcript<ME>,
   point: &[crate::dyn_prime::DynPrime<4>],
   eval: &BigUint,
   reduction_round_polys: &[Vec<BigUint>],
   int_v_prime: &BigInt,
   chains: &[ChainData],
-  ab_comms: &[<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
+  ab_comms: &[B::Comm],
 ) -> Result<PerPolyVerifier, SpartanError> {
   let monty = point
     .first()
@@ -2504,7 +2808,7 @@ fn verify_one_poly(
         .collect(),
     })
     .collect();
-  let red_sc = crate::sumcheck_modp::SumcheckProof::<T256DynPrimeEngine> {
+  let red_sc = crate::sumcheck_modp::SumcheckProof::<ME> {
     compressed_polys: red_sc_polys,
   };
   let (red_final_claim, r_k) = red_sc.verify(eval_p, params.numlimb_var, 2, &monty, transcript)?;
@@ -2564,7 +2868,7 @@ fn verify_one_poly(
   let s_pad = params.s.next_power_of_two();
   let log_spad = s_pad.trailing_zeros() as usize;
   for c in ab_comms {
-    transcript.absorb(b"ab_chunk", c);
+    transcript.absorb_bytes(b"ab_chunk", &B::comm_transcript_bytes(c));
   }
 
   let gamma_fq: Vec<t256::Scalar> = if with_iter {
@@ -2694,10 +2998,16 @@ fn verify_one_poly(
 /// every polynomial's batches, then ONE combined-open verification over
 /// every commitment, in the same canonical order the prover used.
 #[allow(clippy::too_many_arguments)]
-fn finish_batch_verify<B: CommitBackend>(
+fn finish_batch_verify<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
   params: &IntEvalParams,
   backend_vk: &B::Vk,
-  transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  transcript: &mut Keccak256Transcript<ME>,
   comms: &[&B::Comm],
   verifiers: &mut [PerPolyVerifier],
   ab_comms_per_poly: &[&[B::Comm]],
@@ -3195,8 +3505,15 @@ fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
 /// shared multiplicity commitment — all before any challenge (in
 /// particular the LogUp `r`) is squeezed. Both prover and verifier
 /// reconstruct it identically.
-fn spawn_shared_range_subtranscript<'a, B: CommitBackend>(
-  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
+fn spawn_shared_range_subtranscript<
+  'a,
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  parent: &mut Keccak256Transcript<ME>,
   chunk_comms: impl Iterator<Item = &'a B::Comm>,
   mult_comm: &B::Comm,
 ) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
@@ -3215,8 +3532,13 @@ fn spawn_shared_range_subtranscript<'a, B: CommitBackend>(
 /// Spawn the F-side sub-transcript of the final batched-open phase.
 /// Each commitment's claims are absorbed (and its λ squeezed) inside
 /// [`prove_batched_open`] / [`verify_batched_open`].
-fn spawn_batch_subtranscript(
-  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
+fn spawn_batch_subtranscript<
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  parent: &mut Keccak256Transcript<ME>,
 ) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
   let seed = parent.squeeze_bytes(b"batch_seed")?;
   let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
@@ -3591,10 +3913,16 @@ struct RcVerifyClaims {
 /// per-batch `V(r_v)` value claims, and the reconstruction sumchecks'
 /// final chunk evaluations) are returned as CLAIMS to be discharged by
 /// the caller's batched opens — this function performs no Hyrax opens.
-fn prove_shared_range_check<B: CommitBackend>(
+fn prove_shared_range_check<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
   backend_ck: &B::Ck,
   batches: &[RangeBatchInputs<'_, B>],
-  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  parent: &mut Keccak256Transcript<ME>,
 ) -> Result<(SharedRangeCheck<B>, RcProverArtifacts<B>), SpartanError> {
   debug_assert!(!batches.is_empty());
 
@@ -3697,7 +4025,7 @@ fn prove_shared_range_check<B: CommitBackend>(
 
   // 4. Sub-transcript bound to (parent, chunk comms, mult comm).
   let mut sub =
-    spawn_shared_range_subtranscript::<B>(parent, chunk_comm_refs.iter().copied(), &mult_comm)?;
+    spawn_shared_range_subtranscript::<B, ME>(parent, chunk_comm_refs.iter().copied(), &mult_comm)?;
 
   // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
   //    [0, 2^16). Its reduced claims become batched-open claims.
@@ -3848,10 +4176,16 @@ fn prove_shared_range_check<B: CommitBackend>(
 /// pinned to the public batch shapes), re-runs each batch's
 /// reconstruction sumcheck against the claimed evaluations, and returns
 /// the claims for the batched-open verification.
-fn verify_shared_range_check<B: CommitBackend>(
+fn verify_shared_range_check<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<4>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
   metas: &[RangeBatchMeta<'_, B>],
   arg: &SharedRangeCheck<B>,
-  parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
+  parent: &mut Keccak256Transcript<ME>,
 ) -> Result<RcVerifyClaims, SpartanError> {
   // The proof carries per-batch data only for batches that committed a
   // fresh chunk polynomial; precommitted batches (F) contribute their
@@ -3892,8 +4226,11 @@ fn verify_shared_range_check<B: CommitBackend>(
   }
 
   // 1. Spawn the same sub-transcript the prover used.
-  let mut sub =
-    spawn_shared_range_subtranscript::<B>(parent, chunk_comm_refs.iter().copied(), &arg.mult_comm)?;
+  let mut sub = spawn_shared_range_subtranscript::<B, ME>(
+    parent,
+    chunk_comm_refs.iter().copied(),
+    &arg.mult_comm,
+  )?;
 
   // 2. Multi-witness LogUp membership: every chunk (and shifted top) in
   //    [0, 2^16). Its reduced claims become batched-open claims.

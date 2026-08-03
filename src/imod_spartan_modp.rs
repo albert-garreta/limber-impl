@@ -142,6 +142,27 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
   }
 }
 
+impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
+  /// Brakedown-engine analog of `setup_with_params`.
+  pub fn setup_with_params(
+    shape: IntModR1CSShapeModp<crate::provider::T256DynPrimeBdEngine>,
+    params: crate::provider::pcs::integer_modpcs::IntEvalParams,
+  ) -> Result<
+    (
+      IntModSpartanModpProverKey<crate::provider::T256DynPrimeBdEngine>,
+      IntModSpartanModpVerifierKey<crate::provider::T256DynPrimeBdEngine>,
+    ),
+    SpartanError,
+  > {
+    let n = shape.num_vars.max(shape.num_cons);
+    let num_vars = n.max(1).ilog2() as usize + if n.is_power_of_two() { 0 } else { 1 };
+    params.validate(num_vars)?;
+    let ck = crate::provider::pcs::integer_modpcs::BdModCommitmentKey::new(params.clone());
+    let vk = crate::provider::pcs::integer_modpcs::BdModVerifierKey::new(params);
+    Ok(Self::assemble_keys(shape, ck, vk))
+  }
+}
+
 impl<M> IntModSpartanModpSNARK<M>
 where
   M: ModEngine<TE = Keccak256Transcript<M>>,
@@ -643,6 +664,41 @@ mod tests {
     shape.is_sat(&pk.ck, &U, &W).unwrap();
     let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &U, &W).unwrap();
     proof.verify(&vk, &U).unwrap();
+  }
+
+  /// The same toy circuit through the Brakedown-backed engine: same
+  /// protocol, hash commitments end to end.
+  #[test]
+  fn imod_modp_bd_toy_roundtrip() {
+    type BE = crate::provider::T256DynPrimeBdEngine;
+    let num_cons = 2usize;
+    let num_vars = 4usize;
+    let one = BigUint::from(1u32);
+    let zero = BigUint::from(0u32);
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one)];
+    let mods = vec![BigUint::from(14u64), zero.clone()];
+    let shape =
+      IntModR1CSShapeModp::<BE>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods).unwrap();
+    let w = vec![
+      BigUint::from(3u64),
+      BigUint::from(5u64),
+      BigUint::from(1u64),
+      zero.clone(),
+    ];
+    let q = vec![BigUint::from(1u64), zero];
+    let (pk, vk) = IntModSpartanModpSNARK::<BE>::setup(shape.clone()).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<BE>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &U, &W).unwrap();
+    let proof = IntModSpartanModpSNARK::<BE>::prove(&pk, &U, &W).unwrap();
+    proof.verify(&vk, &U).unwrap();
+
+    // Tampering the witness commitment (a Merkle root byte) must break
+    // verification via the transcript binding.
+    let mut bad_u = U.clone();
+    bad_u.comm_w.root[0] ^= 1;
+    assert!(proof.verify(&vk, &bad_u).is_err());
   }
 
   /// `is_sat` rejects an inconsistent witness (wrong quotient).

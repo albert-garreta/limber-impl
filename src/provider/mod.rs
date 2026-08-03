@@ -126,6 +126,34 @@ impl SumcheckEngine for T256DynPrimeEngine {
   type TE = Keccak256Transcript<Self>;
 }
 
+/// A `ModEngine` identical to [`T256DynPrimeEngine`] except that its
+/// Mod-PCS commits with Brakedown (hash-based, non-hiding) instead of
+/// Pedersen/Hyrax. Shares the same scalar field and prime sampling, so
+/// the protocol layer is reused verbatim; only the commitment scheme
+/// differs. This is the comparison instantiation
+/// against code-commitment systems (fast prover, large proofs).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct T256DynPrimeBdEngine;
+
+impl SumcheckEngine for T256DynPrimeBdEngine {
+  type Scalar = DynPrime<4>;
+  type TE = Keccak256Transcript<Self>;
+}
+
+impl ModEngine for T256DynPrimeBdEngine {
+  type ModPCS = crate::provider::pcs::integer_modpcs::IntegerModPCSBd;
+
+  fn bootstrap_params() -> crypto_bigint::modular::FixedMontyParams<4> {
+    <T256DynPrimeEngine as ModEngine>::bootstrap_params()
+  }
+
+  fn sample_params<T: crate::traits::transcript::ByteTranscript>(
+    transcript: &mut T,
+  ) -> crypto_bigint::modular::FixedMontyParams<4> {
+    <T256DynPrimeEngine as ModEngine>::sample_params(transcript)
+  }
+}
+
 impl ModEngine for T256DynPrimeEngine {
   // Phase-3 step B: sound IntegerModPCS (small-prime fingerprinting +
   // Hyrax-T256 underneath).
