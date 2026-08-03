@@ -96,6 +96,16 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
   /// Transcript representation of a commitment (`absorb`-equivalent).
   fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8>;
 
+  /// Regenerate the retained opening data for a polynomial that was
+  /// committed elsewhere (the ModPCS commit surface returns only the
+  /// commitment). Free for Hyrax (`()`); Brakedown re-encodes.
+  fn recommit_data(
+    ck: &Self::Ck,
+    poly: &[t256::Scalar],
+    blind: &Self::Blind,
+    small: bool,
+  ) -> Result<Self::Data, SpartanError>;
+
   /// Commit to an F-polynomial under `blind`. `small` hints that every
   /// coefficient is < 2^16 (Hyrax small-scalar MSM path; Brakedown
   /// ignores it). Deterministic given `(poly, blind)` — callers
@@ -142,6 +152,15 @@ impl CommitBackend for BdBackend {
 
   fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8> {
     comm.to_vec()
+  }
+
+  fn recommit_data(
+    ck: &Self::Ck,
+    poly: &[t256::Scalar],
+    blind: &Self::Blind,
+    small: bool,
+  ) -> Result<Self::Data, SpartanError> {
+    Ok(Self::commit(ck, poly, blind, small)?.1)
   }
 
   fn commit(

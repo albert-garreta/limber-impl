@@ -578,7 +578,8 @@ pub struct ChainData {
 /// the reduction-sumcheck round polynomials (Phase-3 step D3), and one
 /// per-prime chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IntEvalArgument {
+#[serde(bound = "")]
+pub struct IntEvalArgument<B: CommitBackend> {
   /// Per-round compressed univariate polynomial of the reduction
   /// sumcheck `sum_k limb(k) · f_limb(int_r, k) ≡_p int_y`. Each inner
   /// vector is the round poly's coefficients excluding the linear term,
@@ -602,7 +603,7 @@ pub struct IntEvalArgument {
   /// to the next power of two. The layer commitment IS its range-check
   /// chunk oracle; layer evaluations fold through [`chunk_fold_point`].
   /// Empty when `t = 0`.
-  pub(crate) ab_comms: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  pub(crate) ab_comms: Vec<B::Comm>,
   /// ONE shared LogUp-GKR range check covering all `(bound, size)`
   /// batch groups. Canonical batch order is `f_limb`, then for each
   /// iteration `j = 1..=t` the `a_j` batch (all `s` chains) and the
@@ -613,7 +614,7 @@ pub struct IntEvalArgument {
   /// the multiplicity commitment and the GKR itself — no per-batch
   /// chunk commitments or reconstruction sumchecks. See
   /// [`prove_shared_range_check`].
-  pub(crate) range_check: SharedRangeCheck,
+  pub(crate) range_check: SharedRangeCheck<B>,
   /// ONE combined opening discharging every evaluation claim made
   /// anywhere in the protocol, over all commitments in canonical order:
   /// the input `f`, the stacked layers `ab_1..ab_t`, the `1+2t` chunk
@@ -627,7 +628,8 @@ pub struct IntEvalArgument {
 /// minus the range check and combined opening (which are shared across
 /// the whole batch).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IntEvalPerPolyArgument {
+#[serde(bound = "")]
+pub struct IntEvalPerPolyArgument<B: CommitBackend> {
   /// See [`IntEvalArgument::reduction_round_polys`].
   pub reduction_round_polys: Vec<Vec<BigUint>>,
   /// See [`IntEvalArgument::int_v_prime`].
@@ -635,7 +637,7 @@ pub struct IntEvalPerPolyArgument {
   /// See [`IntEvalArgument::chains`].
   pub chains: Vec<ChainData>,
   /// See [`IntEvalArgument::ab_comms`].
-  pub(crate) ab_comms: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  pub(crate) ab_comms: Vec<B::Comm>,
 }
 
 /// Evaluation argument for a *batched* Mod-PCS open of several integer
@@ -647,11 +649,12 @@ pub struct IntEvalPerPolyArgument {
 /// per-open costs (the `2^16`-table-side GKR, the merged IPA) are paid
 /// once for the whole batch instead of once per polynomial.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IntEvalBatchArgument {
+#[serde(bound = "")]
+pub struct IntEvalBatchArgument<B: CommitBackend> {
   /// One entry per opened polynomial, in the caller's input order.
-  pub per_poly: Vec<IntEvalPerPolyArgument>,
+  pub per_poly: Vec<IntEvalPerPolyArgument<B>>,
   /// ONE shared LogUp-GKR range check covering every batch of every poly.
-  pub(crate) range_check: SharedRangeCheck,
+  pub(crate) range_check: SharedRangeCheck<B>,
   /// ONE combined opening discharging every evaluation claim of every poly.
   pub(crate) combined_open: CombinedBatchOpen<HyBackend>,
 }
@@ -700,10 +703,11 @@ pub(crate) const CHUNK_BITS: usize = 16;
 /// the final batched opens), and the value-reconstruction sumcheck tying
 /// chunks to the batch's value polynomials.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RangeCheckBatchData {
+#[serde(bound = "")]
+pub struct RangeCheckBatchData<B: CommitBackend> {
   /// Stacked chunk-polynomial commitment (entries in `[0, 2^16)`),
   /// laid out `((p·n_values + within)·stride + c)`.
-  pub(crate) chunk_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  pub(crate) chunk_comm: B::Comm,
   /// Claimed `V(r_v) = Σ_p eq(r_v_poly, p)·value_p(r_v_within)` — for an
   /// `a/b` batch this equals the stacked layer MLE at `(role, r_v)`, for
   /// the `f_limb` batch it is `f(r_v_within)`; discharged by the
@@ -727,9 +731,10 @@ pub struct RangeCheckBatchData {
 /// batch order, then the shifted-top trees of the non-aligned batches in
 /// the same order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SharedRangeCheck {
+#[serde(bound = "")]
+pub struct SharedRangeCheck<B: CommitBackend> {
   /// Commitment to the shared `2^16`-entry multiplicity table.
-  pub(crate) mult_comm: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  pub(crate) mult_comm: B::Comm,
   /// The multi-witness LogUp-GKR membership argument.
   pub(crate) logup: crate::logup_gkr::LogUpMultiRangeProof<T256HyraxEngine>,
   /// Per-batch commitments, openings, and reconstruction sumchecks for
@@ -738,7 +743,7 @@ pub struct SharedRangeCheck {
   /// chunk polynomial is the target's own commitment, the chunk→value
   /// relation definitional via [`chunk_fold_point`]), so this is always
   /// empty; the machinery remains for non-precommitted batch kinds.
-  pub(crate) batches: Vec<RangeCheckBatchData>,
+  pub(crate) batches: Vec<RangeCheckBatchData<B>>,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -1548,8 +1553,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   type VerifierKey = IntegerModVerifierKey;
   type Commitment = IntegerModCommitment;
   type Blind = IntegerModBlind;
-  type EvaluationArgument = IntEvalArgument;
-  type BatchEvaluationArgument = IntEvalBatchArgument;
+  type EvaluationArgument = IntEvalArgument<HyBackend>;
+  type BatchEvaluationArgument = IntEvalBatchArgument<HyBackend>;
 
   /// Trait-driven setup: derive `IntEvalParams` optimized for this
   /// polynomial size via [`IntEvalParams::derive_optimized`], with the
@@ -2261,7 +2266,7 @@ fn finish_batch_open(
   states: &mut [PerPolyProver],
   comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
   blinds: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind],
-) -> Result<(SharedRangeCheck, CombinedBatchOpen<HyBackend>), SpartanError> {
+) -> Result<(SharedRangeCheck<HyBackend>, CombinedBatchOpen<HyBackend>), SpartanError> {
   type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
   type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
   let params = &ck.params;
@@ -2668,7 +2673,7 @@ fn finish_batch_verify(
   comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
   verifiers: &mut [PerPolyVerifier],
   ab_comms_per_poly: &[&[<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment]],
-  range_check: &SharedRangeCheck,
+  range_check: &SharedRangeCheck<HyBackend>,
   combined_open: &CombinedBatchOpen<HyBackend>,
 ) -> Result<(), SpartanError> {
   let params = &vk.params;
@@ -2817,7 +2822,7 @@ struct ChainProverState {
 /// fallback opens, and every absorb happen in the exact order the
 /// monolithic implementation used.
 #[derive(Clone, Debug)]
-pub(crate) struct HyBackend;
+pub struct HyBackend;
 
 impl CommitBackend for HyBackend {
   type Ck = IntegerModCommitmentKey;
@@ -2842,6 +2847,15 @@ impl CommitBackend for HyBackend {
     small: bool,
   ) -> Result<(Self::Comm, Self::Data), SpartanError> {
     Ok((Hyrax::commit(&ck.inner, poly, blind, small)?, ()))
+  }
+
+  fn recommit_data(
+    _ck: &Self::Ck,
+    _poly: &[t256::Scalar],
+    _blind: &Self::Blind,
+    _small: bool,
+  ) -> Result<Self::Data, SpartanError> {
+    Ok(())
   }
 
   fn open_targets(
@@ -3564,7 +3578,7 @@ fn prove_shared_range_check(
   _ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   batches: &[RangeBatchInputs<'_>],
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-) -> Result<(SharedRangeCheck, RcProverArtifacts), SpartanError> {
+) -> Result<(SharedRangeCheck<HyBackend>, RcProverArtifacts), SpartanError> {
   type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
   type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
   debug_assert!(!batches.is_empty());
@@ -3711,7 +3725,7 @@ fn prove_shared_range_check(
   let (_rcr_span, rcr_t) = start_span!("rc_reconstr");
   let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
     Vec::with_capacity(batches.len());
-  let mut batch_data: Vec<RangeCheckBatchData> = Vec::with_capacity(batches.len());
+  let mut batch_data: Vec<RangeCheckBatchData<HyBackend>> = Vec::with_capacity(batches.len());
   for (bi, (b, d)) in batches.iter().zip(dims.iter()).enumerate() {
     if b.precommitted.is_some() {
       // Zero-pad claims: the fold (`chunk_fold_point`) weighs EVERY
@@ -3820,7 +3834,7 @@ fn prove_shared_range_check(
 /// the claims for the batched-open verification.
 fn verify_shared_range_check(
   metas: &[RangeBatchMeta<'_>],
-  arg: &SharedRangeCheck,
+  arg: &SharedRangeCheck<HyBackend>,
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
 ) -> Result<RcVerifyClaims, SpartanError> {
   // The proof carries per-batch data only for batches that committed a
