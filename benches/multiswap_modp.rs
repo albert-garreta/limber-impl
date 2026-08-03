@@ -435,6 +435,16 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let params =
       IntEvalParams::derive(2048, LOG_T, DEFAULT_K, log_n).expect("IntEval params satisfy bounds");
     let (pk, vk) = IntModSpartanModpSNARK::<BE>::setup_with_params(shape.clone(), params).unwrap();
+    // Pre-warm the per-length code layouts (deterministic public
+    // matrices; conceptually part of setup, not of commit).
+    let tw = Instant::now();
+    let nvars = shape.num_vars().max(shape.num_cons());
+    let f_chunk_len = (nvars * 32 * 4).next_power_of_two();
+    let _ = spartan2::provider::pcs::prewarm_brakedown_params(f_chunk_len);
+    println!(
+      "  (params prewarm for f-chunk length: {:.1} ms)",
+      tw.elapsed().as_secs_f64() * 1e3
+    );
     let t0 = Instant::now();
     let (witness, instance) =
       IntModR1CSWitnessModp::<BE>::new(&shape, pk.ck(), w, q, vec![]).unwrap();

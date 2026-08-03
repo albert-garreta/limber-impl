@@ -15,3 +15,10 @@ pub(crate) mod commit_backend;
 pub mod hyrax_pc;
 pub mod integer_modpcs;
 pub mod kzh_pc;
+
+/// Pre-build the deterministic Brakedown layout for a given polynomial
+/// length (public code matrices; conceptually setup work). Returns the
+/// column-open count for informational use.
+pub fn prewarm_brakedown_params(n: usize) -> usize {
+  commit_backend::bd_params(n).n_col_opens
+}

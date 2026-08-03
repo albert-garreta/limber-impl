@@ -1,28 +1,29 @@
-//! Minimal binary Merkle tree over `[u8; 32]` leaves (Keccak256), with
+//! Minimal binary Merkle tree over `[u8; 32]` leaves (BLAKE3), with
 //! domain-separated leaf/node hashing and stateless path verification. Used to
-//! commit the columns of a Brakedown encoded matrix.
+//! commit the columns of a Brakedown encoded matrix. BLAKE3 (SIMD,
+//! ~5-10x Keccak single-thread throughput) is used only for this
+//! column/tree commitment; the Fiat-Shamir transcript remains Keccak.
 
 use rayon::prelude::*;
-use sha3::{Digest, Keccak256};
 
-/// A 32-byte Keccak256 digest.
+/// A 32-byte BLAKE3 digest.
 pub type Hash = [u8; 32];
 
 /// Hash raw leaf data (domain tag `0`).
 pub fn hash_leaf(data: &[u8]) -> Hash {
-  let mut h = Keccak256::new();
-  h.update([0u8]);
+  let mut h = blake3::Hasher::new();
+  h.update(&[0u8]);
   h.update(data);
-  h.finalize().into()
+  *h.finalize().as_bytes()
 }
 
 /// Hash two child digests (domain tag `1`).
 fn hash_node(l: &Hash, r: &Hash) -> Hash {
-  let mut h = Keccak256::new();
-  h.update([1u8]);
+  let mut h = blake3::Hasher::new();
+  h.update(&[1u8]);
   h.update(l);
   h.update(r);
-  h.finalize().into()
+  *h.finalize().as_bytes()
 }
 
 /// A binary Merkle tree; leaves are padded to a power of two with the zero hash.

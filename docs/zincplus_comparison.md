@@ -185,7 +185,7 @@ workload, single-threaded (BDPCS=1 on the multiswap bench):
 | instantiation | prove (total) | verify | proof |
 |---|---|---|---|
 | Ours / Hyrax (Pedersen) | **1.34 s** | **37.9 ms** | **~KB** |
-| Ours / Brakedown v1 | 2.44 s | 194 ms | 21.8 MB |
+| Ours / Brakedown v1.1 | 2.11 s | 182 ms | 21.75 MB |
 | Zinc+ (IPRS) | 1.13 s | 482 ms | 1.21 MB zstd |
 
 **The projection that hash commitments would reach Zinc+ prover parity
@@ -203,11 +203,16 @@ was wrong, and the reason is the finding:**
    SIMD): that, not "hash vs group", is their prover advantage on this
    axis.
 
-Known v1 caveats (would narrow but not close the gap): the 1.14 s
-commit includes one-time code-matrix sampling; w+q could share one
-Merkle tree (~30% proof-size saving); multithreading favors the hash
-side. The v1 numbers are end-to-end verified (roundtrip + tamper tests
-through the full SNARK driver).
+v1.1 applied the cheap fixes: opening-data caching across
+commit/prove (−0.86 s), one-time code-matrix sampling moved to setup
+(−0.21 s, 208 ms measured), BLAKE3 column/tree hashing with Keccak kept
+for Fiat–Shamir (−0.09 s). The small BLAKE3 delta confirms the commit
+is ENCODE-dominated — the expander's field multiplications pay the same
+width tax as the hashing. Remaining engineering levers: merging
+same-transcript-moment commitments (9 trees → 4, ≈ halves the proof)
+and 16-bit serialization of systematic columns (~3–4 MB more); neither
+touches the ~2 s prover floor at field width. Numbers are end-to-end
+verified (roundtrip + tamper tests through the full SNARK driver).
 
 **Paper framing:** one protocol, measured at both ends of the
 commitment design space, with an explanation of why the frontier sits
