@@ -28,7 +28,7 @@
 //! `s` independent primes implies the integer evaluation is correct
 //! with high probability.
 
-use crate::provider::pcs::fbackend::{FBackend, OpenTarget};
+use crate::provider::pcs::commit_backend::{CommitBackend, OpenTarget};
 use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
@@ -669,7 +669,7 @@ pub struct IntEvalBatchArgument {
 /// (test sizes) fall back to individual opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct CombinedBatchOpen<B: crate::provider::pcs::fbackend::FBackend> {
+pub struct CombinedBatchOpen<B: crate::provider::pcs::commit_backend::CommitBackend> {
   /// Per-commitment compressed sumcheck round polynomials, tail-aligned
   /// to the shared challenge vector (entry `j` has `n_j` rounds).
   pub(crate) round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<t256::Scalar>>>,
@@ -2819,7 +2819,7 @@ struct ChainProverState {
 #[derive(Clone, Debug)]
 pub(crate) struct HyBackend;
 
-impl FBackend for HyBackend {
+impl CommitBackend for HyBackend {
   type Ck = IntegerModCommitmentKey;
   type Vk = IntegerModVerifierKey;
   type Comm = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
@@ -3194,7 +3194,7 @@ fn spawn_batch_subtranscript(
 
 /// Absorb a commitment and its claims into the batch sub-transcript,
 /// binding them before the RLC challenge λ is squeezed.
-fn absorb_batch_claims<B: FBackend>(
+fn absorb_batch_claims<B: CommitBackend>(
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
   comm: &B::Comm,
   claims: &OpenClaims,
@@ -3210,7 +3210,7 @@ fn absorb_batch_claims<B: FBackend>(
 
 /// Prove the combined multi-point opening (see [`CombinedBatchOpen`]).
 /// `targets` are `(commitment, poly, blind, claims)` in canonical order.
-fn prove_combined_batch_open<B: FBackend>(
+fn prove_combined_batch_open<B: CommitBackend>(
   ck: &B::Ck,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
   targets: &[(&B::Comm, &[t256::Scalar], &B::Blind, &B::Data, &OpenClaims)],
@@ -3327,7 +3327,7 @@ fn prove_combined_batch_open<B: FBackend>(
 /// Verifier mirror of [`prove_combined_batch_open`]. `targets` are
 /// `(commitment, num_vars, claims)` in canonical order; every claim's
 /// point length is pinned to its commitment's variable count.
-fn verify_combined_batch_open<B: FBackend>(
+fn verify_combined_batch_open<B: CommitBackend>(
   vk: &B::Vk,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
   targets: &[(&B::Comm, usize, &OpenClaims)],

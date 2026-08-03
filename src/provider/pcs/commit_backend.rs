@@ -1,18 +1,26 @@
-//! Internal F-side commitment backend for the integer Mod-PCS: the seam
-//! that lets the IntEval protocol run over either Pedersen/Hyrax
-//! commitments (homomorphic, tiny proofs, group MSMs) or Brakedown
-//! (hash-based, large proofs, no MSMs). Everything above this seam —
-//! reduction sumchecks, chains, the committed-chunk representation and
-//! fold points, the lockstep range check, and the interleaved
-//! claim-reduction sumcheck — is backend-agnostic field arithmetic; the
-//! backend only (a) commits F-polynomials and (b) discharges the final
-//! one-evaluation-per-commitment openings the claim reduction produces.
+//! The interface separating the integer Mod-PCS *protocol* from the
+//! *commitment scheme* it runs on.
 //!
-//! The Hyrax backend preserves the existing protocol byte-for-byte
-//! (merged same-column IPA over homomorphically combined commitments,
-//! Pedersen blinds). The Brakedown backend is deliberately non-hiding
-//! (`Blind = ()`, no-ZK — matching the Zinc+ comparison target) and
-//! opens each target with a tensor-IOPP column-opening argument.
+//! The protocol — sumchecks, the per-prime chains, the range check —
+//! is ordinary field arithmetic and never manipulates commitments
+//! algebraically. It needs a commitment scheme for exactly two things:
+//!
+//! 1. committing to polynomials over the Hyrax scalar field, and
+//! 2. proving, at the very end, what each committed polynomial
+//!    evaluates to at one point (the protocol has already reduced all
+//!    of its claims down to one evaluation per commitment).
+//!
+//! [`CommitBackend`] captures those two operations. Two
+//! implementations exist: the Pedersen/Hyrax one (`HyBackend`, in
+//! `integer_modpcs.rs`), which keeps the existing protocol
+//! byte-for-byte — including its trick of merging all the final
+//! evaluation proofs into a single inner-product argument, which works
+//! because Pedersen commitments can be added together — and the
+//! hash-based Brakedown one ([`BdBackend`]), which cannot merge
+//! commitments and instead proves each evaluation separately with
+//! Merkle-tree column openings. Brakedown commitments have no
+//! randomness, so that instantiation is not zero-knowledge (the same
+//! trade-off Zinc+ makes).
 
 // Staged: consumed by the Brakedown Mod-PCS integration (threading the
 // backend through integer_modpcs is the next milestone).
@@ -61,7 +69,7 @@ pub(crate) fn bd_params(n: usize) -> &'static BrakedownParams<t256::Scalar> {
 /// commitment, its polynomial (and any retained commit data), the
 /// reduced point, and the claimed evaluation (already transcript-bound
 /// by the claim reduction).
-pub struct OpenTarget<'a, B: FBackend> {
+pub struct OpenTarget<'a, B: CommitBackend> {
   pub comm: &'a B::Comm,
   pub poly: &'a [t256::Scalar],
   pub blind: &'a B::Blind,
@@ -73,7 +81,7 @@ pub struct OpenTarget<'a, B: FBackend> {
 /// The F-side commitment backend seam. `Data` is whatever the prover
 /// retains alongside a commitment to answer openings (Hyrax: the blind;
 /// Brakedown: the encoded matrix + Merkle tree).
-pub trait FBackend: Sized + Send + Sync + 'static {
+pub trait CommitBackend: Sized + Send + Sync + 'static {
   type Ck: Send + Sync + Clone;
   type Vk: Send + Sync + Clone;
   type Comm: Clone + core::fmt::Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync;
@@ -122,7 +130,7 @@ pub trait FBackend: Sized + Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct BdBackend;
 
-impl FBackend for BdBackend {
+impl CommitBackend for BdBackend {
   type Ck = ();
   type Vk = ();
   type Comm = [u8; 32];

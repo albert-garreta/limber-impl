@@ -11,7 +11,7 @@ pub mod ipa;
 
 // implementations of polynomial commitment schemes
 pub mod brakedown;
-pub(crate) mod fbackend;
+pub(crate) mod commit_backend;
 pub mod hyrax_pc;
 pub mod integer_modpcs;
 pub mod kzh_pc;
