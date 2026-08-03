@@ -174,6 +174,47 @@ ECDSA MSM: 386 ms / 24 ms (was 545/43) — Zinc+ gap ~16× (was 23×). No protoc
 change; parameters only. The T=2^16 witness-commit-reuse idea was implemented,
 measured, and reverted (dominated by T=2^64 — details in imod_followups.md).
 
+## Update (2026-08-03): the Brakedown instantiation — measured, and a negative result worth having
+
+The full Mod-PCS now also runs over Brakedown (hash commitments, no
+elliptic-curve operations, non-hiding) behind a commitment-backend
+interface; same protocol, same committed-chunk layout, per-target
+tensor-IOPP final openings. Measured on the same multiswap 2¹³
+workload, single-threaded (BDPCS=1 on the multiswap bench):
+
+| instantiation | prove (total) | verify | proof |
+|---|---|---|---|
+| Ours / Hyrax (Pedersen) | **1.34 s** | **37.9 ms** | **~KB** |
+| Ours / Brakedown v1 | 2.44 s | 194 ms | 21.8 MB |
+| Zinc+ (IPRS) | 1.13 s | 482 ms | 1.21 MB zstd |
+
+**The projection that hash commitments would reach Zinc+ prover parity
+was wrong, and the reason is the finding:**
+
+1. After the small-scalar optimization campaign, our Pedersen chunk
+   commit (16-bit scalars, vartime buckets) costs ~380 ms — CHEAPER
+   than Brakedown's encode+hash (~1.1 s) at the same data. Group
+   arithmetic on small scalars beats hashing when the hashing is done
+   at field width.
+2. The structural cost is the **field-width tax**: our chunk values are
+   16-bit, but field-level Brakedown encodes and Keccak-hashes them as
+   256-bit field elements — ~16× more bytes than the information
+   content. Zinc+'s IPRS is **integer-native** (small `Int<W>` cells,
+   SIMD): that, not "hash vs group", is their prover advantage on this
+   axis.
+
+Known v1 caveats (would narrow but not close the gap): the 1.14 s
+commit includes one-time code-matrix sampling; w+q could share one
+Merkle tree (~30% proof-size saving); multithreading favors the hash
+side. The v1 numbers are end-to-end verified (roundtrip + tamper tests
+through the full SNARK driver).
+
+**Paper framing:** one protocol, measured at both ends of the
+commitment design space, with an explanation of why the frontier sits
+where it does — an integer-native code commitment (their design) or a
+small-scalar-optimized group commitment (ours) both beat a field-level
+hash commitment on small-valued data.
+
 ## Update (2026-07-22): committed-chunk representation
 
 The witness commitment now IS the range check's 16-bit chunk commitment
