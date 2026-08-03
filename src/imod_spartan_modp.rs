@@ -181,6 +181,17 @@ where
     Ok(Self::assemble_keys(shape, ck, vk_ee))
   }
 
+  /// Serialized size of the Mod-PCS evaluation argument — the dominant
+  /// proof component (the sumcheck round polynomials and claimed
+  /// evaluations add ~KBs of field elements on top; `DynPrime` lacks
+  /// serde, so whole-proof serialization is a separate follow-up).
+  pub fn eval_arg_size(&self) -> usize
+  where
+    ModBatchEvalArg<M>: serde::Serialize,
+  {
+    bincode::serialized_size(&self.eval_arg).map_or(0, |n| n as usize)
+  }
+
   /// Shared tail of `setup` / `setup_with_params`: precompute the
   /// commitment-key tables and assemble the prover/verifier keys from a
   /// prebuilt `(ck, vk_ee)` pair. (The Mod-PCS now owns its own size-1

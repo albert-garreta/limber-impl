@@ -2703,6 +2703,7 @@ fn finish_batch_open<
     .map(|(p, _)| {
       B::recommit_data(
         backend_ck,
+        comms[p],
         &rc_art.chunk_data[f_batch_idx[p]].0,
         blinds[p],
         true,
@@ -3184,6 +3185,7 @@ impl CommitBackend for HyBackend {
 
   fn recommit_data(
     _ck: &Self::Ck,
+    _comm: &Self::Comm,
     _poly: &[t256::Scalar],
     _blind: &Self::Blind,
     _small: bool,

@@ -311,6 +311,12 @@ fn compute_witness_advice(
 }
 
 fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
+  multiswap_shape_and_witness_for::<M>(d)
+}
+
+fn multiswap_shape_and_witness_for<MM: spartan2::traits::mod_engine::ModEngine>(
+  d: Dims,
+) -> (IntModR1CSShapeModp<MM>, Vec<BigUint>, Vec<BigUint>) {
   let n = modulus_n();
   let ell = modulus_ell();
   let p_hash = modulus_p_hash();
@@ -380,7 +386,7 @@ fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>
 
   mods.resize(num_cons, BigUint::from(2u32));
 
-  let shape = IntModR1CSShapeModp::<M>::new(
+  let shape = IntModR1CSShapeModp::<MM>::new(
     num_cons, num_vars, num_io, a_entries, b_entries, c_entries, mods,
   )
   .expect("valid IntMod-R1CS shape");
@@ -415,6 +421,40 @@ fn paper_fp_constraints(k: usize) -> u64 {
 
 fn multiswap_modp_benches(c: &mut Criterion) {
   let ks: &[usize] = &[0];
+
+  // BDPCS=1: measure the Brakedown-backed instantiation (hash
+  // commitments, non-hiding) on the same workload: commit+prove,
+  // verify, and serialized proof size. The comparison point against
+  // code-commitment systems.
+  if std::env::var_os("BDPCS").is_some() {
+    use spartan2::provider::T256DynPrimeBdEngine as BE;
+    use std::time::Instant;
+    let dims = Dims::multiswap(0);
+    let (shape, w, q) = multiswap_shape_and_witness_for::<BE>(dims);
+    let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
+    let params =
+      IntEvalParams::derive(2048, LOG_T, DEFAULT_K, log_n).expect("IntEval params satisfy bounds");
+    let (pk, vk) = IntModSpartanModpSNARK::<BE>::setup_with_params(shape.clone(), params).unwrap();
+    let t0 = Instant::now();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<BE>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let t_commit = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = Instant::now();
+    let proof = IntModSpartanModpSNARK::<BE>::prove(&pk, &instance, &witness).unwrap();
+    let t_prove = t1.elapsed().as_secs_f64() * 1e3;
+    let proof_bytes = proof.eval_arg_size();
+    let t2 = Instant::now();
+    proof.verify(&vk, &instance).unwrap();
+    let t_verify = t2.elapsed().as_secs_f64() * 1e3;
+    println!(
+      "MultiSwap 2^13 / Brakedown Mod-PCS: commit {t_commit:.1} ms, prove {t_prove:.1} ms, \
+       total {:.1} ms, verify {t_verify:.1} ms, proof {} bytes ({:.2} MB)",
+      t_commit + t_prove,
+      proof_bytes,
+      proof_bytes as f64 / 1e6,
+    );
+    return;
+  }
 
   // KSWEEP=1: time (commit + prove) per k at the current LOG_T, verify each
   // (soundness gate), print, and return (skip criterion). Used to re-find the

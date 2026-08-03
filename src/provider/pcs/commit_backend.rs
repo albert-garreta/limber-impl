@@ -65,6 +65,35 @@ pub(crate) fn bd_params(n: usize) -> &'static BrakedownParams<t256::Scalar> {
   params
 }
 
+/// Bounded cache of commit-time opening data, keyed by Merkle root, so
+/// `prove` does not re-encode witness polynomials committed moments
+/// earlier through the ModPCS surface. Purely a prover-side
+/// memoization: on a miss the data is recomputed and checked against
+/// the expected root.
+fn bd_data_cache_put(root: [u8; 32], data: BrakedownCommitData<t256::Scalar>) {
+  let cache = bd_data_cache();
+  let mut guard = cache.lock().expect("bd data cache poisoned");
+  if guard.len() >= 8 {
+    guard.clear();
+  }
+  guard.insert(root, data);
+}
+
+fn bd_data_cache_get(root: &[u8; 32]) -> Option<BrakedownCommitData<t256::Scalar>> {
+  bd_data_cache()
+    .lock()
+    .expect("bd data cache poisoned")
+    .get(root)
+    .cloned()
+}
+
+#[allow(clippy::type_complexity)]
+fn bd_data_cache() -> &'static Mutex<HashMap<[u8; 32], BrakedownCommitData<t256::Scalar>>> {
+  static CACHE: OnceLock<Mutex<HashMap<[u8; 32], BrakedownCommitData<t256::Scalar>>>> =
+    OnceLock::new();
+  CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// One final-opening target after the interleaved claim reduction: the
 /// commitment, its polynomial (and any retained commit data), the
 /// reduced point, and the claimed evaluation (already transcript-bound
@@ -98,9 +127,12 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
 
   /// Regenerate the retained opening data for a polynomial that was
   /// committed elsewhere (the ModPCS commit surface returns only the
-  /// commitment). Free for Hyrax (`()`); Brakedown re-encodes.
+  /// commitment). `comm` is the expected commitment. Free for Hyrax
+  /// (`()`); Brakedown serves it from a small cache filled at commit
+  /// time, re-encoding only on a miss.
   fn recommit_data(
     ck: &Self::Ck,
+    comm: &Self::Comm,
     poly: &[t256::Scalar],
     blind: &Self::Blind,
     small: bool,
@@ -154,15 +186,6 @@ impl CommitBackend for BdBackend {
     comm.to_vec()
   }
 
-  fn recommit_data(
-    ck: &Self::Ck,
-    poly: &[t256::Scalar],
-    blind: &Self::Blind,
-    small: bool,
-  ) -> Result<Self::Data, SpartanError> {
-    Ok(Self::commit(ck, poly, blind, small)?.1)
-  }
-
   fn commit(
     _ck: &Self::Ck,
     poly: &[t256::Scalar],
@@ -179,7 +202,27 @@ impl CommitBackend for BdBackend {
       &padded[..]
     };
     let (root, data) = brakedown_commit(params, poly);
+    bd_data_cache_put(root, data.clone());
     Ok((root, data))
+  }
+
+  fn recommit_data(
+    ck: &Self::Ck,
+    comm: &Self::Comm,
+    poly: &[t256::Scalar],
+    blind: &Self::Blind,
+    small: bool,
+  ) -> Result<Self::Data, SpartanError> {
+    if let Some(data) = bd_data_cache_get(comm) {
+      return Ok(data);
+    }
+    let (root, data) = Self::commit(ck, poly, blind, small)?;
+    if &root != comm {
+      return Err(SpartanError::InternalError {
+        reason: "brakedown recommit: root mismatch with the input commitment".to_string(),
+      });
+    }
+    Ok(data)
   }
 
   fn open_targets(
