@@ -1664,8 +1664,9 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     eval: &BigUint,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove");
-    let mut st = prove_one_poly(ck, transcript, poly, point, eval)?;
-    let (range_check, combined_open) = finish_batch_open(
+    let mut st = prove_one_poly::<HyBackend>(&ck.params, ck, transcript, poly, point, eval)?;
+    let (range_check, combined_open) = finish_batch_open::<HyBackend>(
+      &ck.params,
       ck,
       transcript,
       std::slice::from_mut(&mut st),
@@ -1702,16 +1703,22 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // Per polynomial: reduction sumcheck + chains, advancing the shared
     // transcript in index order. The expensive range check and inner-
     // product opening are then run ONCE over every polynomial's batches.
-    let mut states: Vec<PerPolyProver> = Vec::with_capacity(n);
+    let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
     for i in 0..n {
-      states.push(prove_one_poly(
-        ck, transcript, polys[i], points[i], evals[i],
+      states.push(prove_one_poly::<HyBackend>(
+        &ck.params, ck, transcript, polys[i], points[i], evals[i],
       )?);
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
     let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
-    let (range_check, combined_open) =
-      finish_batch_open(ck, transcript, &mut states, &comm_inners, &blind_inners)?;
+    let (range_check, combined_open) = finish_batch_open::<HyBackend>(
+      &ck.params,
+      ck,
+      transcript,
+      &mut states,
+      &comm_inners,
+      &blind_inners,
+    )?;
     let per_poly = states
       .into_iter()
       .map(|st| IntEvalPerPolyArgument {
@@ -1748,7 +1755,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &arg.chains,
       &arg.ab_comms,
     )?;
-    finish_batch_verify(
+    finish_batch_verify::<HyBackend>(
+      &vk.params,
       vk,
       transcript,
       &[&comm.inner],
@@ -1794,7 +1802,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       .iter()
       .map(|pp| pp.ab_comms.as_slice())
       .collect();
-    finish_batch_verify(
+    finish_batch_verify::<HyBackend>(
+      &vk.params,
       vk,
       transcript,
       &comm_inners,
@@ -1812,12 +1821,12 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 /// outputs plus the witness polynomials the shared range check / combined
 /// opening borrow from. Built by [`prove_one_poly`], consumed by
 /// [`finish_batch_open`].
-struct PerPolyProver {
+struct PerPolyProver<B: CommitBackend> {
   reduction_round_polys: Vec<Vec<BigUint>>,
   int_v_prime: BigInt,
   chains: Vec<ChainData>,
   /// Per-layer chunk commitments, 2 per layer (`a_j` then `b_j`).
-  ab_comms: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  ab_comms: Vec<B::Comm>,
   /// `f_limb` reduced to the Hyrax base field: F-batch value polynomial
   /// (chain-claim evaluations only — the combined open runs on chunks).
   poly_fq: Vec<t256::Scalar>,
@@ -1828,7 +1837,9 @@ struct PerPolyProver {
   /// Per-layer, per-role stacked chunk polynomials (the committed
   /// oracles) and their blinds; index `2·(j−1) + role`.
   ab_chunk_polys: Vec<Vec<t256::Scalar>>,
-  ab_blinds: Vec<<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind>,
+  ab_blinds: Vec<B::Blind>,
+  /// Retained opening data for each layer chunk commitment.
+  ab_open_aux: Vec<B::Data>,
   /// Accumulated multi-point claims on the input commitment / the
   /// per-layer chunk commitments (already in chunk coordinates).
   f_claims: OpenClaims,
@@ -1842,16 +1853,14 @@ struct PerPolyProver {
 /// a standalone open would through the chain-claim phase, and returns the
 /// proof outputs plus the witness data [`finish_batch_open`]'s shared
 /// range check and combined opening borrow from.
-fn prove_one_poly(
-  ck: &IntegerModCommitmentKey,
+fn prove_one_poly<B: CommitBackend>(
+  params: &IntEvalParams,
+  backend_ck: &B::Ck,
   transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
   poly: &[BigUint],
   point: &[crate::dyn_prime::DynPrime<4>],
   eval: &BigUint,
-) -> Result<PerPolyProver, SpartanError> {
-  type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
-  type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
-  let params = &ck.params;
+) -> Result<PerPolyProver<B>, SpartanError> {
   let monty = point
     .first()
     .map(|p| *p.params())
@@ -2092,8 +2101,9 @@ fn prove_one_poly(
   // and the small-scalar fast path always applies). Order: per layer
   // `j`, the `a_j` chunk commitment then the `b_j` one (2t total).
   let mut ab_chunk_polys: Vec<Vec<t256::Scalar>> = Vec::with_capacity(2 * t_layers);
-  let mut ab_blinds: Vec<HB> = Vec::with_capacity(2 * t_layers);
-  let mut ab_comms: Vec<HC> = Vec::with_capacity(2 * t_layers);
+  let mut ab_blinds: Vec<B::Blind> = Vec::with_capacity(2 * t_layers);
+  let mut ab_open_aux: Vec<B::Data> = Vec::with_capacity(2 * t_layers);
+  let mut ab_comms: Vec<B::Comm> = Vec::with_capacity(2 * t_layers);
   let (_ab_span, ab_t) = start_span!("imod_pcs_ab_commit");
   for jm1 in 0..t_layers {
     let m = 1usize << (num_vars - (jm1 + 1) * params.k);
@@ -2114,11 +2124,12 @@ fn prove_one_poly(
         .par_iter()
         .map(|&c| scalar_from_chunk(c))
         .collect();
-      let blind = Hyrax::blind(&ck.inner, chunk_fq.len());
-      let comm = Hyrax::commit(&ck.inner, &chunk_fq, &blind, true)?;
-      transcript.absorb(b"ab_chunk", &comm);
+      let blind = B::blind(backend_ck, chunk_fq.len());
+      let (comm, data) = B::commit(backend_ck, &chunk_fq, &blind, true)?;
+      transcript.absorb_bytes(b"ab_chunk", &B::comm_transcript_bytes(&comm));
       ab_chunk_polys.push(chunk_fq);
       ab_blinds.push(blind);
+      ab_open_aux.push(data);
       ab_comms.push(comm);
     }
   }
@@ -2245,6 +2256,7 @@ fn prove_one_poly(
     chain_states,
     ab_chunk_polys,
     ab_blinds,
+    ab_open_aux,
     f_claims,
     ab_claims,
     t_layers,
@@ -2260,16 +2272,14 @@ fn prove_one_poly(
 /// polynomial in turn (its `f_limb` batch then its `a_j`/`b_j` layer
 /// batches), then all chunk commitments in that batch order, then the
 /// shared multiplicity table.
-fn finish_batch_open(
-  ck: &IntegerModCommitmentKey,
+fn finish_batch_open<B: CommitBackend>(
+  params: &IntEvalParams,
+  backend_ck: &B::Ck,
   transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
-  states: &mut [PerPolyProver],
-  comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
-  blinds: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind],
-) -> Result<(SharedRangeCheck<HyBackend>, CombinedBatchOpen<HyBackend>), SpartanError> {
-  type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
-  type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
-  let params = &ck.params;
+  states: &mut [PerPolyProver<B>],
+  comms: &[&B::Comm],
+  blinds: &[&B::Blind],
+) -> Result<(SharedRangeCheck<B>, CombinedBatchOpen<B>), SpartanError> {
   let log_bound_a = params.log_p + 1;
   let log_bound_b = LOG_Q - params.log_p + 1;
 
@@ -2280,7 +2290,7 @@ fn finish_batch_open(
   // index.
   let mut f_batch_idx: Vec<usize> = Vec::with_capacity(states.len());
   let (range_check, rc_art) = {
-    let mut rc_batches: Vec<RangeBatchInputs<'_>> = Vec::new();
+    let mut rc_batches: Vec<RangeBatchInputs<'_, B>> = Vec::new();
     for (p, st) in states.iter().enumerate() {
       f_batch_idx.push(rc_batches.len());
       rc_batches.push(RangeBatchInputs {
@@ -2335,7 +2345,7 @@ fn finish_batch_open(
       }
     }
     let (_rc_span, rc_t) = start_span!("imod_pcs_rc_shared");
-    let out = prove_shared_range_check(&ck.inner, &ck.eval, &rc_batches, transcript)?;
+    let out = prove_shared_range_check::<B>(backend_ck, &rc_batches, transcript)?;
     info!(elapsed_ms = %rc_t.elapsed().as_millis(), "imod_pcs_rc_shared");
     out
   };
@@ -2384,33 +2394,50 @@ fn finish_batch_open(
   // its chunk polynomial.
   let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
   let mut bsub = spawn_batch_subtranscript(transcript)?;
-  let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &(), &OpenClaims)> = Vec::new();
+  let mut bo_targets: Vec<(&B::Comm, &[t256::Scalar], &B::Blind, &B::Data, &OpenClaims)> =
+    Vec::new();
+  // The input commitments were made through the ModPCS surface, which
+  // returns no retained opening data — regenerate it (free for Hyrax,
+  // a re-encode for Brakedown).
+  let f_open_aux: Vec<B::Data> = states
+    .iter()
+    .enumerate()
+    .map(|(p, _)| {
+      B::recommit_data(
+        backend_ck,
+        &rc_art.chunk_data[f_batch_idx[p]].0,
+        blinds[p],
+        true,
+      )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
   for (p, st) in states.iter().enumerate() {
     bo_targets.push((
       comms[p],
       rc_art.chunk_data[f_batch_idx[p]].0.as_slice(),
       blinds[p],
-      &(),
+      &f_open_aux[p],
       &f_target_claims[p],
     ));
-    for (((comm, poly), blind), claims) in st
+    for ((((comm, poly), blind), data), claims) in st
       .ab_comms
       .iter()
       .zip(st.ab_chunk_polys.iter())
       .zip(st.ab_blinds.iter())
+      .zip(st.ab_open_aux.iter())
       .zip(ab_target_claims[p].iter())
     {
-      bo_targets.push((comm, poly.as_slice(), blind, &(), claims));
+      bo_targets.push((comm, poly.as_slice(), blind, data, claims));
     }
   }
   bo_targets.push((
     &range_check.mult_comm,
     rc_art.mult_fq.as_slice(),
     &rc_art.mult_blind,
-    &(),
+    &rc_art.mult_data,
     &rc_art.mult_claims,
   ));
-  let combined_open = prove_combined_batch_open::<HyBackend>(ck, &mut bsub, &bo_targets)?;
+  let combined_open = prove_combined_batch_open::<B>(backend_ck, &mut bsub, &bo_targets)?;
   info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
 
   Ok((range_check, combined_open))
@@ -2667,21 +2694,21 @@ fn verify_one_poly(
 /// every polynomial's batches, then ONE combined-open verification over
 /// every commitment, in the same canonical order the prover used.
 #[allow(clippy::too_many_arguments)]
-fn finish_batch_verify(
-  vk: &IntegerModVerifierKey,
+fn finish_batch_verify<B: CommitBackend>(
+  params: &IntEvalParams,
+  backend_vk: &B::Vk,
   transcript: &mut Keccak256Transcript<T256DynPrimeEngine>,
-  comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
+  comms: &[&B::Comm],
   verifiers: &mut [PerPolyVerifier],
-  ab_comms_per_poly: &[&[<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment]],
-  range_check: &SharedRangeCheck<HyBackend>,
-  combined_open: &CombinedBatchOpen<HyBackend>,
+  ab_comms_per_poly: &[&[B::Comm]],
+  range_check: &SharedRangeCheck<B>,
+  combined_open: &CombinedBatchOpen<B>,
 ) -> Result<(), SpartanError> {
-  let params = &vk.params;
   let log_bound_a = params.log_p + 1;
   let log_bound_b = LOG_Q - params.log_p + 1;
 
   let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
-  let mut rc_metas: Vec<RangeBatchMeta<'_>> = Vec::new();
+  let mut rc_metas: Vec<RangeBatchMeta<'_, B>> = Vec::new();
   let mut f_batch_idx: Vec<usize> = Vec::with_capacity(verifiers.len());
   for (p, v) in verifiers.iter().enumerate() {
     f_batch_idx.push(rc_metas.len());
@@ -2754,11 +2781,7 @@ fn finish_batch_verify(
 
   let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
   let mut bsub = spawn_batch_subtranscript(transcript)?;
-  let mut bo_targets: Vec<(
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-    usize,
-    &OpenClaims,
-  )> = Vec::new();
+  let mut bo_targets: Vec<(&B::Comm, usize, &OpenClaims)> = Vec::new();
   for (p, v) in verifiers.iter().enumerate() {
     bo_targets.push((comms[p], v.num_vars + f_log_stride[p], &f_target_claims[p]));
     for (idx, ab_comm) in ab_comms_per_poly[p].iter().enumerate() {
@@ -2777,7 +2800,7 @@ fn finish_batch_verify(
     }
   }
   bo_targets.push((&range_check.mult_comm, CHUNK_BITS, &rc_claims.mult_claims));
-  verify_combined_batch_open::<HyBackend>(vk, &mut bsub, &bo_targets, combined_open)?;
+  verify_combined_batch_open::<B>(backend_vk, &mut bsub, &bo_targets, combined_open)?;
   info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
   Ok(())
 }
@@ -3070,7 +3093,7 @@ impl OpenClaims {
 /// polynomials, all of length `n_values` (a power of two) and the same
 /// bound `2^log_bound`. The value polynomials are NOT separately
 /// committed — their `V(r_v)` evaluation becomes a claim on `target`.
-struct RangeBatchInputs<'a> {
+struct RangeBatchInputs<'a, B: CommitBackend> {
   target: RcTarget,
   value_polys_fq: Vec<&'a [t256::Scalar]>,
   values: Vec<&'a [BigUint]>,
@@ -3084,14 +3107,11 @@ struct RangeBatchInputs<'a> {
   /// made and no value-reconstruction sumcheck runs — the chunk→value
   /// relation is definitional via [`chunk_fold_point`] — and the GKR's
   /// chunk claims are discharged against this commitment.
-  precommitted: Option<(
-    &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-    &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-  )>,
+  precommitted: Option<(&'a B::Comm, &'a B::Blind)>,
 }
 
 /// Verifier-side metadata for one batch of the shared range check.
-struct RangeBatchMeta<'a> {
+struct RangeBatchMeta<'a, B: CommitBackend> {
   target: RcTarget,
   num_polys: usize,
   n_values: usize,
@@ -3099,7 +3119,7 @@ struct RangeBatchMeta<'a> {
   /// Mirror of [`RangeBatchInputs::precommitted`]: the target's own
   /// commitment, for batches whose chunk polynomial is the committed
   /// representation itself (F batches).
-  precommitted_comm: Option<&'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
+  precommitted_comm: Option<&'a B::Comm>,
 }
 
 /// Sizes derived from a batch's public parameters, shared by prover and
@@ -3175,10 +3195,10 @@ fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
 /// shared multiplicity commitment — all before any challenge (in
 /// particular the LogUp `r`) is squeezed. Both prover and verifier
 /// reconstruct it identically.
-fn spawn_shared_range_subtranscript<'a>(
+fn spawn_shared_range_subtranscript<'a, B: CommitBackend>(
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-  chunk_comms: impl Iterator<Item = &'a <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment>,
-  mult_comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  chunk_comms: impl Iterator<Item = &'a B::Comm>,
+  mult_comm: &B::Comm,
 ) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
   let seed = parent.squeeze_bytes(b"range_seed")?;
   let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
@@ -3186,9 +3206,9 @@ fn spawn_shared_range_subtranscript<'a>(
   >>::new_with_params(b"range_check", ());
   sub.absorb_bytes(b"seed", &seed);
   for cc in chunk_comms {
-    sub.absorb(b"range_chunk_comm", cc);
+    sub.absorb_bytes(b"range_chunk_comm", &B::comm_transcript_bytes(cc));
   }
-  sub.absorb(b"range_mult_comm", mult_comm);
+  sub.absorb_bytes(b"range_mult_comm", &B::comm_transcript_bytes(mult_comm));
   Ok(sub)
 }
 
@@ -3544,15 +3564,13 @@ fn batch_weight(
 /// batched opens: value claims routed to `f` / stacked-layer targets,
 /// per-batch chunk polynomials + blinds + claims, and the multiplicity
 /// table's polynomial + blind + claim.
-struct RcProverArtifacts {
+struct RcProverArtifacts<B: CommitBackend> {
   value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)>,
-  chunk_data: Vec<(
-    Vec<t256::Scalar>,
-    <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-    OpenClaims,
-  )>,
+  chunk_data: Vec<(Vec<t256::Scalar>, B::Blind, OpenClaims)>,
   mult_fq: Vec<t256::Scalar>,
-  mult_blind: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+  mult_blind: B::Blind,
+  /// Retained opening data for the multiplicity commitment.
+  mult_data: B::Data,
   mult_claims: OpenClaims,
 }
 
@@ -3573,14 +3591,11 @@ struct RcVerifyClaims {
 /// per-batch `V(r_v)` value claims, and the reconstruction sumchecks'
 /// final chunk evaluations) are returned as CLAIMS to be discharged by
 /// the caller's batched opens — this function performs no Hyrax opens.
-fn prove_shared_range_check(
-  ck: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
-  _ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
-  batches: &[RangeBatchInputs<'_>],
+fn prove_shared_range_check<B: CommitBackend>(
+  backend_ck: &B::Ck,
+  batches: &[RangeBatchInputs<'_, B>],
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
-) -> Result<(SharedRangeCheck<HyBackend>, RcProverArtifacts), SpartanError> {
-  type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
-  type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+) -> Result<(SharedRangeCheck<B>, RcProverArtifacts<B>), SpartanError> {
   debug_assert!(!batches.is_empty());
 
   let dims: Vec<BatchDims> = batches
@@ -3597,11 +3612,11 @@ fn prove_shared_range_check(
   let (_rcc_span, rcc_t) = start_span!("rc_chunk_commit");
   let mut chunk_vals_all: Vec<Vec<u64>> = Vec::with_capacity(batches.len());
   let mut chunk_fq_all: Vec<Vec<t256::Scalar>> = Vec::with_capacity(batches.len());
-  let mut chunk_blinds: Vec<HB> = Vec::with_capacity(batches.len());
+  let mut chunk_blinds: Vec<B::Blind> = Vec::with_capacity(batches.len());
   // `Some` for batches that committed a fresh chunk polynomial here
   // (these land in `SharedRangeCheck::batches`); `None` for
   // precommitted batches.
-  let mut created_comms: Vec<Option<HC>> = Vec::with_capacity(batches.len());
+  let mut created_comms: Vec<Option<B::Comm>> = Vec::with_capacity(batches.len());
   for (b, d) in batches.iter().zip(dims.iter()) {
     let num_polys = b.value_polys_fq.len();
     debug_assert!(num_polys >= 1);
@@ -3625,8 +3640,8 @@ fn prove_shared_range_check(
       chunk_blinds.push((*blind).clone());
       created_comms.push(None);
     } else {
-      let blind = Hyrax::blind(ck, d.n_chunks);
-      let comm = Hyrax::commit(ck, &chunk_fq, &blind, true)?;
+      let blind = B::blind(backend_ck, d.n_chunks);
+      let (comm, _data) = B::commit(backend_ck, &chunk_fq, &blind, true)?;
       chunk_blinds.push(blind);
       created_comms.push(Some(comm));
     }
@@ -3635,7 +3650,7 @@ fn prove_shared_range_check(
   }
   // Canonical per-batch commitment references: the input commitment for
   // precommitted batches, the fresh chunk commitment otherwise.
-  let chunk_comm_refs: Vec<&HC> = batches
+  let chunk_comm_refs: Vec<&B::Comm> = batches
     .iter()
     .zip(created_comms.iter())
     .map(|(b, created)| match b.precommitted {
@@ -3676,13 +3691,13 @@ fn prove_shared_range_check(
     &witness_refs,
   )?;
   let mult_fq: Vec<t256::Scalar> = mult.iter().map(|&m| t256::Scalar::from(m)).collect();
-  let mult_blind = Hyrax::blind(ck, mult_fq.len());
-  let mult_comm = Hyrax::commit(ck, &mult_fq, &mult_blind, true)?;
+  let mult_blind = B::blind(backend_ck, mult_fq.len());
+  let (mult_comm, mult_data) = B::commit(backend_ck, &mult_fq, &mult_blind, true)?;
   info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "rc_mult_commit");
 
   // 4. Sub-transcript bound to (parent, chunk comms, mult comm).
   let mut sub =
-    spawn_shared_range_subtranscript(parent, chunk_comm_refs.iter().copied(), &mult_comm)?;
+    spawn_shared_range_subtranscript::<B>(parent, chunk_comm_refs.iter().copied(), &mult_comm)?;
 
   // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
   //    [0, 2^16). Its reduced claims become batched-open claims.
@@ -3725,7 +3740,7 @@ fn prove_shared_range_check(
   let (_rcr_span, rcr_t) = start_span!("rc_reconstr");
   let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
     Vec::with_capacity(batches.len());
-  let mut batch_data: Vec<RangeCheckBatchData<HyBackend>> = Vec::with_capacity(batches.len());
+  let mut batch_data: Vec<RangeCheckBatchData<B>> = Vec::with_capacity(batches.len());
   for (bi, (b, d)) in batches.iter().zip(dims.iter()).enumerate() {
     if b.precommitted.is_some() {
       // Zero-pad claims: the fold (`chunk_fold_point`) weighs EVERY
@@ -3804,7 +3819,7 @@ fn prove_shared_range_check(
 
   info!(elapsed_ms = %rcr_t.elapsed().as_millis(), "rc_reconstr");
 
-  let chunk_data: Vec<(Vec<t256::Scalar>, HB, OpenClaims)> = chunk_fq_all
+  let chunk_data: Vec<(Vec<t256::Scalar>, B::Blind, OpenClaims)> = chunk_fq_all
     .into_iter()
     .zip(chunk_blinds)
     .zip(chunk_claims)
@@ -3822,6 +3837,7 @@ fn prove_shared_range_check(
       chunk_data,
       mult_fq,
       mult_blind,
+      mult_data,
       mult_claims,
     },
   ))
@@ -3832,9 +3848,9 @@ fn prove_shared_range_check(
 /// pinned to the public batch shapes), re-runs each batch's
 /// reconstruction sumcheck against the claimed evaluations, and returns
 /// the claims for the batched-open verification.
-fn verify_shared_range_check(
-  metas: &[RangeBatchMeta<'_>],
-  arg: &SharedRangeCheck<HyBackend>,
+fn verify_shared_range_check<B: CommitBackend>(
+  metas: &[RangeBatchMeta<'_, B>],
+  arg: &SharedRangeCheck<B>,
   parent: &mut Keccak256Transcript<T256DynPrimeEngine>,
 ) -> Result<RcVerifyClaims, SpartanError> {
   // The proof carries per-batch data only for batches that committed a
@@ -3853,7 +3869,7 @@ fn verify_shared_range_check(
     .collect();
   // Canonical per-batch commitment references (input comm for
   // precommitted batches, proof-carried chunk comm otherwise).
-  let chunk_comm_refs: Vec<&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment> = {
+  let chunk_comm_refs: Vec<&B::Comm> = {
     let mut fresh = arg.batches.iter();
     metas
       .iter()
@@ -3877,7 +3893,7 @@ fn verify_shared_range_check(
 
   // 1. Spawn the same sub-transcript the prover used.
   let mut sub =
-    spawn_shared_range_subtranscript(parent, chunk_comm_refs.iter().copied(), &arg.mult_comm)?;
+    spawn_shared_range_subtranscript::<B>(parent, chunk_comm_refs.iter().copied(), &arg.mult_comm)?;
 
   // 2. Multi-witness LogUp membership: every chunk (and shifted top) in
   //    [0, 2^16). Its reduced claims become batched-open claims.
