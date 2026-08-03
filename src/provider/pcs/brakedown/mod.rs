@@ -10,3 +10,10 @@ pub mod code;
 pub mod commit;
 pub mod eval;
 pub mod merkle;
+
+pub use code::DEFAULT_SPEC;
+pub use commit::{BrakedownCommitData, BrakedownParams, commit as brakedown_commit};
+pub use eval::{
+  BrakedownEvalArg, open_with_data as brakedown_open_with_data,
+  verify_open as brakedown_verify_open,
+};

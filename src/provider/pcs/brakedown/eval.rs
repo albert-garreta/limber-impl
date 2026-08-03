@@ -14,7 +14,7 @@
 
 use super::{
   code::{next_index, next_scalar, xof},
-  commit::{BrakedownParams, column_to_bytes, commit},
+  commit::{BrakedownCommitData, BrakedownParams, column_to_bytes, commit},
   merkle::{Hash, hash_leaf, verify_batch_path},
 };
 use crate::{
@@ -27,7 +27,11 @@ use std::collections::HashMap;
 /// Evaluation argument: the proximity row, the eval row, the opened columns
 /// (sorted-unique `(index, entries)`), and one batched Merkle multiproof
 /// covering all of them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+  serialize = "F: serde::Serialize",
+  deserialize = "F: serde::de::DeserializeOwned"
+))]
 pub struct BrakedownEvalArg<F> {
   w_prox: Vec<F>,
   w_eval: Vec<F>,
@@ -93,7 +97,19 @@ pub fn open<F: PrimeFieldExt>(
   transcript: &mut impl ByteTranscript,
 ) -> Result<(F, BrakedownEvalArg<F>), SpartanError> {
   let (root, data) = commit(params, poly);
-  transcript.absorb_bytes(b"bd_root", &root);
+  open_with_data(params, &root, &data, point, transcript)
+}
+
+/// Like [`open`], but against an already-committed polynomial's retained
+/// [`BrakedownCommitData`] — skips the re-encode + re-hash `open` pays.
+pub fn open_with_data<F: PrimeFieldExt>(
+  params: &BrakedownParams<F>,
+  root: &Hash,
+  data: &BrakedownCommitData<F>,
+  point: &[F],
+  transcript: &mut impl ByteTranscript,
+) -> Result<(F, BrakedownEvalArg<F>), SpartanError> {
+  transcript.absorb_bytes(b"bd_root", root);
   let log_rows = params.n_rows.trailing_zeros() as usize;
   let e_row = eq_evals(&point[..log_rows]);
   let e_col = eq_evals(&point[log_rows..]);
