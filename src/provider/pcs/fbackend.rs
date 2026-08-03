@@ -64,6 +64,7 @@ pub(crate) fn bd_params(n: usize) -> &'static BrakedownParams<t256::Scalar> {
 pub(crate) struct OpenTarget<'a, B: FBackend> {
   pub comm: &'a B::Comm,
   pub poly: &'a [t256::Scalar],
+  pub blind: &'a B::Blind,
   pub data: &'a B::Data,
   pub point: Vec<t256::Scalar>,
   pub eval: t256::Scalar,
@@ -76,14 +77,22 @@ pub(crate) trait FBackend: Sized + Send + Sync + 'static {
   type Ck: Send + Sync + Clone;
   type Vk: Send + Sync + Clone;
   type Comm: Clone + core::fmt::Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync;
+  type Blind: Clone + core::fmt::Debug + Serialize + DeserializeOwned + Send + Sync;
   type Data: Send + Sync;
   type BatchOpenArg: Clone + core::fmt::Debug + Serialize + DeserializeOwned + Send + Sync;
 
-  /// Commit to an F-polynomial. `small` hints that every coefficient is
-  /// < 2^16 (Hyrax uses the small-scalar MSM path; Brakedown ignores it).
+  /// Fresh commitment randomness for an `n`-coefficient polynomial
+  /// (`()` for non-hiding backends).
+  fn blind(ck: &Self::Ck, n: usize) -> Self::Blind;
+
+  /// Commit to an F-polynomial under `blind`. `small` hints that every
+  /// coefficient is < 2^16 (Hyrax small-scalar MSM path; Brakedown
+  /// ignores it). Deterministic given `(poly, blind)` — callers
+  /// recommit to check commitment equality.
   fn commit(
     ck: &Self::Ck,
     poly: &[t256::Scalar],
+    blind: &Self::Blind,
     small: bool,
   ) -> Result<(Self::Comm, Self::Data), SpartanError>;
 
@@ -114,12 +123,16 @@ impl FBackend for BdBackend {
   type Ck = ();
   type Vk = ();
   type Comm = [u8; 32];
+  type Blind = ();
   type Data = BrakedownCommitData<t256::Scalar>;
   type BatchOpenArg = Vec<BrakedownEvalArg<t256::Scalar>>;
+
+  fn blind(_ck: &Self::Ck, _n: usize) -> Self::Blind {}
 
   fn commit(
     _ck: &Self::Ck,
     poly: &[t256::Scalar],
+    _blind: &Self::Blind,
     _small: bool,
   ) -> Result<(Self::Comm, Self::Data), SpartanError> {
     let params = bd_params(poly.len().next_power_of_two());
