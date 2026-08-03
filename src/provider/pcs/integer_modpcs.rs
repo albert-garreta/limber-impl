@@ -28,6 +28,7 @@
 //! `s` independent primes implies the integer evaluation is correct
 //! with high probability.
 
+use crate::provider::pcs::fbackend::{FBackend, OpenTarget};
 use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
@@ -617,7 +618,7 @@ pub struct IntEvalArgument {
   /// anywhere in the protocol, over all commitments in canonical order:
   /// the input `f`, the stacked layers `ab_1..ab_t`, the `1+2t` chunk
   /// commitments, and the multiplicity table.
-  pub(crate) combined_open: CombinedBatchOpen,
+  pub(crate) combined_open: CombinedBatchOpen<HyBackend>,
 }
 
 /// Per-polynomial portion of a batched [`IntEvalBatchArgument`]: the same
@@ -652,7 +653,7 @@ pub struct IntEvalBatchArgument {
   /// ONE shared LogUp-GKR range check covering every batch of every poly.
   pub(crate) range_check: SharedRangeCheck,
   /// ONE combined opening discharging every evaluation claim of every poly.
-  pub(crate) combined_open: CombinedBatchOpen,
+  pub(crate) combined_open: CombinedBatchOpen<HyBackend>,
 }
 
 /// ONE combined multi-point opening for ALL commitments of a Mod-PCS
@@ -667,18 +668,26 @@ pub struct IntEvalBatchArgument {
 /// ([`HyraxPCS::prove_same_column_batch`]). Sub-column-width commitments
 /// (test sizes) fall back to individual opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CombinedBatchOpen {
+#[serde(bound = "")]
+pub struct CombinedBatchOpen<B: crate::provider::pcs::fbackend::FBackend> {
   /// Per-commitment compressed sumcheck round polynomials, tail-aligned
   /// to the shared challenge vector (entry `j` has `n_j` rounds).
   pub(crate) round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<t256::Scalar>>>,
   /// Per-commitment claimed final evaluation `f_j(r_j)`.
   pub(crate) final_evals: Vec<t256::Scalar>,
-  /// The merged same-column opening (`f_y` is the μ-combined value
-  /// `Σ μ^pos·f_j(r_j)` over the merged commitments). `None` iff no
-  /// commitment reaches the column width.
+  /// The backend's discharge of the per-commitment single-point
+  /// openings (Hyrax: μ-merged same-column IPA + small-size fallback
+  /// opens; Brakedown: per-target tensor-IOPP arguments).
+  pub(crate) backend: B::BatchOpenArg,
+}
+
+/// Hyrax's final-opening argument: the μ-merged same-column opening over
+/// every column-width-or-larger commitment plus individual fallback
+/// opens for the sub-column-width ones (test sizes), in canonical order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HyraxBatchOpenArg {
+  /// `None` iff no commitment reaches the column width.
   pub(crate) merged: Option<SmallPrimeOpening>,
-  /// Individual fallback opens for sub-column-width commitments, in
-  /// canonical order.
   pub(crate) small_opens: Vec<SmallPrimeOpening>,
 }
 
@@ -2252,7 +2261,7 @@ fn finish_batch_open(
   states: &mut [PerPolyProver],
   comms: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment],
   blinds: &[&<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind],
-) -> Result<(SharedRangeCheck, CombinedBatchOpen), SpartanError> {
+) -> Result<(SharedRangeCheck, CombinedBatchOpen<HyBackend>), SpartanError> {
   type HC = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
   type HB = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
   let params = &ck.params;
@@ -2370,12 +2379,13 @@ fn finish_batch_open(
   // its chunk polynomial.
   let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
   let mut bsub = spawn_batch_subtranscript(transcript)?;
-  let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &OpenClaims)> = Vec::new();
+  let mut bo_targets: Vec<(&HC, &[t256::Scalar], &HB, &(), &OpenClaims)> = Vec::new();
   for (p, st) in states.iter().enumerate() {
     bo_targets.push((
       comms[p],
       rc_art.chunk_data[f_batch_idx[p]].0.as_slice(),
       blinds[p],
+      &(),
       &f_target_claims[p],
     ));
     for (((comm, poly), blind), claims) in st
@@ -2385,16 +2395,17 @@ fn finish_batch_open(
       .zip(st.ab_blinds.iter())
       .zip(ab_target_claims[p].iter())
     {
-      bo_targets.push((comm, poly.as_slice(), blind, claims));
+      bo_targets.push((comm, poly.as_slice(), blind, &(), claims));
     }
   }
   bo_targets.push((
     &range_check.mult_comm,
     rc_art.mult_fq.as_slice(),
     &rc_art.mult_blind,
+    &(),
     &rc_art.mult_claims,
   ));
-  let combined_open = prove_combined_batch_open(&ck.inner, &ck.eval, &mut bsub, &bo_targets)?;
+  let combined_open = prove_combined_batch_open::<HyBackend>(ck, &mut bsub, &bo_targets)?;
   info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
 
   Ok((range_check, combined_open))
@@ -2658,7 +2669,7 @@ fn finish_batch_verify(
   verifiers: &mut [PerPolyVerifier],
   ab_comms_per_poly: &[&[<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment]],
   range_check: &SharedRangeCheck,
-  combined_open: &CombinedBatchOpen,
+  combined_open: &CombinedBatchOpen<HyBackend>,
 ) -> Result<(), SpartanError> {
   let params = &vk.params;
   let log_bound_a = params.log_p + 1;
@@ -2761,7 +2772,7 @@ fn finish_batch_verify(
     }
   }
   bo_targets.push((&range_check.mult_comm, CHUNK_BITS, &rc_claims.mult_claims));
-  verify_combined_batch_open(&vk.inner, &vk.eval, &mut bsub, &bo_targets, combined_open)?;
+  verify_combined_batch_open::<HyBackend>(vk, &mut bsub, &bo_targets, combined_open)?;
   info!(elapsed_ms = %vbo_t.elapsed().as_millis(), "imod_pcs_verify_batched_opens");
   Ok(())
 }
@@ -2798,6 +2809,161 @@ struct ChainProverState {
   p_i: BigUint,
   r_i_int: Vec<BigUint>,
   iters: Vec<IterationProverState>,
+}
+
+/// The Hyrax/Pedersen instantiation of the F-side backend seam:
+/// preserves the pre-seam protocol byte-for-byte — the μ challenge, the
+/// width split between the merged same-column IPA and individual
+/// fallback opens, and every absorb happen in the exact order the
+/// monolithic implementation used.
+#[derive(Clone, Debug)]
+pub(crate) struct HyBackend;
+
+impl FBackend for HyBackend {
+  type Ck = IntegerModCommitmentKey;
+  type Vk = IntegerModVerifierKey;
+  type Comm = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
+  type Blind = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind;
+  type Data = ();
+  type BatchOpenArg = HyraxBatchOpenArg;
+
+  fn blind(ck: &Self::Ck, n: usize) -> Self::Blind {
+    Hyrax::blind(&ck.inner, n)
+  }
+
+  fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8> {
+    comm.to_transcript_bytes()
+  }
+
+  fn commit(
+    ck: &Self::Ck,
+    poly: &[t256::Scalar],
+    blind: &Self::Blind,
+    small: bool,
+  ) -> Result<(Self::Comm, Self::Data), SpartanError> {
+    Ok((Hyrax::commit(&ck.inner, poly, blind, small)?, ()))
+  }
+
+  fn open_targets(
+    ck: &Self::Ck,
+    targets: &[OpenTarget<'_, Self>],
+    sub: &mut impl ByteTranscript,
+  ) -> Result<Self::BatchOpenArg, SpartanError> {
+    let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
+    let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
+
+    // Merge every column-width-or-larger commitment into ONE same-column
+    // IPA; open the rest (test sizes) individually.
+    let width = Hyrax::key_num_cols(&ck.inner);
+    let mut small_opens = Vec::new();
+    let mut big_items: Vec<(
+      &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+      &[t256::Scalar],
+      &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
+      Vec<t256::Scalar>,
+    )> = Vec::new();
+    let mut y_star = t256::Scalar::ZERO;
+    let mut mu_pow = t256::Scalar::ONE;
+    for t in targets {
+      if t.poly.len() >= width {
+        y_star += mu_pow * t.eval;
+        mu_pow *= mu;
+        big_items.push((t.comm, t.poly, t.blind, t.point.clone()));
+      } else {
+        small_opens.push(hyrax_open_at(
+          &ck.inner, &ck.eval, sub, t.comm, t.poly, t.blind, &t.point,
+        )?);
+      }
+    }
+    let merged = if big_items.is_empty() {
+      None
+    } else {
+      // `y_star` is recomputed by the verifier from the in-clear final
+      // evaluations, so the eval commitment needs no hiding: use the
+      // deterministic zero-blind `G^{y_star}`.
+      let blind_eval = HyraxBlind::<T256HyraxEngine>::zero(&ck.eval, 1);
+      let comm_eval = Hyrax::commit(&ck.eval, &[y_star], &blind_eval, false)?;
+      let arg = Hyrax::prove_same_column_batch(
+        &ck.inner,
+        &ck.eval,
+        sub,
+        &big_items,
+        mu,
+        &comm_eval,
+        &blind_eval,
+      )?;
+      Some(SmallPrimeOpening {
+        f_y: y_star,
+        hyrax_arg: arg,
+      })
+    };
+    Ok(HyraxBatchOpenArg {
+      merged,
+      small_opens,
+    })
+  }
+
+  fn verify_targets(
+    vk: &Self::Vk,
+    targets: &[(&Self::Comm, Vec<t256::Scalar>, t256::Scalar)],
+    arg: &Self::BatchOpenArg,
+    sub: &mut impl ByteTranscript,
+  ) -> Result<(), SpartanError> {
+    let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
+    let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
+
+    let width = Hyrax::vk_num_cols(&vk.inner);
+    let mut small_iter = arg.small_opens.iter();
+    let mut big_items: Vec<(
+      &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+      Vec<t256::Scalar>,
+    )> = Vec::new();
+    let mut y_star = t256::Scalar::ZERO;
+    let mut mu_pow = t256::Scalar::ONE;
+    for (comm, r_j, eval) in targets {
+      if (1usize << r_j.len()) >= width {
+        y_star += mu_pow * eval;
+        mu_pow *= mu;
+        big_items.push((comm, r_j.clone()));
+      } else {
+        let open = small_iter
+          .next()
+          .ok_or(SpartanError::InvalidSumcheckProof)?;
+        hyrax_verify_open(&vk.inner, &vk.eval, sub, comm, r_j, open)?;
+        if open.f_y != *eval {
+          return Err(SpartanError::InvalidSumcheckProof);
+        }
+      }
+    }
+    if small_iter.next().is_some() {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    if big_items.is_empty() {
+      if arg.merged.is_some() {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+    } else {
+      let merged = arg
+        .merged
+        .as_ref()
+        .ok_or(SpartanError::InvalidSumcheckProof)?;
+      if merged.f_y != y_star {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+      let zero_blind = HyraxBlind::<T256HyraxEngine>::zero(&vk.eval, 1);
+      let comm_eval = Hyrax::commit(&vk.eval, &[merged.f_y], &zero_blind, false)?;
+      Hyrax::verify_same_column_batch(
+        &vk.inner,
+        &vk.eval,
+        sub,
+        &big_items,
+        mu,
+        &comm_eval,
+        &merged.hyrax_arg,
+      )?;
+    }
+    Ok(())
+  }
 }
 
 /// Helper: open the Hyrax commitment `comm` at `point` to produce a
@@ -3028,12 +3194,12 @@ fn spawn_batch_subtranscript(
 
 /// Absorb a commitment and its claims into the batch sub-transcript,
 /// binding them before the RLC challenge λ is squeezed.
-fn absorb_batch_claims(
+fn absorb_batch_claims<B: FBackend>(
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  comm: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
+  comm: &B::Comm,
   claims: &OpenClaims,
 ) {
-  sub.absorb(b"bo_comm", comm);
+  sub.absorb_bytes(b"bo_comm", &B::comm_transcript_bytes(comm));
   for (z, y) in claims.points.iter().zip(claims.evals.iter()) {
     for c in z {
       sub.absorb_bytes(b"bo_pt", c.to_repr().as_ref());
@@ -3044,17 +3210,11 @@ fn absorb_batch_claims(
 
 /// Prove the combined multi-point opening (see [`CombinedBatchOpen`]).
 /// `targets` are `(commitment, poly, blind, claims)` in canonical order.
-fn prove_combined_batch_open(
-  ck: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
-  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+fn prove_combined_batch_open<B: FBackend>(
+  ck: &B::Ck,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  targets: &[(
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-    &[t256::Scalar],
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-    &OpenClaims,
-  )],
-) -> Result<CombinedBatchOpen, SpartanError> {
+  targets: &[(&B::Comm, &[t256::Scalar], &B::Blind, &B::Data, &OpenClaims)],
+) -> Result<CombinedBatchOpen<B>, SpartanError> {
   use crate::polys::univariate::UniPoly;
   let m = targets.len();
 
@@ -3065,9 +3225,9 @@ fn prove_combined_batch_open(
   let mut ws = Vec::with_capacity(m);
   let mut run = Vec::with_capacity(m);
   let mut nv = Vec::with_capacity(m);
-  for (comm, poly, _, claims) in targets {
+  for (comm, poly, _, _, claims) in targets {
     debug_assert!(!claims.points.is_empty());
-    absorb_batch_claims(sub, comm, claims);
+    absorb_batch_claims::<B>(sub, comm, claims);
     let lambda = sub.squeeze(b"bo_lambda")?;
     let (w, c) = batch_weight(&claims.points, &claims.evals, lambda, poly.len());
     fs.push(crate::polys::multilinear::MultilinearPolynomial::new(
@@ -3134,77 +3294,44 @@ fn prove_combined_batch_open(
 
   info!(elapsed_ms = %bs_t.elapsed().as_millis(), "bo_interleaved_sc");
 
-  // 3. Send the per-commitment final evaluations, then μ.
+  // 3. Send the per-commitment final evaluations; the backend
+  //    discharges the resulting one-evaluation-per-commitment claims.
   let final_evals: Vec<t256::Scalar> = fs.iter().map(|f| f[0]).collect();
   for y in &final_evals {
     sub.absorb_bytes(b"cbo_fe", y.to_repr().as_ref());
   }
-  let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
-  let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
 
-  let (_bm_span, bm_t) = start_span!("bo_merged_ipa");
-  // 4. Merge every column-width-or-larger commitment into ONE same-column
-  //    IPA; open the rest (test sizes) individually.
-  let width = Hyrax::key_num_cols(ck);
-  let mut small_opens = Vec::new();
-  let mut big_items: Vec<(
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-    &[t256::Scalar],
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Blind,
-    Vec<t256::Scalar>,
-  )> = Vec::new();
-  let mut y_star = t256::Scalar::ZERO;
-  let mut mu_pow = t256::Scalar::ONE;
-  for (j, (comm, poly, blind, _)) in targets.iter().enumerate() {
-    let r_j = challenges[n_max - nv[j]..].to_vec();
-    if poly.len() >= width {
-      y_star += mu_pow * final_evals[j];
-      mu_pow *= mu;
-      big_items.push((comm, poly, blind, r_j));
-    } else {
-      small_opens.push(hyrax_open_at(ck, ck_eval, sub, comm, poly, blind, &r_j)?);
-    }
-  }
-  let merged = if big_items.is_empty() {
-    None
-  } else {
-    // `y_star` is recomputed by the verifier from the in-clear
-    // `final_evals`, so the eval commitment needs no hiding: use the
-    // deterministic zero-blind `G^{y_star}` (same treatment as
-    // `hyrax_open_at`).
-    let blind_eval = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
-    let comm_eval = Hyrax::commit(ck_eval, &[y_star], &blind_eval, false)?;
-    let arg =
-      Hyrax::prove_same_column_batch(ck, ck_eval, sub, &big_items, mu, &comm_eval, &blind_eval)?;
-    Some(SmallPrimeOpening {
-      f_y: y_star,
-      hyrax_arg: arg,
+  let (_bm_span, bm_t) = start_span!("bo_backend_open");
+  let open_targets: Vec<OpenTarget<'_, B>> = targets
+    .iter()
+    .enumerate()
+    .map(|(j, &(comm, poly, blind, data, _))| OpenTarget {
+      comm,
+      poly,
+      blind,
+      data,
+      point: challenges[n_max - nv[j]..].to_vec(),
+      eval: final_evals[j],
     })
-  };
-
-  info!(elapsed_ms = %bm_t.elapsed().as_millis(), "bo_merged_ipa");
+    .collect();
+  let backend = B::open_targets(ck, &open_targets, sub)?;
+  info!(elapsed_ms = %bm_t.elapsed().as_millis(), "bo_backend_open");
 
   Ok(CombinedBatchOpen {
     round_polys,
     final_evals,
-    merged,
-    small_opens,
+    backend,
   })
 }
 
 /// Verifier mirror of [`prove_combined_batch_open`]. `targets` are
 /// `(commitment, num_vars, claims)` in canonical order; every claim's
 /// point length is pinned to its commitment's variable count.
-fn verify_combined_batch_open(
-  vk: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::VerifierKey,
-  ck_eval: &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+fn verify_combined_batch_open<B: FBackend>(
+  vk: &B::Vk,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  targets: &[(
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-    usize,
-    &OpenClaims,
-  )],
-  arg: &CombinedBatchOpen,
+  targets: &[(&B::Comm, usize, &OpenClaims)],
+  arg: &CombinedBatchOpen<B>,
 ) -> Result<(), SpartanError> {
   let m = targets.len();
   if arg.round_polys.len() != m || arg.final_evals.len() != m {
@@ -3220,7 +3347,7 @@ fn verify_combined_batch_open(
     if arg.round_polys[j].len() != *num_vars {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    absorb_batch_claims(sub, comm, claims);
+    absorb_batch_claims::<B>(sub, comm, claims);
     let lambda = sub.squeeze(b"bo_lambda")?;
     let mut c = t256::Scalar::ZERO;
     let mut lam_pow = t256::Scalar::ONE;
@@ -3273,61 +3400,19 @@ fn verify_combined_batch_open(
   for y in &arg.final_evals {
     sub.absorb_bytes(b"cbo_fe", y.to_repr().as_ref());
   }
-  let mu_bytes = sub.squeeze_bytes(b"cbo_mu")?;
-  let mu = <t256::Scalar as PrimeFieldExt>::from_uniform(&mu_bytes);
 
-  let width = Hyrax::vk_num_cols(vk);
-  let mut small_iter = arg.small_opens.iter();
-  let mut big_items: Vec<(
-    &<Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment,
-    Vec<t256::Scalar>,
-  )> = Vec::new();
-  let mut y_star = t256::Scalar::ZERO;
-  let mut mu_pow = t256::Scalar::ONE;
-  for (j, (comm, num_vars, _)) in targets.iter().enumerate() {
-    let r_j = challenges[n_max - nv[j]..].to_vec();
-    if (1usize << num_vars) >= width {
-      y_star += mu_pow * arg.final_evals[j];
-      mu_pow *= mu;
-      big_items.push((comm, r_j));
-    } else {
-      let open = small_iter
-        .next()
-        .ok_or(SpartanError::InvalidSumcheckProof)?;
-      hyrax_verify_open(vk, ck_eval, sub, comm, &r_j, open)?;
-      if open.f_y != arg.final_evals[j] {
-        return Err(SpartanError::InvalidSumcheckProof);
-      }
-    }
-  }
-  if small_iter.next().is_some() {
-    return Err(SpartanError::InvalidSumcheckProof);
-  }
-  if big_items.is_empty() {
-    if arg.merged.is_some() {
-      return Err(SpartanError::InvalidSumcheckProof);
-    }
-  } else {
-    let merged = arg
-      .merged
-      .as_ref()
-      .ok_or(SpartanError::InvalidSumcheckProof)?;
-    if merged.f_y != y_star {
-      return Err(SpartanError::InvalidSumcheckProof);
-    }
-    let zero_blind = HyraxBlind::<T256HyraxEngine>::zero(ck_eval, 1);
-    let comm_eval = Hyrax::commit(ck_eval, &[merged.f_y], &zero_blind, false)?;
-    Hyrax::verify_same_column_batch(
-      vk,
-      ck_eval,
-      sub,
-      &big_items,
-      mu,
-      &comm_eval,
-      &merged.hyrax_arg,
-    )?;
-  }
-  Ok(())
+  let vt: Vec<(&B::Comm, Vec<t256::Scalar>, t256::Scalar)> = targets
+    .iter()
+    .enumerate()
+    .map(|(j, (comm, _, _))| {
+      (
+        *comm,
+        challenges[n_max - nv[j]..].to_vec(),
+        arg.final_evals[j],
+      )
+    })
+    .collect();
+  B::verify_targets(vk, &vt, &arg.backend, sub)
 }
 
 /// Build `W = Σ_i λ^i·eq(z_i, ·)` (length `n`) and the combined claim

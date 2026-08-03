@@ -61,7 +61,7 @@ pub(crate) fn bd_params(n: usize) -> &'static BrakedownParams<t256::Scalar> {
 /// commitment, its polynomial (and any retained commit data), the
 /// reduced point, and the claimed evaluation (already transcript-bound
 /// by the claim reduction).
-pub(crate) struct OpenTarget<'a, B: FBackend> {
+pub struct OpenTarget<'a, B: FBackend> {
   pub comm: &'a B::Comm,
   pub poly: &'a [t256::Scalar],
   pub blind: &'a B::Blind,
@@ -73,7 +73,7 @@ pub(crate) struct OpenTarget<'a, B: FBackend> {
 /// The F-side commitment backend seam. `Data` is whatever the prover
 /// retains alongside a commitment to answer openings (Hyrax: the blind;
 /// Brakedown: the encoded matrix + Merkle tree).
-pub(crate) trait FBackend: Sized + Send + Sync + 'static {
+pub trait FBackend: Sized + Send + Sync + 'static {
   type Ck: Send + Sync + Clone;
   type Vk: Send + Sync + Clone;
   type Comm: Clone + core::fmt::Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync;
@@ -84,6 +84,9 @@ pub(crate) trait FBackend: Sized + Send + Sync + 'static {
   /// Fresh commitment randomness for an `n`-coefficient polynomial
   /// (`()` for non-hiding backends).
   fn blind(ck: &Self::Ck, n: usize) -> Self::Blind;
+
+  /// Transcript representation of a commitment (`absorb`-equivalent).
+  fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8>;
 
   /// Commit to an F-polynomial under `blind`. `small` hints that every
   /// coefficient is < 2^16 (Hyrax small-scalar MSM path; Brakedown
@@ -117,7 +120,7 @@ pub(crate) trait FBackend: Sized + Send + Sync + 'static {
 /// Brakedown (hash-based) backend: non-hiding, MSM-free, per-target
 /// tensor-IOPP openings. The comparison instantiation.
 #[derive(Clone, Debug)]
-pub(crate) struct BdBackend;
+pub struct BdBackend;
 
 impl FBackend for BdBackend {
   type Ck = ();
@@ -128,6 +131,10 @@ impl FBackend for BdBackend {
   type BatchOpenArg = Vec<BrakedownEvalArg<t256::Scalar>>;
 
   fn blind(_ck: &Self::Ck, _n: usize) -> Self::Blind {}
+
+  fn comm_transcript_bytes(comm: &Self::Comm) -> Vec<u8> {
+    comm.to_vec()
+  }
 
   fn commit(
     _ck: &Self::Ck,
