@@ -680,8 +680,13 @@ mod tests {
       let (sval, lpval, nl) = (params.s, params.log_p, params.numlimb);
       let (pk, vk) =
         IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+      // Witness commitment is part of the prover's work — cross-system
+      // comparisons (e.g. Zinc+, whose prove commits internally) must
+      // use commit + prove.
+      let tc = Instant::now();
       let (witness, instance) =
         IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+      let commit_ms = tc.elapsed().as_secs_f64() * 1e3;
       let t0 = Instant::now();
       let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
       let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -689,8 +694,9 @@ mod tests {
       proof.verify(&vk, &instance).unwrap();
       let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
       println!(
-        "  k={k:<2} (s={sval}, log_p={lpval}, numlimb={nl}): \
-         prove {prove_ms:7.1} ms, verify {verify_ms:.1} ms"
+        "  k={k:<2} (s={sval}, log_p={lpval}, numlimb={nl}): commit {commit_ms:6.1} ms, \
+         prove {prove_ms:7.1} ms, commit+prove {:7.1} ms, verify {verify_ms:.1} ms",
+        commit_ms + prove_ms
       );
     }
   }

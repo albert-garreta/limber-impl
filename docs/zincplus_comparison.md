@@ -234,7 +234,25 @@ The witness commitment now IS the range check's 16-bit chunk commitment
 | ratio | **~1.19–1.22× them** | **~13× us** | ~1000× us |
 
 Official cold-machine pair (2026-07-24, rested machine, back-to-back):
-ours 1.344 s / 37.9 ms; Zinc+ 1.131 s / 482 ms — **prove ratio 1.19×**.
+ours 1.344 s / 37.9 ms; Zinc+ 1.131 s / 482 ms.
+
+**Accounting correction (2026-08-03): the ratio must include witness
+commitment.** Zinc+'s `--bench e2e` prove takes the raw trace and
+commits inside the timed region (their PCS is ~26% of prove). Our
+criterion `prove` receives a pre-committed witness; `commit_witness`
+(351 ms, benched separately) plays the same role as their in-prove
+commit and belongs in the cross-system number. Corrected apples-to-
+apples, multiswap 2^13 single-thread: ours 1.33 s prove + 0.35 s
+commit = **1.68 s** vs Zinc+ **1.13 s** -> **prove ratio ~1.49×**
+(not the 1.19× previously quoted, which was prove-sans-commit).
+Verify/proof-size comparisons are unaffected. The Brakedown numbers
+in this document already include commit and need no correction, and
+the msshape/native-overhead figures were commit-inclusive on both
+sides from the start (stated in their provenance header). ECDSA
+re-measured commit-inclusive (2026-08-03, single-thread, k=9):
+commit 59 ms + prove 187 ms = **246 ms**, verify 20.6 ms -> the gap
+vs Zinc+'s q=p specialization (24.5 ms) is **~10×** (earlier "~8×"
+was prove-only).
 
 **Same-hour pairing (2026-07-23):** both sides re-measured back-to-back
 on the same machine state after the full optimization series: ours
