@@ -168,6 +168,56 @@ mod tests {
   use super::*;
   use crypto_bigint::{Odd, U256};
 
+  #[test]
+  #[ignore]
+  fn width_microbench() {
+    use crypto_bigint::U128;
+    use std::time::Instant;
+    // Same 128-bit prime (top bit set) in both carriers.
+    let m128: U128 = U128::from_be_hex("ffffffffffffffffffffffffffffff61");
+    let m256: U256 =
+      U256::from_be_hex("00000000000000000000000000000000ffffffffffffffffffffffffffffff61");
+    let p2 = FixedMontyParams::new(Odd::new(m128).unwrap());
+    let p4 = FixedMontyParams::new(Odd::new(m256).unwrap());
+    const ITERS: usize = 10_000_000;
+    let mut a2 = DynPrime::<2>::new(U128::from(0x1234_5678_9abc_def0_u64), &p2);
+    let b2 = DynPrime::<2>::new(U128::from(0x0fed_cba9_8765_4321_u64), &p2);
+    let t = Instant::now();
+    for _ in 0..ITERS {
+      a2 *= b2;
+    }
+    let ns2 = t.elapsed().as_nanos() as f64 / ITERS as f64;
+    std::hint::black_box(a2);
+    let mut a4 = DynPrime::<4>::new(U256::from(0x1234_5678_9abc_def0_u64), &p4);
+    let b4 = DynPrime::<4>::new(U256::from(0x0fed_cba9_8765_4321_u64), &p4);
+    let t = Instant::now();
+    for _ in 0..ITERS {
+      a4 *= b4;
+    }
+    let ns4 = t.elapsed().as_nanos() as f64 / ITERS as f64;
+    std::hint::black_box(a4);
+    let t = Instant::now();
+    for _ in 0..ITERS {
+      a2 += b2;
+    }
+    let add2 = t.elapsed().as_nanos() as f64 / ITERS as f64;
+    std::hint::black_box(a2);
+    let t = Instant::now();
+    for _ in 0..ITERS {
+      a4 += b4;
+    }
+    let add4 = t.elapsed().as_nanos() as f64 / ITERS as f64;
+    std::hint::black_box(a4);
+    println!(
+      "mul: DynPrime<2> {ns2:.2} ns  DynPrime<4> {ns4:.2} ns  ratio {:.2}x",
+      ns4 / ns2
+    );
+    println!(
+      "add: DynPrime<2> {add2:.2} ns  DynPrime<4> {add4:.2} ns  ratio {:.2}x",
+      add4 / add2
+    );
+  }
+
   // Small Mersenne prime 2^61 - 1, easy to verify against u128 arithmetic.
   fn test_params() -> FixedMontyParams<4> {
     let modulus: U256 = U256::from(0x1fff_ffff_ffff_ffff_u64);

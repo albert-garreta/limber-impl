@@ -94,7 +94,7 @@ impl Engine for Bn254Engine {
 // ---- ModEngine impls ------------------------------------------------------
 
 /// A Phase-2 engine whose sumcheck arithmetic runs over the dynamic-prime
-/// field `DynPrime<4>` (256-bit, runtime modulus). This is *not* an
+/// field `DynPrime<2>` (256-bit, runtime modulus). This is *not* an
 /// `Engine` — it's a `SumcheckEngine` only, used to drive `sumcheck_modp`
 /// over a runtime prime. (The full `ModEngine` impl, pairing it with a
 /// Mod-PCS, lands in step 7b.)
@@ -102,9 +102,10 @@ impl Engine for Bn254Engine {
 pub struct T256DynPrimeEngine;
 
 /// The T256 scalar field's prime as a `FixedMontyParams<4>`. Useful when
-/// you want a `DynPrime<4>` whose modulus matches the static `t256::Scalar`
-/// (e.g. for `p = q` mode in tests). Computed as `(q-1) + 1` from
-/// `-Scalar::ONE` to avoid parsing `PrimeField::MODULUS` string formats.
+/// you need the static `t256::Scalar` modulus as a `crypto_bigint` Monty
+/// context (e.g. to compare against the sampled `p` in tests). Computed as
+/// `(q-1) + 1` from `-Scalar::ONE` to avoid parsing `PrimeField::MODULUS`
+/// string formats.
 pub fn t256_scalar_params() -> crypto_bigint::modular::FixedMontyParams<4> {
   use crypto_bigint::{Odd, U256};
   use ff::{Field, PrimeField};
@@ -122,7 +123,7 @@ pub fn t256_scalar_params() -> crypto_bigint::modular::FixedMontyParams<4> {
 }
 
 impl SumcheckEngine for T256DynPrimeEngine {
-  type Scalar = DynPrime<4>;
+  type Scalar = DynPrime<2>;
   type TE = Keccak256Transcript<Self>;
 }
 
@@ -136,20 +137,20 @@ impl SumcheckEngine for T256DynPrimeEngine {
 pub struct T256DynPrimeBdEngine;
 
 impl SumcheckEngine for T256DynPrimeBdEngine {
-  type Scalar = DynPrime<4>;
+  type Scalar = DynPrime<2>;
   type TE = Keccak256Transcript<Self>;
 }
 
 impl ModEngine for T256DynPrimeBdEngine {
   type ModPCS = crate::provider::pcs::integer_modpcs::IntegerModPCSBd;
 
-  fn bootstrap_params() -> crypto_bigint::modular::FixedMontyParams<4> {
+  fn bootstrap_params() -> crypto_bigint::modular::FixedMontyParams<2> {
     <T256DynPrimeEngine as ModEngine>::bootstrap_params()
   }
 
   fn sample_params<T: crate::traits::transcript::ByteTranscript>(
     transcript: &mut T,
-  ) -> crypto_bigint::modular::FixedMontyParams<4> {
+  ) -> crypto_bigint::modular::FixedMontyParams<2> {
     <T256DynPrimeEngine as ModEngine>::sample_params(transcript)
   }
 }
@@ -159,12 +160,12 @@ impl ModEngine for T256DynPrimeEngine {
   // Hyrax-T256 underneath).
   type ModPCS = crate::provider::pcs::integer_modpcs::IntegerModPCS;
 
-  /// Bootstrap params: smallest valid odd-modulus `FixedMontyParams<4>`
+  /// Bootstrap params: smallest valid odd-modulus `FixedMontyParams<2>`
   /// (modulus = 3). Used only for transcript construction before the
   /// real `p` is sampled; never participates in arithmetic.
-  fn bootstrap_params() -> crypto_bigint::modular::FixedMontyParams<4> {
-    use crypto_bigint::{Odd, U256};
-    crypto_bigint::modular::FixedMontyParams::new(Odd::new(U256::from(3u32)).unwrap())
+  fn bootstrap_params() -> crypto_bigint::modular::FixedMontyParams<2> {
+    use crypto_bigint::{Odd, U128};
+    crypto_bigint::modular::FixedMontyParams::new(Odd::new(U128::from(3u32)).unwrap())
   }
 
   /// Rejection-sample a ~128-bit prime `p` from the transcript via
@@ -175,21 +176,21 @@ impl ModEngine for T256DynPrimeEngine {
   /// The candidate is built by taking 16 bytes from the squeeze, forcing
   /// the top bit (MSB of bit 127, exactly 128-bit width) and the bottom
   /// bit (odd), then testing primality. The zero-padded `U256` carrier
-  /// type matches `DynPrime<4>`'s backing.
+  /// type matches `DynPrime<2>`'s backing.
   fn sample_params<T: crate::traits::transcript::ByteTranscript>(
     transcript: &mut T,
-  ) -> crypto_bigint::modular::FixedMontyParams<4> {
-    use crypto_bigint::{Odd, U256};
+  ) -> crypto_bigint::modular::FixedMontyParams<2> {
+    use crypto_bigint::{Odd, U128};
     use crypto_primes::{Flavor, is_prime};
     loop {
       let bytes = transcript
         .squeeze_bytes(b"sample_p")
         .expect("transcript squeeze failed during prime sampling");
-      let mut candidate_bytes = [0u8; 32];
-      candidate_bytes[..16].copy_from_slice(&bytes[..16]);
+      let mut candidate_bytes = [0u8; 16];
+      candidate_bytes.copy_from_slice(&bytes[..16]);
       candidate_bytes[15] |= 0x80; // exactly 128-bit
       candidate_bytes[0] |= 0x01; // odd
-      let candidate = U256::from_le_slice(&candidate_bytes);
+      let candidate = U128::from_le_slice(&candidate_bytes);
       if is_prime(Flavor::Any, &candidate) {
         return crypto_bigint::modular::FixedMontyParams::new(Odd::new(candidate).unwrap());
       }

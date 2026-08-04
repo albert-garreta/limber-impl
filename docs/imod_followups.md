@@ -1018,3 +1018,106 @@ every cell (single-threaded, KSWEEP harnesses, best k per cell):
   `integer_modpcs.rs` f_limb commit and the >64-bit truncation regression
   test).
 - At T=2^128 the optimal k drops to ~6–7 (s explodes beyond: k=9 → s≈93–98).
+
+## Brakedown parameter sweep (2026-08-03)
+
+Question: is the Bd prover fixable with parameters alone? Swept (k, T)
+and the GLSTW code spec on multiswap 2^13 ST (temp env hooks BD_K /
+BD_LOGT / BD_SPEC, since removed; re-add to the BDPCS bench block to
+reproduce).
+
+(k, T) at spec 5 — the Hyrax-tuned (k=9, T=2^64) is NOT optimal here:
+
+| k | T | total | proof |
+|---|---|-------|-------|
+| 7 | 2^64 | 3.61 s | 28.90 MB |
+| 8 | 2^64 | 3.18 s | 24.92 MB |
+| 9 | 2^64 | 2.09 s | 21.75 MB |
+| 11 | 2^64 | **1.99 s** | **20.08 MB** |
+| 12 | 2^64 | 2.14 s | 20.07 MB |
+| 9 | 2^128 | 2.90 s | 27.76 MB |
+
+k=11 is a strict Pareto improvement for the Bd backend (fewer chain
+layers -> fewer trees + opens; open cost is linear here, unlike Hyrax
+where the MSM regime put the optimum at k=9).
+
+Code spec at k=11 — trades commit(encode) time against query count:
+
+| spec | commit | total | verify | proof |
+|------|--------|-------|--------|-------|
+| 0 | 592 ms | 1.74 s | 247 ms | 39.20 MB |
+| 1 | 577 ms | **1.65 s** | 151 ms | 28.09 MB |
+| 3 | 687 ms | 1.83 s | 157 ms | 22.59 MB |
+| 5 | 855 ms | 1.97 s | 172 ms | 20.08 MB |
+
+Prove-proper is flat (~1.07-1.15 s) across specs — only the encode
+moves. Best-time config (spec 1, k=11): 1.65 s total, -21% vs the
+shipped default, at +40% proof. Balanced pick (spec 5, k=11): 1.97 s /
+20.08 MB / 172 ms — dominates the current default on every axis.
+Conclusion: parameters recover 6-21%, floor ~1.65 s; the ~16x
+field-width tax stays structural (integer-native code = future work).
+
+T (limb bound) at spec 5 — 2^64 stays optimal under Brakedown:
+
+| T | k | total | proof |
+|---|---|-------|-------|
+| 2^32 | 11 | 2.32 s | 21.73 MB |
+| 2^32 | 12 | 2.13 s | 20.07 MB |
+| 2^32 | 13 | 2.18 s | 18.59 MB |
+| 2^16 | 13 | 4.29 s | 23.83 MB |
+| 2^64 | 11 | **1.99 s** | 20.08 MB |
+
+Smaller T loosens the norm bound (admits k=13, smallest proof seen at
+18.59 MB) but loses on time; T=2^16 roughly doubles commit (per-limb
+padding + limb-var overhead). Note k=11 at T=2^64 runs with log_p=16
+(norm bound: k + k*log_p + max(log_t, log_p) < log_q), i.e. a much
+larger s than k=9's log_p=24 — and still wins, so the s-repetition
+cost is evidently not a dominant term. Relevant for the smaller-field
+question (see zincplus_comparison.md).
+
+## DynPrime<2> carrier for the sampled prime p (2026-08-03)
+
+The transcript-sampled sumcheck prime p is 128 bits but was carried in
+a 4-limb (256-bit) `DynPrime<4>` Montgomery form. Swapped the protocol
+scalar to `DynPrime<2>` (microbench: mul 19.4 -> 10.9 ns, add 3.8 ->
+2.2 ns, ~1.75x per op; all 194 tests pass).
+
+Measured effect on multiswap 2^13 prove: **none** (A/B: 1.314 s 4-limb
+vs 1.333 s 2-limb, within noise). Span diff explains it: the hot spans
+(rc_logup_gkr 415 ms, bo_interleaved_sc 142 ms, chain/ab/opens) all run
+over `t256::Scalar` -- the fixed 256-bit q-side PCS field -- and moved
+0 ms. The p-side (mod-p Spartan sumchecks over DynPrime) is only ~10 ms
+at 2^13; only the reduction/conversion spans improved (~30 ms total).
+
+Takeaways: (a) the p-side carrier swap is kept -- strictly correct,
+halves p-side element bytes, and the p-side cost grows linearly with
+rows so it should matter at larger instances; (b) the real
+smaller-field lever is the q side: the whole ~950 ms Mod-PCS open runs
+in the PCS field, so the Brakedown 192-bit-q plan (fixed Solinas-style
+prime, fast reduction) attacks the entire open, not just commit
+hashing. Hyrax cannot shrink q (curve-pinned).
+
+## Range check: all-zero block dropping (2026-08-04)
+
+The committed chunk oracles carry large all-zero regions (41% padded
+rows at multiswap 2^13, padded polys, zero limb slots). The shared
+range check now splits every chunk polynomial into dyadic blocks of
+2^RC_BLOCK_LOG (= 2^16) slots and feeds only blocks containing a
+nonzero chunk into the LogUp multiset. Each dropped block is pinned to
+zero by ONE fresh random-point opening claim (the `range_zpad`
+Schwartz-Zippel technique generalized) -- strictly stronger than range
+membership and O(block) to discharge thanks to `batch_weight`'s
+existing boolean-head fast path. The active map travels in the proof
+as untrusted advice, absorbed before any challenge: nonzero-marked-
+inactive fails its zero claim; zero-marked-active wastes prover work.
+Multiplicities count active entries only.
+
+Measured (multiswap 2^13 ST): prove 1.333 -> **1.219 s** (-114 ms);
+verify unchanged ~36.8 ms. Commit-inclusive vs Zinc+: 1.57 s vs
+1.13 s -> gap 1.49x -> **1.39x**. Test:
+`rc_zero_blocks_dropped_and_bitmap_pinned` (roundtrip at 8 blocks +
+both bitmap forgeries rejected).
+
+Next in this campaign: GKR round/build fusion (~100-150 ms), then
+per-segment value bounds (bit rows pay 1 chunk slot instead of 128;
+shrinks commit + range check + opens ~2.5-3x on multiswap).

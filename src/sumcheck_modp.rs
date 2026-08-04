@@ -387,9 +387,9 @@ mod tests {
   }
 
   /// The load-bearing Phase-2 test: run the 5-input cubic sumcheck over the
-  /// dynamic-prime field `DynPrime<4>` (not a static curve scalar). Same
+  /// dynamic-prime field `DynPrime<2>` (not a static curve scalar). Same
   /// shape as `prove_cubic_with_five_inputs_roundtrips_on_satisfying_witness`
-  /// but with `Scalar = DynPrime<4>` parameterized by a runtime 256-bit
+  /// but with `Scalar = DynPrime<2>` parameterized by a runtime 256-bit
   /// prime. Exercises DynPrime arithmetic + transcript-over-DynPrime +
   /// the polys_modp types end-to-end.
   #[test]
@@ -397,15 +397,14 @@ mod tests {
   fn prove_cubic_over_dynprime_roundtrips() {
     use crate::dyn_prime::DynPrime;
     use crate::provider::T256DynPrimeEngine;
-    use crypto_bigint::{Odd, U256, modular::FixedMontyParams};
+    use crypto_bigint::{Odd, U128, modular::FixedMontyParams};
 
     type ME = T256DynPrimeEngine;
-    type DP = DynPrime<4>;
+    type DP = DynPrime<2>;
 
-    // secp256k1 base field prime: prime (so 2/3/6 are invertible) and odd
+    // Mersenne prime 2^127 - 1: prime (so 2/3/6 are invertible) and odd
     // (required for Montgomery). Stands in for a verifier-sampled prime.
-    let modulus =
-      U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+    let modulus = U128::from_be_hex("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
     let params = FixedMontyParams::new(Odd::new(modulus).unwrap());
 
     let num_rounds = 3usize;

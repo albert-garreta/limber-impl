@@ -1109,13 +1109,17 @@ mod tests {
     t.absorb(b"comm_q", &U.comm_q);
     let params_p = <ME as ModEngine>::sample_params(&mut t);
     let params_q = t256_scalar_params();
-    // Compare the modulus values via the Montgomery context's stable
-    // representation: convert 1 to canonical Uint via `retrieve()`, then
-    // compare moduli through MontyForm's `params()` accessor.
-    // (`FixedMontyParams` doesn't impl PartialEq; route through DynPrime.)
-    use crate::dyn_prime::DynPrime;
-    let one_p = DynPrime::<4>::one(&params_p);
-    let one_q = DynPrime::<4>::one(&params_q);
-    assert_ne!(one_p.params(), one_q.params());
+    // `p` is a transcript-sampled 128-bit prime in a 2-limb carrier; `q`
+    // is the 256-bit curve scalar prime. Compare the modulus values as
+    // byte strings, zero-extending `p` to `q`'s width.
+    let p_enc = params_p.modulus().as_ref().to_le_bytes();
+    let q_enc = params_q.modulus().as_ref().to_le_bytes();
+    let p_bytes: &[u8] = p_enc.as_ref();
+    let q_bytes: &[u8] = q_enc.as_ref();
+    let mut p_wide = [0u8; 32];
+    p_wide[..16].copy_from_slice(p_bytes);
+    assert_ne!(&p_wide[..], q_bytes);
+    // And the sampled p really is 128 bits (top bit forced by sampling).
+    assert_eq!(p_bytes[15] & 0x80, 0x80);
   }
 }

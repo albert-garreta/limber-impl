@@ -744,6 +744,12 @@ pub struct SharedRangeCheck<B: CommitBackend> {
   /// relation definitional via [`chunk_fold_point`]), so this is always
   /// empty; the machinery remains for non-precommitted batch kinds.
   pub(crate) batches: Vec<RangeCheckBatchData<B>>,
+  /// Per batch: which dyadic chunk blocks (`2^RC_BLOCK_LOG` slots each)
+  /// enter the LogUp multiset. Inactive blocks are proven all-zero by
+  /// fresh random-point opening claims instead. Untrusted prover advice:
+  /// a nonzero block marked inactive fails its zero claim w.h.p.; a zero
+  /// block marked active merely wastes prover work.
+  pub(crate) active_blocks: Vec<Vec<bool>>,
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
@@ -806,14 +812,14 @@ fn t256_q() -> BigUint {
   Q.clone()
 }
 
-/// Canonical integer in `[0, p)` from a `DynPrime<4>` value.
-fn dyn_to_biguint(d: &crate::dyn_prime::DynPrime<4>) -> BigUint {
+/// Canonical integer in `[0, p)` from a `DynPrime<2>` value.
+fn dyn_to_biguint(d: &crate::dyn_prime::DynPrime<2>) -> BigUint {
   BigUint::from_bytes_le(&d.to_le_bytes())
 }
 
 /// Extract `p` (the dynamic prime) from a non-empty point. Uses the
-/// modulus carried by the first component's `FixedMontyParams<4>`.
-fn extract_p(point: &[crate::dyn_prime::DynPrime<4>]) -> Result<BigUint, SpartanError> {
+/// modulus carried by the first component's `FixedMontyParams<2>`.
+fn extract_p(point: &[crate::dyn_prime::DynPrime<2>]) -> Result<BigUint, SpartanError> {
   let p0 = point.first().ok_or(SpartanError::InternalError {
     reason: "IntegerModPCS: point must have at least one component to extract p".to_string(),
   })?;
@@ -856,6 +862,33 @@ fn chunk_decompose_value(v: &BigUint, log_bound: usize) -> Vec<u64> {
   (0..numchunks)
     .map(|c| byte_at(2 * c) | (byte_at(2 * c + 1) << 8))
     .collect()
+}
+
+/// Dyadic block granularity (log2 of slots) for dropping all-zero
+/// regions from the range check's LogUp multiset. Committed chunk
+/// polynomials carry large all-zero regions (padded rows, padded polys);
+/// each all-zero block is proven zero by ONE random-point opening claim
+/// (Schwartz-Zippel, strictly stronger than range membership) instead of
+/// walking `2^RC_BLOCK_LOG` leaves through the GKR.
+const RC_BLOCK_LOG: usize = 16;
+
+/// Block split of an `n_chunks`-slot chunk polynomial:
+/// `(block_log, n_blocks)` with `n_blocks · 2^block_log = n_chunks`.
+fn rc_block_split(n_chunks: usize) -> (usize, usize) {
+  let n_vars = ceil_log2(n_chunks.max(1));
+  let block_log = RC_BLOCK_LOG.min(n_vars);
+  (block_log, 1usize << (n_vars - block_log))
+}
+
+/// Pack an active-block bitmap for transcript absorption (LSB-first).
+fn pack_bitmap(bits: &[bool]) -> Vec<u8> {
+  let mut packed = vec![0u8; bits.len().div_ceil(8)];
+  for (i, &b) in bits.iter().enumerate() {
+    if b {
+      packed[i / 8] |= 1 << (i % 8);
+    }
+  }
+  packed
 }
 
 /// Chunk slots per value in a chunk-decomposed layout: `⌈log_bound/16⌉`
@@ -1037,15 +1070,15 @@ fn extract_bit_window(bytes: &[u8], start: usize, len: usize) -> BigUint {
   BigUint::from_bytes_le(&out)
 }
 
-/// Build the public limb-weight polynomial `limb` as a `DynPrime<4>`
+/// Build the public limb-weight polynomial `limb` as a `DynPrime<2>`
 /// MLE of size `2^numlimb_var`: `limb[k] = T^k` for `k < numlimb`, else
 /// `0` (padding when `numlimb` isn't a power of two). Used by the
 /// Phase-3 step D3 reduction sumcheck integrand
 /// `sum_k limb(k) · f_limb(int_r, k)`.
 fn build_limb_weight_dynprime(
   params: &IntEvalParams,
-  monty: &crypto_bigint::modular::FixedMontyParams<4>,
-) -> Vec<crate::dyn_prime::DynPrime<4>> {
+  monty: &crypto_bigint::modular::FixedMontyParams<2>,
+) -> Vec<crate::dyn_prime::DynPrime<2>> {
   let stride = 1usize << params.numlimb_var;
   let t = BigUint::one() << params.log_t;
   let mut out = Vec::with_capacity(stride);
@@ -1053,14 +1086,14 @@ fn build_limb_weight_dynprime(
   for k in 0..stride {
     if k < params.numlimb {
       out.push(
-        <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+        <crate::dyn_prime::DynPrime<2> as SumcheckField>::from_bytes_reduce(
           monty,
           &pow.to_bytes_le(),
         ),
       );
       pow = &pow * &t;
     } else {
-      out.push(<crate::dyn_prime::DynPrime<4> as SumcheckField>::zero(
+      out.push(<crate::dyn_prime::DynPrime<2> as SumcheckField>::zero(
         monty,
       ));
     }
@@ -2143,7 +2176,7 @@ struct PerPolyProver<B: CommitBackend> {
 fn prove_one_poly<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -2151,7 +2184,7 @@ fn prove_one_poly<
   backend_ck: &B::Ck,
   transcript: &mut Keccak256Transcript<ME>,
   poly: &[BigUint],
-  point: &[crate::dyn_prime::DynPrime<4>],
+  point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
 ) -> Result<PerPolyProver<B>, SpartanError> {
   let monty = point
@@ -2174,10 +2207,10 @@ fn prove_one_poly<
   //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
   //    point `(int_r, r_k)` where `r_k` are the sumcheck challenges.
   let (_dc_span, dc_t) = start_span!("imod_pcs_red_to_dynprime");
-  let f_limb_p: Vec<crate::dyn_prime::DynPrime<4>> = f_limb
+  let f_limb_p: Vec<crate::dyn_prime::DynPrime<2>> = f_limb
     .iter()
     .map(|b| {
-      <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(&monty, &b.to_bytes_le())
+      <crate::dyn_prime::DynPrime<2> as SumcheckField>::from_bytes_reduce(&monty, &b.to_bytes_le())
     })
     .collect();
   info!(elapsed_ms = %dc_t.elapsed().as_millis(), "imod_pcs_red_to_dynprime");
@@ -2188,12 +2221,12 @@ fn prove_one_poly<
   for r_i in point {
     mle.bind_poly_var_top(r_i);
   }
-  let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<4>> = mle.into_vec();
+  let f_limb_at_int_r: Vec<crate::dyn_prime::DynPrime<2>> = mle.into_vec();
   info!(elapsed_ms = %pe_t.elapsed().as_millis(), "imod_pcs_red_dynprime_bind");
   debug_assert_eq!(f_limb_at_int_r.len(), 1 << params.numlimb_var);
 
   let limb_p = build_limb_weight_dynprime(params, &monty);
-  let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+  let eval_p = <crate::dyn_prime::DynPrime<2> as SumcheckField>::from_bytes_reduce(
     &monty,
     &eval.to_bytes_le(),
   );
@@ -2567,7 +2600,7 @@ fn prove_one_poly<
 fn finish_batch_open<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -2761,13 +2794,13 @@ struct PerPolyVerifier {
 fn verify_one_poly<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
   params: &IntEvalParams,
   transcript: &mut Keccak256Transcript<ME>,
-  point: &[crate::dyn_prime::DynPrime<4>],
+  point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
   reduction_round_polys: &[Vec<BigUint>],
   int_v_prime: &BigInt,
@@ -2789,19 +2822,19 @@ fn verify_one_poly<
     return Err(SpartanError::InvalidSumcheckProof);
   }
 
-  let eval_p = <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+  let eval_p = <crate::dyn_prime::DynPrime<2> as SumcheckField>::from_bytes_reduce(
     &monty,
     &eval.to_bytes_le(),
   );
   let red_sc_polys: Vec<
-    crate::polys_modp::univariate::CompressedUniPoly<crate::dyn_prime::DynPrime<4>>,
+    crate::polys_modp::univariate::CompressedUniPoly<crate::dyn_prime::DynPrime<2>>,
   > = reduction_round_polys
     .iter()
     .map(|coeffs| crate::polys_modp::univariate::CompressedUniPoly {
       coeffs_except_linear_term: coeffs
         .iter()
         .map(|b| {
-          <crate::dyn_prime::DynPrime<4> as SumcheckField>::from_bytes_reduce(
+          <crate::dyn_prime::DynPrime<2> as SumcheckField>::from_bytes_reduce(
             &monty,
             &b.to_bytes_le(),
           )
@@ -2820,7 +2853,7 @@ fn verify_one_poly<
     limb_mle.bind_poly_var_top(r);
   }
   let limb_at_r_k = limb_mle.into_vec()[0];
-  let limb_inv = <crate::dyn_prime::DynPrime<4> as SumcheckField>::invert(&limb_at_r_k)
+  let limb_inv = <crate::dyn_prime::DynPrime<2> as SumcheckField>::invert(&limb_at_r_k)
     .ok_or(SpartanError::InvalidSumcheckProof)?;
   let f_eval_p = red_final_claim * limb_inv;
 
@@ -3002,7 +3035,7 @@ fn verify_one_poly<
 fn finish_batch_verify<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -3511,7 +3544,7 @@ fn spawn_shared_range_subtranscript<
   'a,
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -3536,7 +3569,7 @@ fn spawn_shared_range_subtranscript<
 /// [`prove_batched_open`] / [`verify_batched_open`].
 fn spawn_batch_subtranscript<
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -3918,7 +3951,7 @@ struct RcVerifyClaims {
 fn prove_shared_range_check<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -4007,12 +4040,42 @@ fn prove_shared_range_check<
     }
   }
 
-  // 3. The shared multiplicity table over ALL witness trees, committed
-  //    before the LogUp challenge `r` is squeezed (multiplicities chosen
-  //    after `r` would break the lookup identity).
+  // 2b. Active-block maps: all-zero dyadic blocks leave the multiset
+  //     and are pinned to zero by direct opening claims below. Padded
+  //     rows/polys make these regions large in practice.
+  let mut active_blocks: Vec<Vec<bool>> = chunk_vals_all
+    .iter()
+    .map(|cv| {
+      let (block_log, n_blocks) = rc_block_split(cv.len());
+      (0..n_blocks)
+        .map(|b| {
+          cv[(b << block_log)..((b + 1) << block_log)]
+            .iter()
+            .any(|&v| v != 0)
+        })
+        .collect()
+    })
+    .collect();
+  // Degenerate all-zero input: keep one live tree so the LogUp argument
+  // is well-formed (a zero block is valid multiset input).
+  if top_vals_all.is_empty() && active_blocks.iter().all(|a| a.iter().all(|&x| !x)) {
+    active_blocks[0][0] = true;
+  }
+
+  // 3. The shared multiplicity table over the ACTIVE witness trees,
+  //    committed before the LogUp challenge `r` is squeezed
+  //    (multiplicities chosen after `r` would break the lookup identity).
   let witness_refs: Vec<&[u64]> = chunk_vals_all
     .iter()
-    .map(|v| v.as_slice())
+    .zip(active_blocks.iter())
+    .flat_map(|(cv, act)| {
+      let (block_log, _) = rc_block_split(cv.len());
+      act
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| **a)
+        .map(move |(b, _)| &cv[(b << block_log)..((b + 1) << block_log)])
+    })
     .chain(top_vals_all.iter().map(|(_, v)| v.as_slice()))
     .collect();
   let (_rcm_span, rcm_t) = start_span!("rc_mult_commit");
@@ -4025,36 +4088,67 @@ fn prove_shared_range_check<
   let (mult_comm, mult_data) = B::commit(backend_ck, &mult_fq, &mult_blind, true)?;
   info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "rc_mult_commit");
 
-  // 4. Sub-transcript bound to (parent, chunk comms, mult comm).
+  // 4. Sub-transcript bound to (parent, chunk comms, mult comm), plus
+  //    the active-block maps (prover advice fixed before any challenge).
   let mut sub =
     spawn_shared_range_subtranscript::<B, ME>(parent, chunk_comm_refs.iter().copied(), &mult_comm)?;
+  for act in &active_blocks {
+    sub.absorb_bytes(b"rc_active", &pack_bitmap(act));
+  }
 
-  // 5. ONE multi-witness LogUp-GKR: every entry of every tree is in
+  // 5. ONE multi-witness LogUp-GKR: every entry of every ACTIVE tree is in
   //    [0, 2^16). Its reduced claims become batched-open claims.
   let (_rcl_span, rcl_t) = start_span!("rc_logup_gkr");
   let (logup, claims) = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::prove(
     CHUNK_BITS,
-    &chunk_vals_all
-      .iter()
-      .map(|v| v.as_slice())
-      .chain(top_vals_all.iter().map(|(_, v)| v.as_slice()))
-      .collect::<Vec<_>>(),
+    &witness_refs,
     &mut sub,
   )?;
   info!(elapsed_ms = %rcl_t.elapsed().as_millis(), "rc_logup_gkr");
   let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); batches.len()];
-  for (bi, (point, eval)) in claims.wit_claims.iter().take(batches.len()).enumerate() {
-    chunk_claims[bi].push(point.clone(), *eval);
+  let mut wc = claims.wit_claims.iter();
+  for (bi, act) in active_blocks.iter().enumerate() {
+    let n_chunk_vars = ceil_log2(chunk_vals_all[bi].len().max(1));
+    let (block_log, _) = rc_block_split(chunk_vals_all[bi].len());
+    for (blk, &a) in act.iter().enumerate() {
+      if !a {
+        continue;
+      }
+      let (point, eval) = wc.next().expect("one claim per active block");
+      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+        .into_iter()
+        .chain(point.iter().copied())
+        .collect();
+      chunk_claims[bi].push(full, *eval);
+    }
   }
-  for (ti, (bi, _)) in top_vals_all.iter().enumerate() {
+  for (bi, _) in top_vals_all.iter() {
     let d = &dims[*bi];
-    let (point, eval) = &claims.wit_claims[batches.len() + ti];
+    let (point, eval) = wc.next().expect("one claim per top tree");
     let ext: Vec<t256::Scalar> = point
       .iter()
       .copied()
       .chain(bool_point_of_index(d.numchunks - 1, d.log_stride))
       .collect();
     chunk_claims[*bi].push(ext, *eval - t256::Scalar::from(d.top_shift()));
+  }
+  // Inactive blocks: pin each to zero with a fresh random-point claim.
+  for (bi, act) in active_blocks.iter().enumerate() {
+    let n_chunk_vars = ceil_log2(chunk_vals_all[bi].len().max(1));
+    let (block_log, _) = rc_block_split(chunk_vals_all[bi].len());
+    for (blk, &a) in act.iter().enumerate() {
+      if a {
+        continue;
+      }
+      let r_blk: Vec<t256::Scalar> = (0..block_log)
+        .map(|_| sub.squeeze(b"range_zblk"))
+        .collect::<Result<Vec<_>, _>>()?;
+      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+        .into_iter()
+        .chain(r_blk)
+        .collect();
+      chunk_claims[bi].push(full, t256::Scalar::ZERO);
+    }
   }
   let mut mult_claims = OpenClaims::default();
   mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
@@ -4161,6 +4255,7 @@ fn prove_shared_range_check<
       mult_comm,
       logup,
       batches: batch_data,
+      active_blocks,
     },
     RcProverArtifacts {
       value_claims,
@@ -4181,7 +4276,7 @@ fn prove_shared_range_check<
 fn verify_shared_range_check<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
-      Scalar = crate::dyn_prime::DynPrime<4>,
+      Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
@@ -4216,9 +4311,26 @@ fn verify_shared_range_check<
       .collect()
   };
 
-  // Tree-depth pinning: chunk trees (one per batch, sized by the public
-  // batch shape), then shifted-top trees of the non-aligned batches.
-  let mut expected_depths: Vec<usize> = dims.iter().map(|d| ceil_log2(d.n_chunks.max(1))).collect();
+  // Tree-depth pinning: one tree per ACTIVE chunk block (block size and
+  // count fixed by the public batch shape; the active map is prover
+  // advice policed by the zero claims below), then shifted-top trees of
+  // the non-aligned batches.
+  let active_blocks = &arg.active_blocks;
+  if active_blocks.len() != metas.len() {
+    return Err(SpartanError::InvalidSumcheckProof);
+  }
+  let mut expected_depths: Vec<usize> = Vec::new();
+  for (d, act) in dims.iter().zip(active_blocks.iter()) {
+    let (block_log, n_blocks) = rc_block_split(d.n_chunks);
+    if act.len() != n_blocks {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    for &a in act.iter() {
+      if a {
+        expected_depths.push(block_log);
+      }
+    }
+  }
   let mut top_batches: Vec<usize> = Vec::new();
   for (bi, d) in dims.iter().enumerate() {
     if d.top_needed() {
@@ -4227,29 +4339,64 @@ fn verify_shared_range_check<
     }
   }
 
-  // 1. Spawn the same sub-transcript the prover used.
+  // 1. Spawn the same sub-transcript the prover used, absorbing the
+  //    active-block maps at the same point.
   let mut sub = spawn_shared_range_subtranscript::<B, ME>(
     parent,
     chunk_comm_refs.iter().copied(),
     &arg.mult_comm,
   )?;
+  for act in active_blocks.iter() {
+    sub.absorb_bytes(b"rc_active", &pack_bitmap(act));
+  }
 
   // 2. Multi-witness LogUp membership: every chunk (and shifted top) in
   //    [0, 2^16). Its reduced claims become batched-open claims.
   let claims = arg.logup.verify(CHUNK_BITS, &expected_depths, &mut sub)?;
   let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); metas.len()];
-  for (bi, (point, eval)) in claims.wit_claims.iter().take(metas.len()).enumerate() {
-    chunk_claims[bi].push(point.clone(), *eval);
+  let mut wc = claims.wit_claims.iter();
+  for (bi, (d, act)) in dims.iter().zip(active_blocks.iter()).enumerate() {
+    let n_chunk_vars = ceil_log2(d.n_chunks.max(1));
+    let (block_log, _) = rc_block_split(d.n_chunks);
+    for (blk, &a) in act.iter().enumerate() {
+      if !a {
+        continue;
+      }
+      let (point, eval) = wc.next().ok_or(SpartanError::InvalidSumcheckProof)?;
+      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+        .into_iter()
+        .chain(point.iter().copied())
+        .collect();
+      chunk_claims[bi].push(full, *eval);
+    }
   }
-  for (ti, &bi) in top_batches.iter().enumerate() {
+  for &bi in top_batches.iter() {
     let d = &dims[bi];
-    let (point, eval) = &claims.wit_claims[metas.len() + ti];
+    let (point, eval) = wc.next().ok_or(SpartanError::InvalidSumcheckProof)?;
     let ext: Vec<t256::Scalar> = point
       .iter()
       .copied()
       .chain(bool_point_of_index(d.numchunks - 1, d.log_stride))
       .collect();
     chunk_claims[bi].push(ext, *eval - t256::Scalar::from(d.top_shift()));
+  }
+  // Inactive blocks: same fresh random-point zero claims as the prover.
+  for (bi, (d, act)) in dims.iter().zip(active_blocks.iter()).enumerate() {
+    let n_chunk_vars = ceil_log2(d.n_chunks.max(1));
+    let (block_log, _) = rc_block_split(d.n_chunks);
+    for (blk, &a) in act.iter().enumerate() {
+      if a {
+        continue;
+      }
+      let r_blk: Vec<t256::Scalar> = (0..block_log)
+        .map(|_| sub.squeeze(b"range_zblk"))
+        .collect::<Result<Vec<_>, _>>()?;
+      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+        .into_iter()
+        .chain(r_blk)
+        .collect();
+      chunk_claims[bi].push(full, t256::Scalar::ZERO);
+    }
   }
   let mut mult_claims = OpenClaims::default();
   mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
@@ -4345,7 +4492,7 @@ mod tests {
 
   type ME = T256DynPrimeEngine;
   type MP = IntegerModPCS;
-  type DP = DynPrime<4>;
+  type DP = DynPrime<2>;
 
   /// Setup + commit round-trip: an IntEval-committed polynomial commits
   /// to the same Hyrax handle as a direct Hyrax commit of its
@@ -4940,6 +5087,61 @@ mod tests {
     assert_eq!(integer_mle_evaluate(&poly, &point), naive);
   }
 
+  #[test]
+  #[ignore]
+  fn small_q_param_grid() {
+    // Exploratory: what (log_p, s, layers) does each candidate log_q
+    // admit, per the derive()/validate() formulas, ignoring Soundness
+    // Bound 2 (which pins log_q >= LAMBDA + log2(s*n) and would need
+    // extension-field challenges to relax)?
+    let num_vars = 13usize; // multiswap 2^13
+    let log_t_f = 2048usize;
+    for log_q in [64usize, 96, 128, 160, 192, 256] {
+      println!("--- log_q = {log_q} ---");
+      for log_t in [16usize, 32, 64] {
+        let nl = numlimb(log_t_f, log_t);
+        let nlv = numlimb_var(nl);
+        let n_total = num_vars + nlv;
+        let mut best: Option<(usize, usize, usize, usize)> = None;
+        for k in 1..=16usize {
+          let mut log_p = 0usize;
+          for lp in 2..log_q {
+            let partial = k + k * lp + log_t.max(lp);
+            let final_eval = k + (k + 1) * lp;
+            if partial < log_q && final_eval < log_q {
+              log_p = lp;
+            }
+          }
+          if log_p < 5 {
+            continue;
+          }
+          let bpp = soundness_bits_per_prime(log_p, n_total, log_t);
+          if bpp <= 0.0 {
+            continue;
+          }
+          let s = (LAMBDA as f64 / bpp).ceil() as usize;
+          let layers = n_total.div_ceil(k);
+          let better = match best {
+            None => true,
+            Some((bl, _, _, bs)) => layers < bl || (layers == bl && s < bs),
+          };
+          if better {
+            best = Some((layers, k, log_p, s));
+          }
+          println!(
+            "  log_t={log_t:2} k={k:2}: log_p={log_p:2} s={s:3} layers={layers:2}              bound2_needs_log_q>={}",
+            LAMBDA + ceil_log2((s * num_vars).max(1))
+          );
+        }
+        if let Some((layers, k, log_p, s)) = best {
+          println!("  => best log_t={log_t}: k={k} log_p={log_p} s={s} layers={layers}");
+        } else {
+          println!("  => log_t={log_t}: INFEASIBLE");
+        }
+      }
+    }
+  }
+
   /// `explicit` rejects a config whose Soundness Bound 1 fails: a small
   /// `log_p` paired with a small `s` gives a too-large soundness error.
   #[test]
@@ -4987,10 +5189,10 @@ mod tests {
 
   /// Helper: build params for a small dynamic prime so we can
   /// deterministically evaluate the polynomial at a known Z_p point.
-  fn small_dyn_params() -> crypto_bigint::modular::FixedMontyParams<4> {
-    use crypto_bigint::{Odd, U256};
+  fn small_dyn_params() -> crypto_bigint::modular::FixedMontyParams<2> {
+    use crypto_bigint::{Odd, U128};
     // A small prime (37) so the integer evaluation is human-verifiable.
-    crypto_bigint::modular::FixedMontyParams::new(Odd::new(U256::from(37u32)).unwrap())
+    crypto_bigint::modular::FixedMontyParams::new(Odd::new(U128::from(37u32)).unwrap())
   }
 
   /// End-to-end IntEval prove/verify for the `n ≤ k` regime.
@@ -5025,6 +5227,84 @@ mod tests {
 
     let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
     <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+  }
+
+  /// A large witness with an all-zero tail exercises the active-block
+  /// split: zero blocks leave the LogUp multiset (pinned by fresh
+  /// zero claims instead), the roundtrip verifies, and a forged
+  /// active-block map is rejected in both directions.
+  #[test]
+  fn rc_zero_blocks_dropped_and_bitmap_pinned() {
+    let num_vars = 12usize;
+    let n = 1usize << num_vars; // 4096 values × 128 chunk slots -> 8 blocks
+    let params = IntEvalParams::derive(2048, 64, DEFAULT_K, num_vars).unwrap();
+    let (ck, vk) = MP::setup_with_params(b"inteval-zb", n, 256, params).unwrap();
+
+    let dyn_params = small_dyn_params();
+    // Nonzero head, all-zero tail (the padded-row shape).
+    let poly: Vec<BigUint> = (0..n)
+      .map(|i| {
+        if i < 100 {
+          (BigUint::from(i as u32 + 1) << 1000) + BigUint::from(7u32)
+        } else {
+          BigUint::from(0u32)
+        }
+      })
+      .collect();
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+    let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+    let int_v = integer_mle_evaluate(&poly, &int_point);
+    let p = BigUint::from(37u32);
+    let eval = int_v
+      .mod_floor(&BigInt::from(p.clone()))
+      .to_biguint()
+      .unwrap();
+
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = <MP as ModPCSEngineTrait<ME>>::commit(&ck, &poly, &blind).unwrap();
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    let arg =
+      <MP as ModPCSEngineTrait<ME>>::prove(&ck, &mut pt, &comm, &poly, &blind, &point, &eval)
+        .unwrap();
+
+    // The f batch's chunk polynomial spans multiple 2^16-slot blocks;
+    // the zero tail must have deactivated at least one, and the nonzero
+    // head must have kept the first active.
+    assert!(
+      arg.range_check.active_blocks[0].iter().any(|&a| !a),
+      "expected an inactive (all-zero) block in the f batch"
+    );
+    assert!(
+      arg.range_check.active_blocks[0][0],
+      "head block must stay active"
+    );
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &arg).unwrap();
+
+    // Forgery 1: claim an active (nonzero) block is all-zero.
+    let mut forged = arg.clone();
+    forged.range_check.active_blocks[0][0] = false;
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    assert!(
+      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &forged).is_err(),
+      "nonzero block forged inactive must fail"
+    );
+
+    // Forgery 2: resurrect a zero block as active.
+    let mut forged = arg.clone();
+    let zi = forged.range_check.active_blocks[0]
+      .iter()
+      .position(|&a| !a)
+      .unwrap();
+    forged.range_check.active_blocks[0][zi] = true;
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"intev", dyn_params);
+    assert!(
+      <MP as ModPCSEngineTrait<ME>>::verify(&vk, &mut vt, &comm, &point, &eval, &forged).is_err(),
+      "zero block forged active must fail"
+    );
   }
 
   /// Verifier rejects a tampered claimed Z_p eval.
