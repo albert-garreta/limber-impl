@@ -150,6 +150,41 @@ struct GkrOut<E: Engine> {
   leaf_q: E::Scalar,
 }
 
+/// One lockstep layer of a batched multi-tree GKR walk: the γ-combined
+/// round polynomials — a single cubic per round shared by every active
+/// tree — plus each active tree's input-layer evaluations
+/// `[p0, p1, q0, q1]`, in tree order. The per-tree finals cannot be
+/// batched away: they seed the next layer's per-tree claims and are
+/// ultimately pinned by the leaf-level PCS openings / closed-form table
+/// checks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct GkrMultiLayerProof<E: Engine> {
+  round_polys: Vec<[E::Scalar; 4]>,
+  finals: Vec<[E::Scalar; 4]>,
+}
+
+/// The shared proof of a batched multi-tree GKR walk: one
+/// [`GkrMultiLayerProof`] per layer of the DEEPEST tree, top to bottom.
+/// Replaces the per-tree [`GkrProof`]s the lockstep walk used to emit —
+/// round-polynomial size drops from `Σ_t Θ(d_t²)` to `Θ(max_d²)` field
+/// elements while the per-tree finals stay `4·Σ_t d_t`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct GkrMultiProof<E: Engine> {
+  layers: Vec<GkrMultiLayerProof<E>>,
+}
+
+/// Per-tree prover output of a batched multi-tree walk (the shared
+/// transcript artifact lives in [`GkrMultiProof`]).
+struct GkrTreeOut<E: Engine> {
+  root_p: E::Scalar,
+  root_q: E::Scalar,
+  leaf_point: Vec<E::Scalar>,
+  leaf_p: E::Scalar,
+  leaf_q: E::Scalar,
+}
+
 /// Build all layers of the fraction tree from the leaves up to the root.
 /// `levels_p[k]` / `levels_q[k]` hold the `2^k`-entry layer; `[d]` is the
 /// leaves and `[0]` the single-entry root.
@@ -574,25 +609,31 @@ fn gkr_verify<E: Engine>(
   Ok((point, claim_p, claim_q))
 }
 
-/// Prove several fraction trees IN LOCKSTEP with shared challenges: all
-/// roots are absorbed before any challenge, then every layer/round
-/// advances all still-active trees together — each round absorbs every
-/// active tree's round polynomial before the ONE shared challenge is
-/// squeezed. Soundness per tree is the single-tree argument verbatim
-/// (its messages are bound before each challenge); the lockstep gives
-/// (a) per-round work that is independent ACROSS trees — the
-/// multithreading unlock the serial per-tree loop lacked, (b) shared
-/// eq/suffix tables and Gruen prefix factors per round, and (c)
-/// identical leaf points for equal-depth trees, whose PCS claims then
-/// share batched-open weight passes. Trees may differ in depth: all
-/// start at layer 0 and a tree exits after its last layer with its leaf
-/// claim at the then-current shared point. Per-tree proof objects are
-/// structurally identical to [`gkr_prove`]'s — only the transcript
-/// interleaving differs.
+/// Prove several fraction trees IN LOCKSTEP with shared challenges and a
+/// γ-batched transcript: all roots are absorbed before any challenge,
+/// then every layer/round advances all still-active trees together. Per
+/// round the trees' cubic round polynomials are combined into ONE
+/// γ-power RLC `S(X) = Σ_i γ^i s_i(X)` — only `S` is absorbed and
+/// serialized — before the one shared challenge is squeezed. Soundness
+/// is the standard batched-sumcheck argument: γ is squeezed at layer
+/// start, AFTER the previous layer's per-tree finals (which fix every
+/// tree's layer claim) are absorbed, so a cheating claim survives the
+/// RLC with probability ≤ (#trees−1)/|F| per layer, on top of the usual
+/// per-round Schwartz–Zippel loss. The lockstep gives (a) per-round
+/// work that is independent ACROSS trees — the multithreading unlock
+/// the serial per-tree loop lacked, (b) shared eq/suffix tables and
+/// Gruen prefix factors per round, (c) identical leaf points for
+/// equal-depth trees, whose PCS claims then share batched-open weight
+/// passes, and (d) round-polynomial proof size `Θ(max_d²)` instead of
+/// `Σ_t Θ(d_t²)`. Trees may differ in depth: all start at layer 0 and a
+/// tree exits after its last layer with its leaf claim at the
+/// then-current shared point. Per-tree input-layer finals remain in the
+/// proof (they seed the next layer's claims), grouped per layer in
+/// [`GkrMultiLayerProof`].
 fn gkr_prove_multi<E: Engine>(
   inputs: Vec<(Vec<E::Scalar>, Vec<E::Scalar>, bool)>,
   transcript: &mut E::TE,
-) -> Result<Vec<GkrOut<E>>, SpartanError> {
+) -> Result<(GkrMultiProof<E>, Vec<GkrTreeOut<E>>), SpartanError> {
   let nt = inputs.len();
   // Build every tree's levels — pure computation, parallel over trees.
   let (_bl_span, bl_t) = crate::start_span!("gkr_build_levels");
@@ -630,8 +671,7 @@ fn gkr_prove_multi<E: Engine>(
 
   let mut claim_p: Vec<E::Scalar> = roots.iter().map(|r| r.0).collect();
   let mut claim_q: Vec<E::Scalar> = roots.iter().map(|r| r.1).collect();
-  let mut layers_out: Vec<Vec<GkrLayerProof<E>>> =
-    depths.iter().map(|&d| Vec::with_capacity(d)).collect();
+  let mut shared_layers: Vec<GkrMultiLayerProof<E>> = Vec::with_capacity(max_d);
   let mut leaf_points: Vec<Vec<E::Scalar>> = vec![Vec::new(); nt];
   let mut point: Vec<E::Scalar> = Vec::new();
 
@@ -644,11 +684,11 @@ fn gkr_prove_multi<E: Engine>(
     b1: Vec<F>,
     leaf_ones: bool,
     claim: F,
-    round_polys: Vec<[F; 4]>,
   }
 
   for k in 0..max_d {
     let lambda = transcript.squeeze(b"gkr_lambda")?;
+    let gamma = transcript.squeeze(b"gkr_gamma")?;
     let half = 1usize << k;
     let mut st: Vec<Ls<E::Scalar>> = Vec::new();
     for t in 0..nt {
@@ -677,9 +717,9 @@ fn gkr_prove_multi<E: Engine>(
         b1,
         leaf_ones,
         claim: claim_p[t] + lambda * claim_q[t],
-        round_polys: Vec::with_capacity(k),
       });
     }
+    let mut layer_round_polys: Vec<[E::Scalar; 4]> = Vec::with_capacity(k);
 
     // Shared Gruen/Dao–Thaler machinery (see `gkr_prove` for the
     // derivation) — the split tables and prefix factors depend only on
@@ -758,11 +798,21 @@ fn gkr_prove_multi<E: Engine>(
         })
         .collect();
 
+      // γ-RLC across trees: one combined cubic goes on the transcript
+      // (and in the proof); each tree still tracks its own claim for the
+      // next round's Gruen shortcut.
+      let mut comb = [E::Scalar::ZERO; 4];
+      let mut g = E::Scalar::ONE;
       for s in &ss {
-        for v in s {
-          transcript.absorb(b"gkr_rp", v);
+        for (cj, sj) in comb.iter_mut().zip(s.iter()) {
+          *cj += g * sj;
         }
+        g *= gamma;
       }
+      for v in &comb {
+        transcript.absorb(b"gkr_rp", v);
+      }
+      layer_round_polys.push(comb);
       let ri = transcript.squeeze(b"gkr_chal")?;
       st.par_iter_mut().zip(ss.par_iter()).for_each(|(s, sp)| {
         if !s.leaf_ones {
@@ -772,7 +822,6 @@ fn gkr_prove_multi<E: Engine>(
         bind_top(&mut s.b0, ri);
         bind_top(&mut s.b1, ri);
         s.claim = eval_cubic_with(&cubic, sp, ri);
-        s.round_polys.push(*sp);
       });
       e_pref *= (E::Scalar::ONE - c) * (E::Scalar::ONE - ri) + c * ri;
       challenges.push(ri);
@@ -803,29 +852,29 @@ fn gkr_prove_multi<E: Engine>(
     next_point.extend_from_slice(&challenges);
     point = next_point;
 
-    for (s, (p0, p1, q0, q1)) in st.into_iter().zip(finals) {
+    for (s, (p0, p1, q0, q1)) in st.into_iter().zip(finals.iter().copied()) {
       let t = s.t;
       claim_p[t] = (E::Scalar::ONE - cc) * p0 + cc * p1;
       claim_q[t] = (E::Scalar::ONE - cc) * q0 + cc * q1;
-      layers_out[t].push(GkrLayerProof {
-        round_polys: s.round_polys,
-        p0,
-        p1,
-        q0,
-        q1,
-      });
       if k + 1 == depths[t] {
         leaf_points[t] = point.clone();
       }
     }
+    shared_layers.push(GkrMultiLayerProof {
+      round_polys: layer_round_polys,
+      finals: finals
+        .into_iter()
+        .map(|(p0, p1, q0, q1)| [p0, p1, q0, q1])
+        .collect(),
+    });
   }
 
-  Ok(
+  Ok((
+    GkrMultiProof {
+      layers: shared_layers,
+    },
     (0..nt)
-      .map(|t| GkrOut {
-        proof: GkrProof {
-          layers: core::mem::take(&mut layers_out[t]),
-        },
+      .map(|t| GkrTreeOut {
         root_p: roots[t].0,
         root_q: roots[t].1,
         leaf_point: core::mem::take(&mut leaf_points[t]),
@@ -833,34 +882,37 @@ fn gkr_prove_multi<E: Engine>(
         leaf_q: claim_q[t],
       })
       .collect(),
-  )
+  ))
 }
 
-/// Verifier mirror of [`gkr_prove_multi`]: walk all trees' proofs in the
-/// same lockstep transcript order, applying exactly the per-tree checks
-/// of [`gkr_verify`]. Returns each tree's `(leaf point, p, q)` claims.
+/// Verifier mirror of [`gkr_prove_multi`]: walk the shared γ-batched
+/// proof in the same lockstep transcript order. Per round it checks the
+/// ONE combined cubic against the γ-RLC of the active trees' claims;
+/// per layer end it checks `eq · Σ_i γ^i gate_i` against the reduced
+/// combined claim, then advances each tree's claim from its own finals.
+/// Returns each tree's `(leaf point, p, q)` claims.
 fn gkr_verify_multi<E: Engine>(
   roots: &[(E::Scalar, E::Scalar)],
   depths: &[usize],
-  proofs: &[&GkrProof<E>],
+  proof: &GkrMultiProof<E>,
   transcript: &mut E::TE,
 ) -> Result<Vec<(Vec<E::Scalar>, E::Scalar, E::Scalar)>, SpartanError> {
   let nt = roots.len();
-  if depths.len() != nt || proofs.len() != nt {
+  if depths.len() != nt {
     return Err(SpartanError::ProofVerifyError {
       reason: "logup-gkr multi: tree count mismatch".to_string(),
     });
   }
-  for t in 0..nt {
-    if proofs[t].layers.len() != depths[t] {
-      return Err(SpartanError::ProofVerifyError {
-        reason: "logup-gkr: wrong number of layers".to_string(),
-      });
-    }
-    transcript.absorb(b"gkr_root_p", &roots[t].0);
-    transcript.absorb(b"gkr_root_q", &roots[t].1);
-  }
   let max_d = depths.iter().copied().max().unwrap_or(0);
+  if proof.layers.len() != max_d {
+    return Err(SpartanError::ProofVerifyError {
+      reason: "logup-gkr: wrong number of layers".to_string(),
+    });
+  }
+  for root in roots {
+    transcript.absorb(b"gkr_root_p", &root.0);
+    transcript.absorb(b"gkr_root_q", &root.1);
+  }
   let cubic = CubicConsts::<E::Scalar>::new();
 
   let mut claim_p: Vec<E::Scalar> = roots.iter().map(|r| r.0).collect();
@@ -868,54 +920,55 @@ fn gkr_verify_multi<E: Engine>(
   let mut leaf_points: Vec<Vec<E::Scalar>> = vec![Vec::new(); nt];
   let mut point: Vec<E::Scalar> = Vec::new();
 
-  for k in 0..max_d {
+  for (k, layer) in proof.layers.iter().enumerate() {
     let lambda = transcript.squeeze(b"gkr_lambda")?;
+    let gamma = transcript.squeeze(b"gkr_gamma")?;
     let active: Vec<usize> = (0..nt).filter(|&t| k < depths[t]).collect();
-    for &t in &active {
-      if proofs[t].layers[k].round_polys.len() != k {
-        return Err(SpartanError::ProofVerifyError {
-          reason: "logup-gkr: wrong round count in layer".to_string(),
-        });
-      }
+    if layer.round_polys.len() != k || layer.finals.len() != active.len() {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: layer shape mismatch".to_string(),
+      });
     }
-    let mut claims: Vec<E::Scalar> = active
-      .iter()
-      .map(|&t| claim_p[t] + lambda * claim_q[t])
-      .collect();
+    // γ-RLC of the active trees' layer claims — the batched sumcheck's
+    // starting claim.
+    let mut claim = E::Scalar::ZERO;
+    let mut g = E::Scalar::ONE;
+    for &t in &active {
+      claim += g * (claim_p[t] + lambda * claim_q[t]);
+      g *= gamma;
+    }
     let mut challenges: Vec<E::Scalar> = Vec::with_capacity(k);
 
-    for round in 0..k {
-      for (i, &t) in active.iter().enumerate() {
-        let s = &proofs[t].layers[k].round_polys[round];
-        if s[0] + s[1] != claims[i] {
-          return Err(SpartanError::ProofVerifyError {
-            reason: "logup-gkr: sumcheck round mismatch".to_string(),
-          });
-        }
-        for v in s {
-          transcript.absorb(b"gkr_rp", v);
-        }
+    for s in &layer.round_polys {
+      if s[0] + s[1] != claim {
+        return Err(SpartanError::ProofVerifyError {
+          reason: "logup-gkr: sumcheck round mismatch".to_string(),
+        });
+      }
+      for v in s {
+        transcript.absorb(b"gkr_rp", v);
       }
       let ri = transcript.squeeze(b"gkr_chal")?;
-      for (i, &t) in active.iter().enumerate() {
-        claims[i] = eval_cubic_with(&cubic, &proofs[t].layers[k].round_polys[round], ri);
-      }
+      claim = eval_cubic_with(&cubic, s, ri);
       challenges.push(ri);
     }
 
     let eq_val = EqPolynomial::new(point.clone()).evaluate(&challenges);
-    for (i, &t) in active.iter().enumerate() {
-      let lp = &proofs[t].layers[k];
-      transcript.absorb(b"gkr_p0", &lp.p0);
-      transcript.absorb(b"gkr_p1", &lp.p1);
-      transcript.absorb(b"gkr_q0", &lp.q0);
-      transcript.absorb(b"gkr_q1", &lp.q1);
-      let gate = lp.p0 * lp.q1 + lp.p1 * lp.q0 + lambda * (lp.q0 * lp.q1);
-      if eq_val * gate != claims[i] {
-        return Err(SpartanError::ProofVerifyError {
-          reason: "logup-gkr: layer gate check failed".to_string(),
-        });
-      }
+    let mut gates = E::Scalar::ZERO;
+    let mut g = E::Scalar::ONE;
+    for f in &layer.finals {
+      let [p0, p1, q0, q1] = *f;
+      transcript.absorb(b"gkr_p0", &p0);
+      transcript.absorb(b"gkr_p1", &p1);
+      transcript.absorb(b"gkr_q0", &q0);
+      transcript.absorb(b"gkr_q1", &q1);
+      gates += g * (p0 * q1 + p1 * q0 + lambda * (q0 * q1));
+      g *= gamma;
+    }
+    if eq_val * gates != claim {
+      return Err(SpartanError::ProofVerifyError {
+        reason: "logup-gkr: layer gate check failed".to_string(),
+      });
     }
 
     let cc = transcript.squeeze(b"gkr_c")?;
@@ -923,10 +976,10 @@ fn gkr_verify_multi<E: Engine>(
     next_point.push(cc);
     next_point.extend_from_slice(&challenges);
     point = next_point;
-    for &t in &active {
-      let lp = &proofs[t].layers[k];
-      claim_p[t] = (E::Scalar::ONE - cc) * lp.p0 + cc * lp.p1;
-      claim_q[t] = (E::Scalar::ONE - cc) * lp.q0 + cc * lp.q1;
+    for (i, &t) in active.iter().enumerate() {
+      let [p0, p1, q0, q1] = layer.finals[i];
+      claim_p[t] = (E::Scalar::ONE - cc) * p0 + cc * p1;
+      claim_q[t] = (E::Scalar::ONE - cc) * q0 + cc * q1;
       if k + 1 == depths[t] {
         leaf_points[t] = point.clone();
       }
@@ -1168,8 +1221,10 @@ pub struct LogUpMultiRangeProof<E: Engine> {
   wit_roots: Vec<(E::Scalar, E::Scalar)>,
   p_rhs_root: E::Scalar,
   q_rhs_root: E::Scalar,
-  wit_gkrs: Vec<GkrProof<E>>,
-  rhs_gkr: GkrProof<E>,
+  /// One shared γ-batched GKR walk over all witness trees + the table
+  /// tree (see [`GkrMultiProof`]) — round polynomials are combined
+  /// across trees, so proof size no longer scales with tree count.
+  gkr: GkrMultiProof<E>,
 }
 
 impl<E: Engine> LogUpMultiRangeProof<E> {
@@ -1252,15 +1307,13 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     let q_rhs = r_plus;
     inputs.push((p_rhs, q_rhs, false));
 
-    let mut outs = gkr_prove_multi::<E>(inputs, transcript)?;
+    let (gkr, mut outs) = gkr_prove_multi::<E>(inputs, transcript)?;
     let rhs = outs.pop().expect("table tree present");
     let mut wit_roots = Vec::with_capacity(witnesses.len());
-    let mut wit_gkrs = Vec::with_capacity(witnesses.len());
     let mut wit_claims = Vec::with_capacity(witnesses.len());
     for out in outs {
       wit_roots.push((out.root_p, out.root_q));
       wit_claims.push((out.leaf_point, out.leaf_q - r));
-      wit_gkrs.push(out.proof);
     }
 
     let claims = MultiRangeClaims {
@@ -1275,8 +1328,7 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
         wit_roots,
         p_rhs_root: rhs.root_p,
         q_rhs_root: rhs.root_q,
-        wit_gkrs,
-        rhs_gkr: rhs.proof,
+        gkr,
       },
       claims,
     ))
@@ -1292,10 +1344,7 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     expected_wit_depths: &[usize],
     transcript: &mut E::TE,
   ) -> Result<MultiRangeClaims<E>, SpartanError> {
-    if self.wit_gkrs.len() != expected_wit_depths.len()
-      || self.wit_roots.len() != expected_wit_depths.len()
-      || expected_wit_depths.is_empty()
-    {
+    if self.wit_roots.len() != expected_wit_depths.len() || expected_wit_depths.is_empty() {
       return Err(SpartanError::ProofVerifyError {
         reason: "logup-gkr multi: witness tree count mismatch".to_string(),
       });
@@ -1310,12 +1359,10 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
     roots.push((self.p_rhs_root, self.q_rhs_root));
     let mut depths: Vec<usize> = expected_wit_depths.to_vec();
     depths.push(bits);
-    let mut proofs: Vec<&GkrProof<E>> = self.wit_gkrs.iter().collect();
-    proofs.push(&self.rhs_gkr);
-    let mut leaf_outs = gkr_verify_multi::<E>(&roots, &depths, &proofs, transcript)?;
+    let mut leaf_outs = gkr_verify_multi::<E>(&roots, &depths, &self.gkr, transcript)?;
 
     let (rhs_point, rhs_p, rhs_q) = leaf_outs.pop().expect("table tree present");
-    let mut wit_claims = Vec::with_capacity(self.wit_gkrs.len());
+    let mut wit_claims = Vec::with_capacity(self.wit_roots.len());
     for (i, (point, leaf_p, leaf_q)) in leaf_outs.into_iter().enumerate() {
       // Witness numerators are all 1.
       if leaf_p != E::Scalar::ONE {
@@ -1542,5 +1589,33 @@ mod tests {
     // Honest proof still verifies.
     let mut tv = <E as Engine>::TE::new(b"logup_multi");
     assert!(proof.verify(4, &[2, 1], &mut tv).is_ok());
+  }
+
+  /// Tampering with the shared γ-batched GKR walk — a combined round
+  /// polynomial or one tree's layer finals — is rejected.
+  #[test]
+  fn multi_range_rejects_tampered_gkr() {
+    type E = PallasHyraxEngine;
+    let w0: Vec<u64> = vec![3, 7, 3, 0, 15, 1, 9, 3];
+    let w1: Vec<u64> = vec![1, 2, 0, 0];
+    let mut tp = <E as Engine>::TE::new(b"logup_multi");
+    let (proof, _) = LogUpMultiRangeProof::<E>::prove(4, &[&w0, &w1], &mut tp).unwrap();
+
+    // Corrupt a combined round polynomial deep in the walk.
+    let mut bad = proof.clone();
+    let last = bad.gkr.layers.len() - 1;
+    bad.gkr.layers[last].round_polys[0][2] += <E as Engine>::Scalar::ONE;
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    assert!(bad.verify(4, &[3, 2], &mut tv).is_err());
+
+    // Corrupt one tree's input-layer finals.
+    let mut bad = proof.clone();
+    bad.gkr.layers[1].finals[0][3] += <E as Engine>::Scalar::ONE;
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    assert!(bad.verify(4, &[3, 2], &mut tv).is_err());
+
+    // Honest proof still verifies.
+    let mut tv = <E as Engine>::TE::new(b"logup_multi");
+    assert!(proof.verify(4, &[3, 2], &mut tv).is_ok());
   }
 }
