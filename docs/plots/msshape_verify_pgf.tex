@@ -4,9 +4,11 @@
 \colorlet{basecolor}{blue!50!black}
 \begin{tikzpicture}
   \begin{axis}[
-    width=0.95\linewidth, height=5.2cm,
+    scale only axis, width=0.84\linewidth, height=4.6cm,
+    yticklabel style={font=\scriptsize, text width=2.4em, align=right},
+    xticklabel style={font=\scriptsize},
     ymin=0,
-    ytick={0,10,20,30,40,50},
+    ytick={0,10,20,30,40},
     xtick={10,12,14}, xticklabels={$2^{10}$,$2^{12}$,$2^{14}$},
     xlabel={Constraints}, ylabel={Verifier time (ms)},
     grid=both, grid style={gray!20},
@@ -17,13 +19,13 @@
     error bars/y dir=both, error bars/y explicit,
   ]
     \addplot[ourscolor, thick, mark=*, mark size=1.8pt]
-      coordinates {(10,25.853) +- (0.350,0.195) (12,28.961) +- (0.214,0.259) (14,33.149) +- (0.275,0.194)};
+      coordinates {(10,25.912) +- (0.328,0.646) (12,28.680) +- (0.302,0.624) (14,27.455) +- (0.152,0.289)};
     \addlegendentry{IntMod-Spartan}
     \addplot[basecolor, thick, mark=square*, mark size=1.8pt]
-      coordinates {(10,14.384) +- (0.079,0.199) (12,14.816) +- (0.090,0.097) (14,16.569) +- (0.175,0.183)};
+      coordinates {(10,15.052) +- (0.116,0.101) (12,15.401) +- (0.062,0.143) (14,17.216) +- (0.209,0.333)};
     \addlegendentry{Spartan (native baseline)}
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:10,25.853) {1.8$\times$};
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:12,28.961) {2.0$\times$};
-    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:14,33.149) {2.0$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:10,25.912) {1.7$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:12,28.680) {1.9$\times$};
+    \node[above=2pt, ourscolor, font=\scriptsize] at (axis cs:14,27.455) {1.6$\times$};
   \end{axis}
 \end{tikzpicture}

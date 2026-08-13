@@ -257,7 +257,15 @@ def emit_pgfplots(phase: str, title: str, outname: str) -> bool:
         "\\colorlet{basecolor}{blue!50!black}\n"
         "\\begin{tikzpicture}\n"
         "  \\begin{axis}[\n"
-        "    width=0.95\\linewidth, height=5.2cm,\n"
+        # scale only axis + fixed-width y tick labels: both panels get an
+
+        # identical axis box and identical left offset, so the stacked
+
+        # prover/verifier figures align regardless of tick label widths.
+
+        "    scale only axis, width=0.84\\linewidth, height=4.6cm,\n"
+        "    yticklabel style={font=\\scriptsize, text width=2.4em, align=right},\n"
+        "    xticklabel style={font=\\scriptsize},\n"
         + yaxis_opts
         + f"    xtick={{{ticks}}}, xticklabels={{{ticklabels}}},\n"
         "    xlabel={Constraints}, ylabel={" + title + " time (ms)},\n"
