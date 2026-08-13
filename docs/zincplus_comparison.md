@@ -236,23 +236,22 @@ The witness commitment now IS the range check's 16-bit chunk commitment
 Official cold-machine pair (2026-07-24, rested machine, back-to-back):
 ours 1.344 s / 37.9 ms; Zinc+ 1.131 s / 482 ms.
 
-**Accounting correction (2026-08-03): the ratio must include witness
-commitment.** Zinc+'s `--bench e2e` prove takes the raw trace and
-commits inside the timed region (their PCS is ~26% of prove). Our
-criterion `prove` receives a pre-committed witness; `commit_witness`
-(351 ms, benched separately) plays the same role as their in-prove
-commit and belongs in the cross-system number. Corrected apples-to-
-apples, multiswap 2^13 single-thread: ours 1.33 s prove + 0.35 s
-commit = **1.68 s** vs Zinc+ **1.13 s** -> **prove ratio ~1.49×**
-(not the 1.19× previously quoted, which was prove-sans-commit).
-Verify/proof-size comparisons are unaffected. The Brakedown numbers
-in this document already include commit and need no correction, and
-the msshape/native-overhead figures were commit-inclusive on both
-sides from the start (stated in their provenance header). ECDSA
-re-measured commit-inclusive (2026-08-03, single-thread, k=9):
-commit 59 ms + prove 187 ms = **246 ms**, verify 20.6 ms -> the gap
-vs Zinc+'s q=p specialization (24.5 ms) is **~10×** (earlier "~8×"
-was prove-only).
+**Accounting notes (2026-08-03/06).** (1) ECDSA: the
+`ecdsa_msm_prove_time` test originally excluded the witness commitment
+from its timer; re-measured commit-inclusive (single-thread, k=9):
+commit 59 ms + prove 187 ms = **246 ms**, verify 20.6 ms -> gap vs
+Zinc+'s q=p specialization (24.5 ms) is **~10×** (earlier "~8×" was
+prove-only). (2) MultiSwap: a 2026-08-03 "correction" claiming the
+prove ratio was 1.49× DOUBLE-COUNTED the commit and is retracted: the
+criterion `prove/` timed region has always been the full pipeline —
+witness generation + witness commitment + prove (see the bench
+comment) — so the published commit-inclusive numbers and the ~1.19×
+cold-pair ratio were correct as originally stated. Zinc+'s e2e prove
+also commits inside its timed region (their PCS is ~26% of prove) but
+receives a prebuilt trace, so our number including witness generation
+is slightly conservative against us. Post zero-block-drop
+(2026-08-04): ours 1.219 s full-pipeline vs Zinc+ 1.13 s ->
+**~1.08×**.
 
 **Same-hour pairing (2026-07-23):** both sides re-measured back-to-back
 on the same machine state after the full optimization series: ours
@@ -291,3 +290,198 @@ prove toward ~1.0 s, i.e. Zinc+ parity); batch-affine MSM internals
 (~110–120 ms more) is the in-place alternative. The GKR is now lockstep-batched:
 multithreaded it scales 3.4× (126 ms), and multithreaded prove-proper
 is ~520 ms total.
+
+## Proof-size correction and measurement (2026-08-06)
+
+The "~KB" / "~1000x" proof-size claim was never measured and is wrong;
+the bench now measures it (`PSIZE=1`, `eval_arg_component_sizes`).
+MultiSwap 2^13, Hyrax path, single proof:
+
+| RC_BLOCK_LOG | proof (raw bincode) | range_check share | commit+prove (one-shot) |
+|---|---|---|---|
+| 16 (current) | **637 KB** | 551 KB | ~1.26-1.35 s |
+| 18 | 351 KB | 266 KB | ~1.28 s |
+| 20 (~unblocked) | 273 KB | 187 KB | ~1.39 s |
+
+plus ~1.2 KB of (not yet serializable) sumcheck rounds/evals. The
+multi-tree LogUp-GKR dominates (~17 KB round polynomials per tree;
+zero-block splitting multiplies tree count -- a prove-time/proof-size
+trade nobody measured until now). Corrected comparison: Zinc+ 4.76 MB
+raw / 1.21 MB zstd vs ours 0.27-0.64 MB raw -> **we are ~2-17x
+smaller, not ~1000x**. Brakedown path: 20.08 MB (k=11). Groth16-class
+baselines (original MultiSwap paper via bellman/BLS12-381; arkworks
+emulation) are constant ~128-192 B -- three orders below all
+code/vector-commitment systems including ours and Zinc+'s.
+RC_BLOCK_LOG=18 looks Pareto (half the proof, prove within noise);
+adopting it needs a criterion A/B. Real fix: RLC-batch the lockstep
+trees' round polynomials into one per round (see gkr_uniskip_plan.md)
+-> ~100 KB at full prove speed.
+
+## Faithful-cost configuration (2026-08-07)
+
+The multiswap bench now charges `Hp` at faithful cost and structure
+(previously 600 modeled rows): 600 Pocklington-exponentiation rows +
+3 chained Poseidon-cost permutations (243 mul rows each -- 81 x^5
+S-boxes x 3 muls; MDS/round-constant layers fold into the LCs free;
+synthetic operands, real chain shape and modulus p_hash) + 640
+mod-0 decomposition bit rows + 10 reconstruction rows mod l. New
+instance: **6,210 real rows** (was 4,831), cons still 2^13; columns
+7,437 (chained hash rows cost ~1 column/row), vars still 2^13 -- the
+variable-padding boundary is NOT crossed.
+
+Zinc+ needs no circuit change: their prover cost is padded-trace
+(8,192 rows x 2048-bit width), which upper-bounds the same faithful
+workload (their hash rows would be narrower-modulus rows in the same
+trace), so their measured 1.13 s stands as the fair number.
+
+Measured (single-thread, criterion full pipeline = witness gen +
+commit + prove): **prove 1.347 s, verify 37.8 ms, proof 725 KB**
+(range check 639 KB -- more nonzero rows -> fewer dropped zero
+blocks). Fair-configuration ratio vs Zinc+: **~1.19x prove**, verify
+~13x us, proof ~1.9-6.6x us (raw 4.76 MB / zstd 1.21 MB vs 725 KB).
+The previous 4,831-row numbers (1.219 s / 637 KB) remain valid as the
+"modmul-core" configuration. At k>0 the H-delta model is still 8
+rows/invocation (faithful ~500-650) -- do not quote k>0 without
+fixing that.
+
+## Fully wired configuration + fairness re-evaluation (2026-08-07)
+
+The bench circuit is now FULLY wired at k = 0: group-mult operands are
+the exponentiation output columns; `Hp` is 4 real square-and-multiply
+chains (50-bit exponents, Mersenne moduli 2^61/89/107/127 − 1, with
+bit decomposition and reconstruction, via the same `build_exp_circuit`
+as the Wesolowski chains); the Poseidon chain is seeded by reducing
+exp output 0 mod p_hash; the 639 decomposition bit rows fully decompose
+the Poseidon output and all four chain outputs with exact mod-0
+reconstruction rows; the final mod-l row reduces the Poseidon output.
+Witness: **6,209 rows / 6,204 real columns (~1 column per row — the
+witness floor: one fresh value per multiplication output)**; shape
+still 2^13 x 2^13. Only remaining unfaithful piece: the k>0 H-delta
+model (do not quote k>0).
+
+Prover-side zero exploitation extended to the batched-open bind/eval
+passes (elementwise both-zero skips; chunk layouts are ~50% strided
+interior zeros from values narrower than their limb budget).
+
+Measured (single-thread, full pipeline): **prove 1.278 s, verify
+38.2 ms, proof 672 KB** -> ratio vs Zinc+ **1.13x**.
+
+**Fairness verdict, sharpened:** Zinc+'s 1.13 s is an UNWIRED,
+single-modulus LOWER BOUND, not their fair number. (a) Gate-count
+corrections provably don't move it: 4,228-real+pad = 8,192-all-real
+measured (1.0956 vs ~1.07 s) — their prover pays padded list price,
+zeros are not free for hash-based linear-time commitment, while ours
+demonstrably harvests zeros (blocking, MSM skips, bind/eval skips).
+(b) What padding does NOT absorb for them: wiring (their MulModN probe
+— which we wrote — has no copy constraints or transition structure;
+the faithful statement is chained everywhere) and modulus mixing
+(their probe bakes in one N). Their own wired UAIRs indicate structure
+costs them ~an order of magnitude per row: RealSha256 97.9 ms at 2^9
+rows vs ~6 ms extrapolated for raw MulModN-256 at the same size.
+A faithful wired multiswap in their framework plausibly lands well
+above 1.13 s; building it is their burden, not ours. Summary line for
+the paper: our 1.278 s is a fully-wired faithful-cost measurement;
+their 1.13 s is an unwired lower bound; the true wired-vs-wired gap is
+at most 1.13x and likely at or below parity.
+
+## Measured: chained cost-model UAIR in their framework (2026-08-07)
+
+Built `ModMulChainedUair` in the Zinc+ clone (test-uair/src/
+modmul_chained.rs, bench "ModMulChained2048"): the unwired probe plus
+every structural element the wired multiswap layout needs, at faithful
+cost drivers with synthetic values — per-row witnessed modulus column
+(mixed RSA-2048 / 2^255−19 / Mersenne-127 schedule), shift-1 chaining
+transition a[r+1]=c[r], bit column with binary constraint, and a
+reconstruction stand-in column with a shift-1 transition. 7 Int<33>
+columns vs the probe's 4; degenerate satisfying witness (cost is
+structure-driven — measured value-insensitivity).
+
+Same-session single-thread at 2^13: probe 1.255 s -> **chained
+1.983 s (+58%)**. Scaling by the session's warm factor (their official
+cold probe = 1.13 s) gives **~1.79 s cold** for the wired-layout cost
+model. Refinements could shave it (bit as a binary_poly column,
+modulus as public columns) — call it **~1.6-1.8 s** fair-bracket.
+
+**Fair wired-vs-wired verdict: ours 1.278 s vs theirs ~1.8 s — we are
+~1.4x FASTER on prove**, plus ~13x verify and ~7x proof size. The
+"they win prove" framing inverts once both sides pay for the same
+statement structure: their unwired probe hid a +58% structural cost
+their architecture cannot avoid (extra wide committed columns), while
+our LC-based wiring is free.
+
+Fidelity asymmetry, stated precisely: OUR circuit is a real, fully
+wired circuit evaluating a synthetic instance — every row performs
+genuine arithmetic on genuine dataflow — with two cost-faithful gadget
+stand-ins (Poseidon internals with identity linear layers; Pocklington
+side-condition comparisons). THEIRS is a structural cost model with
+degenerate values (5·1 = 5 rows; no real dataflow), legitimate for
+cost measurement (structure-driven, verified via their padding/value
+insensitivity) but a categorically weaker artifact. Our remaining gap
+to fully-faithful is small and shape-neutral: real Poseidon constants
+(LC coefficients only — cost-identical by construction), the
+Pocklington comparison rows (a few hundred, absorbed by padding), and
+witness generation from an actual accumulator run.
+
+## Same-session final pair (2026-08-07, warm machine, back-to-back)
+
+| | ours (wired, real circuit) | Zinc+ probe (unwired) | Zinc+ chained (fair) |
+|---|---|---|---|
+| prove (full pipeline) | **1.315 s** | 1.276 s | **2.060 s** |
+| verify | **39.5 ms** | 523 ms | 514 ms |
+| proof, raw | **672 KB** | 4.76 MB | 4.84 MB |
+| proof, zstd | ~raw (field data) | 1.24 MB | n/a¹ |
+
+¹ The chained cost-model's zstd figure (79 KB) is an artifact: the
+degenerate witness values make the opened IPRS columns trivially
+compressible. Quote raw for the chained model; the probe's 1.24 MB is
+the realistic compressed figure for real data.
+
+Fair (wired-vs-wired) ratios, same thermal state: **prove ours 1.57×
+faster; verify ours 13×; proof ours ~7× smaller (raw), ~2× (their
+zstd vs our raw)**. Against their unwired lower-bound probe we are at
+prove parity (1.315 vs 1.276) while keeping the verify and proof wins.
+## γ-RLC GKR round-poly batching lands (2026-08-13)
+
+The "real fix" flagged in the proof-size section is implemented: the
+lockstep multi-tree GKR walk (`gkr_prove_multi`) now sends ONE
+γ-power RLC of the active trees' cubic round polynomials per round
+(γ squeezed per layer, after the previous layer's finals are absorbed
+— standard batched-sumcheck soundness, ≤ (#trees−1)/|F| extra loss
+per layer). Per-tree layer finals remain (they seed the next layer's
+claims and are pinned by the leaf PCS opens), grouped per layer in a
+shared `GkrMultiProof`. Round-poly bytes drop from Σ_t Θ(d_t²) to
+Θ(max_d²).
+
+Measured, MultiSwap 2^13 Hyrax path, same-machine A/B (criterion,
+back-to-back):
+
+| | before | after | change |
+|---|---|---|---|
+| proof (raw bincode) | 672.4 KB | **174.7 KB** | **−74%** |
+| — range_check component | 586.4 KB | 88.7 KB | −85% |
+| prove (criterion median) | 491.0 ms | 472.1 ms | −3.5% |
+| verify | 22.9 ms | 20.8 ms | −7.7% |
+
+(Absolute times are MULTITHREADED — this A/B ran without
+`RAYON_NUM_THREADS=1`, unlike the single-threaded 2026-08-07 pair
+(1.315 s) quoted in the paper table; the ~2.7× gap between the two is
+thread count, not code. The A/B is internally consistent — both sides
+multithreaded, back-to-back — and proof size is thread- and
+machine-independent.) The prove/verify wins are real but small:
+thousands of per-tree transcript absorbs and per-tree cubic
+evaluations collapse to one per round.
+
+Updated scoreboard vs Zinc+ (proof sizes deterministic, timing pairs
+unchanged from 2026-08-07): **ours 174.7 KB raw vs their chained
+4.84 MB raw → ~28× smaller** (vs probe 4.76 MB raw: ~27×; vs the
+probe's realistic 1.24 MB zstd: ~7×). Remaining proof-size structure:
+combined_open 74.5 KB (√n Hyrax IPA-free opening) + range-check
+finals ~85 KB + per_poly 10.3 KB; next lever if ever needed is
+RC_BLOCK_LOG=18 (fewer trees → fewer finals) or trimming the
+combined-open transcript.
+
+msshape sweep (γ-RLC code, `PSIZE=1`, full-impl proof incl. sumcheck
+side): imod 135.2 / 149.1 / 137.8 KB at c2^10 / 2^12 / 2^14 (range
+check now 24-40% of the proof, combined_open dominant) vs plain
+Spartan (Hyrax) 67.8 / 68.3 / 69.0 KB — **native proof-size overhead
+~2.0-2.2×**, down from ~5-6× pre-batching.

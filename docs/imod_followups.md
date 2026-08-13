@@ -1121,3 +1121,96 @@ both bitmap forgeries rejected).
 Next in this campaign: GKR round/build fusion (~100-150 ms), then
 per-segment value bounds (bit rows pay 1 chunk slot instead of 128;
 shrinks commit + range check + opens ~2.5-3x on multiswap).
+
+## GKR bind/eval round fusion: tested, neutral, reverted (2026-08-05)
+
+Implemented the fused round kernel (bind by `ri` + next round's
+`[h(0), h(inf)]` sums in one table traversal, transcript-identical;
+round 0 standalone, later rounds fed by the previous bind). All tests
+passed. Same-thermal-state A/B at multiswap 2^13 ST: unfused 1.247 s,
+fused 1.244 s -- **neutral**, so reverted.
+
+Why the followups estimate (~100-150 ms) no longer holds: the
+zero-block split caps every witness tree at 2^RC_BLOCK_LOG = 2^16
+leaves, so per-round layer tables are cache-resident and the second
+traversal is nearly free. The estimate predated blocking. Do not
+retry unless RC_BLOCK_LOG grows or trees leave cache again; the
+remaining range-check lever is per-segment value bounds (layout), not
+kernel micro-optimization.
+
+## Large matrix constants: accounting obligations (2026-08-07)
+
+The circuits carry matrix coefficients far above T = 2^64 (the
+conditional-multiply rows' `g−1` at ~2048 bits; reconstruction rows'
+powers of two up to 2^351). This is sound TODAY because coefficients
+are public shape data — never committed, never limb-split (no Spark:
+the verifier evaluates A/B/C MLEs directly, ~1-2 ms at 2^13) — and
+evaluated LC values stay small (big constants only multiply bits).
+Two standing obligations:
+
+1. **Paper soundness statement**: the main-relation fingerprint bound
+   B_total must include coefficient norms. Adversarial row magnitude
+   reaches ~2^6100 (2048-bit coefficient x range-checked 2^2048
+   witness products) -> up to ~48 of ~2^121 candidate 128-bit primes
+   divide a cheating row: soundness error ~2^-114 (vs ~2^-118 for 0/1
+   coefficients). Harmless at a 128-bit sampled p; would bite below
+   ~90 bits.
+
+2. **If Spark is ever added** (sublinear verify at large nnz): the
+   committed `val` table would hold 2048-bit coefficients needing
+   limb-split + range check at log_t_f = 2048. Mitigations available:
+   reconstruction coefficients are powers of two (closed-form MLE, no
+   commitment needed); `g−1` is 4 distinct structured values ->
+   hybrid Spark-plus-special-casing avoids committing wide values.
+
+## Open-source readiness checklist (2026-08-13)
+
+State of the repo audited for a public release. Code hygiene is
+already good (fmt/clippy/typos gates green, no personal or tooling
+traces in tracked files); the work is identity/metadata, the
+uncommitted pile, and a history decision. Rough total: 2-4 focused
+days, mostly decisions rather than code.
+
+**Must do before flipping public:**
+
+1. **Cargo.toml identity**: still claims `name = "spartan2"`,
+   `version = 0.8.0`, `authors = [Srinath Setty]`,
+   `repository = Microsoft/Spartan2`. Rename the crate, set real
+   authors/repository, keep the MIT LICENSE (Microsoft copyright
+   notice must stay; add our own line above it).
+2. **Commit or drop the working tree** (~20 modified files + the
+   `p3_adapter.rs` spike + `examples/commit_overhead.rs`). The p3
+   spike is self-labeled "delete or promote after Phase A" and adds
+   two public deps (`p3-field`, `p3-goldilocks`) — decide before it
+   lands; check it doesn't break the CI wasm32 build job.
+3. **Commit-history + repo-home decision**: decide whether the
+   public repo keeps full history or starts from a squashed/grafted
+   release commit, and which account/org hosts it; delete stale
+   remote branches first.
+4. **SUPPORT.md** is Microsoft boilerplate — rewrite or delete;
+   likewise sweep for other upstream community files.
+5. **README reproduce-the-paper section**: map each paper
+   table/figure to its exact bench command + env
+   (`RAYON_NUM_THREADS=1`, `target-cpu=native`), so the quoted
+   numbers reproduce from a clean clone.
+
+**Nice to have:**
+
+- Retire the stale "Phase 2 step N" TODO markers and file-top
+  `#![allow(dead_code)]` in `sumcheck_modp.rs`, `dyn_prime.rs`,
+  `polys_modp/mod.rs`, `integer_modpcs.rs`, `ecdsa_msm.rs` (1-2 h).
+- Decide the fate of docs/: ~3.2k lines of candid working notes
+  (perf logs, retractions, plans). They are clean and arguably good
+  research-log transparency, but keeping them should be a choice,
+  not an accident.
+- `tests/param_sweep.rs` / `tests/wide_value_probe.rs` read as
+  probes, not tests — rename, gate behind `#[ignore]`, or move.
+- State prominently that this is a research prototype (162
+  unwrap/panic sites in the three core protocol files; no
+  constant-time discipline claims).
+
+**Timing**: do NOT gate the release on more PCS backends or more
+benchmarks — those can land publicly afterwards. The only real
+gates are the identity/metadata fixes and settling the working
+tree; everything else is incremental polish an early release does
+not preclude.
