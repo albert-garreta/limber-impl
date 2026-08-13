@@ -659,6 +659,26 @@ pub struct IntEvalBatchArgument<B: CommitBackend> {
   pub(crate) combined_open: CombinedBatchOpen<B>,
 }
 
+impl<B: CommitBackend> IntEvalBatchArgument<B>
+where
+  IntEvalPerPolyArgument<B>: Serialize,
+  SharedRangeCheck<B>: Serialize,
+  CombinedBatchOpen<B>: Serialize,
+{
+  /// Serialized size of each top-level component, for proof-size
+  /// accounting: `(per_poly, range_check, combined_open)` in bytes.
+  pub fn component_sizes(&self) -> (usize, usize, usize) {
+    let sz_pp: u64 = self
+      .per_poly
+      .iter()
+      .map(|p| bincode::serialized_size(p).unwrap_or(0))
+      .sum();
+    let sz_rc = bincode::serialized_size(&self.range_check).unwrap_or(0);
+    let sz_co = bincode::serialized_size(&self.combined_open).unwrap_or(0);
+    (sz_pp as usize, sz_rc as usize, sz_co as usize)
+  }
+}
+
 /// ONE combined multi-point opening for ALL commitments of a Mod-PCS
 /// open. Per commitment, its claims are RLC-combined (`Σ_i λ^i·y_i =
 /// Σ_x f(x)·W(x)`); the per-commitment degree-2 sumchecks then run
@@ -3646,13 +3666,21 @@ fn prove_combined_batch_open<B: CommitBackend>(
       }
       let len = fs[j].Z.len();
       let h = len / 2;
+      // Interior sparsity: skip zero-f terms (chunk-layout polynomials
+      // have many strided zero slots — values narrower than their limb
+      // budget, bit values, dropped regions).
       let (e0, e2) = if h >= 1 << 12 {
         (0..h)
           .into_par_iter()
           .map(|i| {
             let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
+            let f0z = f0.is_zero_vartime();
+            if f0z && f1.is_zero_vartime() {
+              return (t256::Scalar::ZERO, t256::Scalar::ZERO);
+            }
             let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
-            (f0 * w0, (f1 + f1 - f0) * (w1 + w1 - w0))
+            let t0 = if f0z { t256::Scalar::ZERO } else { f0 * w0 };
+            (t0, (f1 + f1 - f0) * (w1 + w1 - w0))
           })
           .reduce(
             || (t256::Scalar::ZERO, t256::Scalar::ZERO),
@@ -3663,8 +3691,14 @@ fn prove_combined_batch_open<B: CommitBackend>(
         let mut e2 = t256::Scalar::ZERO;
         for i in 0..h {
           let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
+          let f0z = f0.is_zero_vartime();
+          if f0z && f1.is_zero_vartime() {
+            continue;
+          }
           let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
-          e0 += f0 * w0;
+          if !f0z {
+            e0 += f0 * w0;
+          }
           e2 += (f1 + f1 - f0) * (w1 + w1 - w0);
         }
         (e0, e2)

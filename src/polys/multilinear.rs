@@ -118,10 +118,19 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
       let (left, right) = self.Z.split_at_mut(n);
       if rayon::current_num_threads() <= 1 {
         for i in 0..hi {
+          // Interior sparsity: chunk-layout polynomials have many
+          // strided zero slots (values narrower than their limb
+          // budget); a zero pair binds to zero with no multiply.
+          if left[i].is_zero_vartime() && right[i].is_zero_vartime() {
+            continue;
+          }
           left[i] += *r * (right[i] - left[i]);
         }
         let one_minus_r = Scalar::ONE - *r;
         for a in left[hi..lo].iter_mut() {
+          if a.is_zero_vartime() {
+            continue;
+          }
           *a *= one_minus_r;
         }
       } else {
@@ -140,9 +149,16 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
       let (left, right) = self.Z.split_at_mut(n);
       if rayon::current_num_threads() <= 1 {
         for i in 0..lo {
+          if left[i].is_zero_vartime() && right[i].is_zero_vartime() {
+            continue;
+          }
           left[i] += *r * (right[i] - left[i]);
         }
         for i in lo..hi {
+          if right[i].is_zero_vartime() {
+            left[i] = Scalar::ZERO;
+            continue;
+          }
           left[i] = *r * right[i];
         }
       } else {

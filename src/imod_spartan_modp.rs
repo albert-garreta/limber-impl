@@ -123,6 +123,13 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
 }
 
 impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
+  /// Per-component serialized sizes of the batch evaluation argument:
+  /// `(per_poly, range_check, combined_open)` bytes. Proof-size
+  /// accounting; see `eval_arg_size` for the total.
+  pub fn eval_arg_component_sizes(&self) -> (usize, usize, usize) {
+    self.eval_arg.component_sizes()
+  }
+
   /// Setup with explicit IntEval params, so callers can size the
   /// committed-value norm bound (`log_t_f`) and limb bound (`log_t`) for
   /// wide operands — e.g. the ~2048-bit `mod N` values in the MultiSwap
