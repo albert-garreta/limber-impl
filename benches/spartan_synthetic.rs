@@ -108,6 +108,24 @@ impl<E: Engine> SpartanCircuit<E> for SyntheticMulCircuit<E::Scalar> {
 }
 
 fn spartan_synthetic_benches(c: &mut Criterion) {
+  // PSIZE=1: serialized proof size per msshape config (plain-Spartan
+  // baseline for the paper's proof-size comparison).
+  if std::env::var_os("PSIZE").is_some() {
+    for &n in &[682usize, 2730, 10922] {
+      let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new_wide(n);
+      let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
+      let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), false).unwrap();
+      let (proof, _) = SpartanSNARK::<E>::prove(&pk, circuit, prep, false).unwrap();
+      proof.verify(&vk).unwrap();
+      println!(
+        "spartan msshape c2^{} proof size: {} bytes",
+        (n.next_power_of_two() as u64).ilog2(),
+        bincode::serialized_size(&proof).map_or(0, |v| v as usize)
+      );
+    }
+    return;
+  }
+
   // Match imod_spartan(_modp) bench: num_cons targets 2^k for k ∈ {6, 8,
   // 10, 12, 14}. Plain Spartan pads internally, so the realised shape
   // may be slightly larger than N.
@@ -214,7 +232,7 @@ fn spartan_synthetic_benches(c: &mut Criterion) {
   // "integer-machinery overhead vs the same shape natively". `wide`
   // keeps witness values full-width so the witness commit can't take
   // the small-scalar MSM fast path. Tags mirror the imod side.
-  for &n in &[682usize, 2730, 10922] {
+  for &n in &[682usize, 2730, 10922, 43690, 174762] {
     let tag = format!("msshape_c{}", n.next_power_of_two().ilog2());
     // `is_small = false`: full-width witness values do NOT fit machine
     // words; claiming otherwise produces an invalid commitment via the

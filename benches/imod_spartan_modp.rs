@@ -153,7 +153,7 @@ fn make_msshape_shape_and_witness(
 /// `(2^(v−1) cons, 2^v vars)` with the 3-fresh-columns layout, mirroring
 /// MultiSwap k=0's padding (2715 real rows → 2^12/2^13). The middle
 /// entry is the MultiSwap k=0 shape itself.
-const MSSHAPE_GATES: &[usize] = &[682, 2730, 10922];
+const MSSHAPE_GATES: &[usize] = &[682, 2730, 10922, 43690, 174762];
 
 /// Setup for the MultiSwap-shaped config: `log_t_f = 256` (limb-split
 /// into 8 limbs of 32 bits), honoring the `IMOD_K` override.
@@ -275,6 +275,47 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
     return;
   }
 
+  // PSIZE=1: full-impl proof size on the msshape configs (the §7.2
+  // comparison vs plain Spartan). The proof isn't fully `Serialize`
+  // (dynamic-prime sumcheck side), so report `eval_arg_size` — the
+  // dominant Mod-PCS batch argument (per-poly commits, LogUp-GKR range
+  // check, combined open) — plus the analytical sumcheck remainder.
+  // Deterministic: one prove each, then return (skip criterion).
+  // Densified to c10..c14 (adds c11, c13) to expand the size curve.
+  if std::env::var_os("PSIZE").is_some() {
+    let k = std::env::var("IMOD_K")
+      .ok()
+      .and_then(|s| s.parse::<usize>().ok())
+      .unwrap_or(DEFAULT_K);
+    println!(
+      "\n§7.2 full-impl proof size (log_t_f={MSSHAPE_LOG_T_F}, log_t={MSSHAPE_LOG_T}, k={k}):"
+    );
+    for &gates in &[682usize, 1365, 2730, 5461, 10922] {
+      let (shape, w, q) = make_msshape_shape_and_witness(gates);
+      let lc = (shape.num_cons() as u64).ilog2();
+      let lv = (shape.num_vars() as u64).ilog2();
+      let (pk, vk) = setup_msshape(shape.clone());
+      let (witness, instance) =
+        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+      let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+      proof.verify(&vk, &instance).unwrap();
+      let arg = proof.eval_arg_size();
+      let (pp, rc, co) = proof.eval_arg_component_sizes();
+      // Dynamic-prime sumcheck side: `lc` cubic outer rounds (3 coeffs)
+      // + `lv` quadratic inner rounds (2 coeffs) + 6 claimed evals, at
+      // 16 B per 2-limb (128-bit) scalar.
+      let dyn_bytes = (lc as usize * 3 + lv as usize * 2 + 6) * 16;
+      let total = arg + dyn_bytes;
+      println!(
+        "  c2^{lc} v2^{lv}: proof≈{:>6.1} KB  [per_poly {pp}, range_check {rc} ({:.0}%), \
+         combined_open {co}, sumcheck {dyn_bytes}]",
+        total as f64 / 1e3,
+        100.0 * rc as f64 / total as f64,
+      );
+    }
+    return;
+  }
+
   // (num_cons, num_vars) — num_vars is the next power-of-two ≥ 4·num_cons.
   // The Mod-PCS open point has length log_2(num_vars); for num_vars > 2^k
   // (default k = 7) this exercises IntEval's partial-eval iteration path.
@@ -292,21 +333,40 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
   // setup/prove/verify per config, printing the section spans
   // (imod_pcs_chain_openings, imod_pcs_rc_ab, …) so you can see where
   // prove/verify time goes without criterion's iteration noise.
+  // PSIZE=1: serialized eval-argument size per msshape config (the
+  // dominant proof component; the dynamic-prime sumcheck side adds
+  // ~1 KB). Mirrors the multiswap bench's PSIZE block.
+  if std::env::var_os("PSIZE").is_some() {
+    for &gates in MSSHAPE_GATES {
+      let (shape, w, q) = make_msshape_shape_and_witness(gates);
+      let (pk, vk) = setup_msshape(shape.clone());
+      let (witness, instance) =
+        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+      let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+      proof.verify(&vk, &instance).unwrap();
+      println!(
+        "msshape c2^{} proof size: eval_arg {} bytes",
+        (shape.num_cons() as u64).ilog2(),
+        proof.eval_arg_size()
+      );
+    }
+    return;
+  }
+
   if std::env::var_os("RUST_LOG").is_some() {
     let _ = tracing_subscriber::fmt()
       .with_target(false)
       .with_env_filter(EnvFilter::from_default_env())
       .try_init();
-    for &(num_cons, num_vars) in configs {
-      let (shape, w, q) = make_shape_and_witness(num_cons, num_vars);
-      let (pk, vk) = setup_for(shape.clone());
-      let (witness, instance) =
-        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
-      let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
-      proof.verify(&vk, &instance).unwrap();
-    }
-    {
-      let (shape, w, q) = make_msshape_shape_and_witness(2730);
+    // Span-timing sweep over the large msshape gates (c14/c16/c18) to
+    // localize the superlinear prover component.
+    for &gates in &[10922usize, 43690, 174762] {
+      let (shape, w, q) = make_msshape_shape_and_witness(gates);
+      println!(
+        "\n===== msshape c2^{} v2^{} (gates={gates}) =====",
+        (shape.num_cons() as u64).ilog2(),
+        (shape.num_vars() as u64).ilog2()
+      );
       let (pk, vk) = setup_msshape(shape.clone());
       let (witness, instance) =
         IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();

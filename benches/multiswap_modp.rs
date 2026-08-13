@@ -26,7 +26,13 @@
 //! The bases are fixed constants baked into matrix coefficients (avoiding
 //! a degree-3 conditional-multiply decomposition). The hashes (`H`, `Hp`,
 //! `H∆`) and RSA group structure are *modeled by operation count*, not
-//! faithful crypto circuits, and are flagged as such.
+//! faithful crypto circuits, and are flagged as such. As of the
+//! faithful-cost extension, `Hp` is charged at faithful cost and
+//! structure: 600 Pocklington-exponentiation rows + 3 chained
+//! Poseidon-cost permutations (243 mul rows each, synthetic operands,
+//! real chain shape and modulus) + 640 decomposition bit rows + 10
+//! reconstruction rows — ~2.0k rows total vs the paper's 217,703 F_p
+//! constraints for the same component.
 //!
 //! Run with:
 //!   RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
@@ -58,8 +64,30 @@ const LOG_T: usize = 64;
 /// Base-hash model: imod rows charged per `H` invocation.
 const H_ROWS: usize = 8;
 
-/// Hash-to-prime (`Hp`) / Pocklington model rows.
-const HP_ROWS: usize = 600;
+/// Hash-to-prime (`Hp`) Pocklington certificate: number of wired
+/// square-and-multiply chains and exponent bits per chain. 4 chains of
+/// 50 bits — 4·(3·50+1) = 604 rows — matching the ~600-row operation
+/// count of the earlier model, but as REAL wired chains (bit
+/// decomposition, reconstruction, chained accumulators) over the
+/// Mersenne-prime moduli 2^61−1, 2^89−1, 2^107−1, 2^127−1.
+const HP_EXPS: usize = 4;
+const HP_EXP_BITS: usize = 50;
+
+/// Faithful-cost Poseidon permutation: 81 x^5 S-boxes × 3 mul rows
+/// (x², x⁴, x⁵); the MDS and round-constant layers are linear and fold
+/// into the LCs for free. Operands are synthetic but the operation
+/// count, chaining structure, and modulus are faithful.
+const POSEIDON_ROWS_PER_PERM: usize = 243;
+/// Poseidon permutations charged inside one `Hp` invocation
+/// (candidate generation for the Pocklington chain).
+const HP_POSEIDON_PERMS: usize = 3;
+/// Bit rows for the Pocklington side-condition decompositions: the
+/// Poseidon output (255 bits) and the four chain outputs (61 + 89 +
+/// 107 + 127 bits) are fully bit-decomposed — 639 exact mod-0 binary
+/// rows WIRED to their values by the reconstruction rows below.
+const HP_DECOMP_BITS: usize = 639;
+/// One exact (mod-0) reconstruction row per decomposed value.
+const HP_DECOMP_RECON: usize = 5;
 
 /// Number of group exponentiations per MultiSwap proof.
 const N_GROUP_EXPS: usize = 4;
@@ -71,11 +99,17 @@ const ELL_BITS: usize = 352;
 
 #[derive(Clone, Copy)]
 struct Dims {
+  /// Faithful-cost hash extension: chained Poseidon-cost rows,
+  /// decomposition bit rows, and reconstruction rows for `Hp`.
+  poseidon_rows: usize,
+  decomp_bits: usize,
+  decomp_recon: usize,
   k: usize,
   ell_bits: usize,
   n_group_exps: usize,
   n_group_muls: usize,
-  hp_rows: usize,
+  hp_exps: usize,
+  hp_exp_bits: usize,
   h_rows: usize,
 }
 
@@ -83,12 +117,21 @@ impl Dims {
   fn multiswap(k: usize) -> Self {
     Self {
       k,
+      poseidon_rows: HP_POSEIDON_PERMS * POSEIDON_ROWS_PER_PERM,
+      decomp_bits: HP_DECOMP_BITS,
+      decomp_recon: HP_DECOMP_RECON,
       ell_bits: ELL_BITS,
       n_group_exps: N_GROUP_EXPS,
       n_group_muls: N_GROUP_MULS,
-      hp_rows: HP_ROWS,
+      hp_exps: HP_EXPS,
+      hp_exp_bits: HP_EXP_BITS,
       h_rows: H_ROWS,
     }
+  }
+
+  /// Rows of one wired Hp certificate chain.
+  fn rows_per_hp_exp(&self) -> usize {
+    3 * self.hp_exp_bits + 1
   }
 
   fn rows_per_exp(&self) -> usize {
@@ -99,8 +142,38 @@ impl Dims {
     3 * self.ell_bits + 1
   }
 
+  /// Unwired generic rows remaining: only the per-swap `H∆` models
+  /// (k > 0). Everything at k = 0 is wired.
+  fn generic_rows(&self) -> usize {
+    2 * self.k + 2 * self.k * self.h_rows
+  }
+
+  /// Wired hash/Hp rows: group mults (operands = exp outputs, 1 fresh
+  /// result column each), 4 Hp certificate chains, the Poseidon seed
+  /// reduction row, the chained Poseidon rows, the decomposition bit
+  /// rows, their reconstruction rows (0 fresh columns), and the final
+  /// mod-ℓ reduction row wired to the Poseidon output.
+  fn wired_ext_rows(&self) -> usize {
+    self.n_group_muls
+      + self.hp_exps * self.rows_per_hp_exp()
+      + 1
+      + self.poseidon_rows
+      + self.decomp_bits
+      + self.decomp_recon
+      + 1
+  }
+
+  fn wired_ext_cols(&self) -> usize {
+    self.n_group_muls
+      + self.hp_exps * self.rows_per_hp_exp()
+      + 1
+      + self.poseidon_rows
+      + self.decomp_bits
+      + 1
+  }
+
   fn non_exp_rows(&self) -> usize {
-    self.n_group_muls + self.hp_rows + (2 * self.k + 1) + 2 * self.k * self.h_rows
+    self.generic_rows() + self.wired_ext_rows()
   }
 
   fn num_real_rows(&self) -> usize {
@@ -108,7 +181,7 @@ impl Dims {
   }
 
   fn num_real_cols(&self) -> usize {
-    self.n_group_exps * self.cols_per_exp() + 3 * self.non_exp_rows()
+    self.n_group_exps * self.cols_per_exp() + 3 * self.generic_rows() + self.wired_ext_cols()
   }
 }
 
@@ -131,6 +204,29 @@ fn modulus_ell() -> BigUint {
 fn modulus_p_hash() -> BigUint {
   let hex = "73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001";
   BigUint::parse_bytes(hex.as_bytes(), 16).expect("valid BLS12-381 scalar hex")
+}
+
+/// Moduli for the wired Hp certificate chains: Mersenne primes
+/// 2^61−1, 2^89−1, 2^107−1, 2^127−1 (clean fixed constants standing in
+/// for a Pocklington prime chain of growing widths).
+fn hp_moduli() -> [BigUint; 4] {
+  [
+    (BigUint::from(1u32) << 61) - 1u32,
+    (BigUint::from(1u32) << 89) - 1u32,
+    (BigUint::from(1u32) << 107) - 1u32,
+    (BigUint::from(1u32) << 127) - 1u32,
+  ]
+}
+
+/// Synthetic (base, exponent) pairs for the Hp chains — deterministic,
+/// bounded by each chain modulus / the chain bit width.
+fn hp_chain_inputs(bits: usize) -> [(BigUint, BigUint); 4] {
+  let ms = hp_moduli();
+  core::array::from_fn(|i| {
+    let base = &ms[i] - BigUint::from(1000u32 + 37 * i as u32);
+    let exponent = (BigUint::from(0x9e37_79b9_7f4a_7c15u64) >> (64 - bits)) ^ BigUint::from(i);
+    (base, exponent)
+  })
 }
 
 fn exp_bases() -> [BigUint; 4] {
@@ -278,6 +374,7 @@ fn compute_witness_advice(
   let one = BigUint::from(1u32);
   let mut out = Vec::new();
 
+  let mut exp_outs = Vec::with_capacity(d.n_group_exps);
   for i in 0..d.n_group_exps {
     let g_minus_1 = &bases[i] - &one;
     let mut acc = one.clone();
@@ -288,15 +385,49 @@ fn compute_witness_advice(
       let b_val = BigUint::from(bit) * &g_minus_1 + &one;
       acc = (&sq * &b_val).div_rem(n).1;
     }
+    exp_outs.push(acc.clone());
     out.push(acc);
   }
 
-  let groups: &[(&BigUint, usize)] = &[
-    (n, d.n_group_muls),
-    (ell, d.hp_rows),
-    (ell, 2 * d.k + 1),
-    (p_hash, 2 * d.k * d.h_rows),
-  ];
+  // Wired group mults from the exponentiation outputs.
+  for i in 0..d.n_group_muls {
+    out.push((&exp_outs[2 * i] * &exp_outs[2 * i + 1]).div_rem(n).1);
+  }
+
+  // Wired Hp certificate chains (square-and-multiply mod the Mersenne
+  // moduli).
+  let hp_ms = hp_moduli();
+  let hp_inputs = hp_chain_inputs(d.hp_exp_bits);
+  for i in 0..d.hp_exps {
+    let g_minus_1 = &hp_inputs[i].0 - &one;
+    let mut acc = one.clone();
+    for j in 0..d.hp_exp_bits {
+      let bit_pos = d.hp_exp_bits - 1 - j;
+      let bit = u8::from(hp_inputs[i].1.bit(bit_pos as u64));
+      let sq = (&acc * &acc).div_rem(&hp_ms[i]).1;
+      let b_val = BigUint::from(bit) * &g_minus_1 + &one;
+      acc = (&sq * &b_val).div_rem(&hp_ms[i]).1;
+    }
+    out.push(acc);
+  }
+
+  // Poseidon seeded from the first exponentiation output, then the
+  // chained S-box values; final mod-ℓ reduction of the hash output.
+  // (Bit rows need no divmods.)
+  let mut x = exp_outs[0].div_rem(p_hash).1;
+  for _ in 0..(d.poseidon_rows / 3) {
+    let x2 = (&x * &x).div_rem(p_hash).1;
+    let x4 = (&x2 * &x2).div_rem(p_hash).1;
+    let x5 = (&x4 * &x).div_rem(p_hash).1;
+    out.push(x2);
+    out.push(x4);
+    out.push(x5.clone());
+    x = x5;
+  }
+  out.push(x.div_rem(ell).1);
+
+  // Per-swap `H∆` models (k > 0 only).
+  let groups: &[(&BigUint, usize)] = &[(ell, 2 * d.k), (p_hash, 2 * d.k * d.h_rows)];
   let mut r = 0usize;
   for &(m, count) in groups {
     for _ in 0..count {
@@ -357,12 +488,158 @@ fn multiswap_shape_and_witness_for<MM: spartan2::traits::mod_engine::ModEngine>(
   let mut row = d.n_group_exps * d.rows_per_exp();
   let mut col = d.n_group_exps * d.cols_per_exp();
 
-  let groups: Vec<(&BigUint, usize)> = vec![
-    (&n, d.n_group_muls),
-    (&ell, d.hp_rows),
-    (&ell, 2 * d.k + 1),
-    (&p_hash, 2 * d.k * d.h_rows),
-  ];
+  // Wired group mults: operands are the exponentiation outputs
+  // (Q^ℓ-style products), one fresh result column each.
+  let exp_out = |i: usize| i * d.cols_per_exp() + 2 * d.ell_bits;
+  for i in 0..d.n_group_muls {
+    let a_col = exp_out(2 * i);
+    let b_col = exp_out(2 * i + 1);
+    let (qi, ci) = (&w[a_col] * &w[b_col]).div_rem(&n);
+    w[col] = ci;
+    q[row] = qi;
+    a_entries.push((row, a_col, one.clone()));
+    b_entries.push((row, b_col, one.clone()));
+    c_entries.push((row, col, one.clone()));
+    mods.push(n.clone());
+    row += 1;
+    col += 1;
+  }
+
+  // Wired Hp certificate chains: real square-and-multiply over the
+  // Mersenne moduli, with bit decomposition and reconstruction —
+  // structurally identical to the main Wesolowski chains.
+  let hp_ms = hp_moduli();
+  let hp_inputs = hp_chain_inputs(d.hp_exp_bits);
+  let mut hp_out_cols = [0usize; 4];
+  for i in 0..d.hp_exps {
+    build_exp_circuit(
+      &hp_inputs[i].0,
+      &hp_inputs[i].1,
+      &hp_ms[i],
+      d.hp_exp_bits,
+      row,
+      col,
+      const_col,
+      &mut a_entries,
+      &mut b_entries,
+      &mut c_entries,
+      &mut mods,
+      &mut w,
+      &mut q,
+    );
+    hp_out_cols[i] = col + 2 * d.hp_exp_bits;
+    row += d.rows_per_hp_exp();
+    col += d.rows_per_hp_exp();
+  }
+
+  // Poseidon seed: reduce the first exponentiation output mod p_hash —
+  // the hash input is wired to real circuit data.
+  let seed_col = col;
+  {
+    let (qi, ci) = w[exp_out(0)].div_rem(&p_hash);
+    w[seed_col] = ci;
+    q[row] = qi;
+    a_entries.push((row, exp_out(0), one.clone()));
+    b_entries.push((row, const_col, one.clone()));
+    c_entries.push((row, seed_col, one.clone()));
+    mods.push(p_hash.clone());
+    row += 1;
+    col += 1;
+  }
+
+  // Chained Poseidon-cost rows mod p_hash: per S-box x² = x·x,
+  // x⁴ = x²·x², x⁵ = x⁴·x — one fresh column per row, the x⁵ output
+  // feeding the next S-box (the linear MDS/round-constant layers fold
+  // into the LCs of the following rows for free, exactly as a
+  // constants-faithful build would).
+  let zero = BigUint::from(0u32);
+  let mut x_col = seed_col;
+  for _ in 0..(d.poseidon_rows / 3) {
+    let x = w[x_col].clone();
+    let (q2, x2) = (&x * &x).div_rem(&p_hash);
+    let (q4, x4) = (&x2 * &x2).div_rem(&p_hash);
+    let (q5, x5) = (&x4 * &x).div_rem(&p_hash);
+    // x² = x·x
+    w[col] = x2;
+    a_entries.push((row, x_col, one.clone()));
+    b_entries.push((row, x_col, one.clone()));
+    c_entries.push((row, col, one.clone()));
+    mods.push(p_hash.clone());
+    q[row] = q2;
+    row += 1;
+    // x⁴ = x²·x²
+    w[col + 1] = x4;
+    a_entries.push((row, col, one.clone()));
+    b_entries.push((row, col, one.clone()));
+    c_entries.push((row, col + 1, one.clone()));
+    mods.push(p_hash.clone());
+    q[row] = q4;
+    row += 1;
+    // x⁵ = x⁴·x
+    w[col + 2] = x5;
+    a_entries.push((row, col + 1, one.clone()));
+    b_entries.push((row, x_col, one.clone()));
+    c_entries.push((row, col + 2, one.clone()));
+    mods.push(p_hash.clone());
+    q[row] = q5;
+    row += 1;
+    x_col = col + 2;
+    col += 3;
+  }
+  let pos_out_col = x_col;
+
+  // Decomposition bit rows WIRED to real values: fully decompose the
+  // Poseidon output and the four Hp chain outputs; each value gets an
+  // exact (mod-0) reconstruction row referencing its bit columns —
+  // zero fresh columns for reconstruction.
+  let decomp_targets: Vec<(usize, usize)> = std::iter::once((pos_out_col, 255))
+    .chain((0..4).map(|i| (hp_out_cols[i], [61usize, 89, 107, 127][i])))
+    .collect();
+  debug_assert_eq!(
+    decomp_targets.iter().map(|&(_, b)| b).sum::<usize>(),
+    d.decomp_bits
+  );
+  for &(val_col, nbits) in &decomp_targets {
+    let val = w[val_col].clone();
+    let bit_base = col;
+    for j in 0..nbits {
+      let bit = u8::from(val.bit((nbits - 1 - j) as u64));
+      w[col] = BigUint::from(bit);
+      a_entries.push((row, col, one.clone()));
+      b_entries.push((row, col, one.clone()));
+      c_entries.push((row, col, one.clone()));
+      mods.push(zero.clone());
+      q[row] = zero.clone();
+      row += 1;
+      col += 1;
+    }
+    for j in 0..nbits {
+      let power = BigUint::from(1u32) << (nbits - 1 - j);
+      a_entries.push((row, bit_base + j, power));
+    }
+    b_entries.push((row, const_col, one.clone()));
+    c_entries.push((row, val_col, one.clone()));
+    mods.push(zero.clone());
+    q[row] = zero.clone();
+    row += 1;
+  }
+
+  // Final mod-ℓ reduction row, wired to the Poseidon output.
+  {
+    let (qi, ci) = w[pos_out_col].div_rem(&ell);
+    w[col] = ci;
+    q[row] = qi;
+    a_entries.push((row, pos_out_col, one.clone()));
+    b_entries.push((row, const_col, one.clone()));
+    c_entries.push((row, col, one.clone()));
+    mods.push(ell.clone());
+    row += 1;
+    col += 1;
+  }
+
+  // Per-swap `H∆` models (k > 0 only): still generic 3-column rows,
+  // flagged as unfaithful — do not quote k > 0 configurations.
+  let groups: Vec<(&BigUint, usize)> = vec![(&ell, 2 * d.k), (&p_hash, 2 * d.k * d.h_rows)];
   let mut r = 0usize;
   for (m, count) in &groups {
     for _ in 0..*count {
@@ -383,6 +660,8 @@ fn multiswap_shape_and_witness_for<MM: spartan2::traits::mod_engine::ModEngine>(
       r += 1;
     }
   }
+  debug_assert_eq!(row, d.num_real_rows());
+  debug_assert_eq!(col, d.num_real_cols());
 
   mods.resize(num_cons, BigUint::from(2u32));
 
@@ -462,6 +741,41 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       t_commit + t_prove,
       proof_bytes,
       proof_bytes as f64 / 1e6,
+    );
+    return;
+  }
+
+  // PSIZE=1: serialized proof size of the Hyrax-backed instantiation on
+  // the standard workload. `eval_arg_size` covers the Mod-PCS batch
+  // argument (commitments, GKR, combined opening) — the dominant part;
+  // the dynamic-prime side (outer/inner sumcheck round polynomials and
+  // claimed evals, ~1.2 KB at 2^13) is not yet `Serialize` and is
+  // reported analytically alongside.
+  if std::env::var_os("PSIZE").is_some() {
+    use std::time::Instant;
+    let dims = Dims::multiswap(0);
+    let (shape, w, q) = multiswap_shape_and_witness(dims);
+    let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
+    let params =
+      IntEvalParams::derive(2048, LOG_T, DEFAULT_K, log_n).expect("IntEval params satisfy bounds");
+    let (pk, vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
+    let t0 = Instant::now();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
+    let total = t0.elapsed().as_secs_f64();
+    proof.verify(&vk, &instance).unwrap();
+    let arg_bytes = proof.eval_arg_size();
+    let (pp, rc, co) = proof.eval_arg_component_sizes();
+    println!("  breakdown: per_poly {pp} B, range_check {rc} B, combined_open {co} B");
+    // Dynamic-prime remainder: 13 cubic outer rounds (3 coeffs each) +
+    // 14 quadratic inner rounds (2 coeffs) + 6 claimed evals, 16 B per
+    // 2-limb scalar.
+    let dyn_bytes = (13 * 3 + 14 * 2 + 6) * 16;
+    println!(
+      "MultiSwap 2^13 / Hyrax Mod-PCS proof size: eval_arg {arg_bytes} bytes \
+       + ~{dyn_bytes} B sumcheck side ≈ {:.1} KB  (commit+prove {total:.2} s)",
+      (arg_bytes + dyn_bytes) as f64 / 1e3,
     );
     return;
   }
