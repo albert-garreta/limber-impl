@@ -12,7 +12,7 @@ static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ff::Field;
-use spartan2::{
+use spartan_inteval::{
   imod_r1cs::{IntModR1CSShape, IntModR1CSWitness},
   imod_spartan::IntModSpartanSNARK,
   provider::T256HyraxEngine,

@@ -45,7 +45,7 @@ static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use num_bigint::BigUint;
 use num_integer::Integer;
-use spartan2::{
+use spartan_inteval::{
   imod_r1cs_modp::{IntModR1CSShapeModp, IntModR1CSWitnessModp},
   imod_spartan_modp::IntModSpartanModpSNARK,
   provider::{
@@ -445,7 +445,7 @@ fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>
   multiswap_shape_and_witness_for::<M>(d)
 }
 
-fn multiswap_shape_and_witness_for<MM: spartan2::traits::mod_engine::ModEngine>(
+fn multiswap_shape_and_witness_for<MM: spartan_inteval::traits::mod_engine::ModEngine>(
   d: Dims,
 ) -> (IntModR1CSShapeModp<MM>, Vec<BigUint>, Vec<BigUint>) {
   let n = modulus_n();
@@ -706,7 +706,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
   // verify, and serialized proof size. The comparison point against
   // code-commitment systems.
   if std::env::var_os("BDPCS").is_some() {
-    use spartan2::provider::T256DynPrimeBdEngine as BE;
+    use spartan_inteval::provider::T256DynPrimeBdEngine as BE;
     use std::time::Instant;
     let dims = Dims::multiswap(0);
     let (shape, w, q) = multiswap_shape_and_witness_for::<BE>(dims);
@@ -719,7 +719,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let tw = Instant::now();
     let nvars = shape.num_vars().max(shape.num_cons());
     let f_chunk_len = (nvars * 32 * 4).next_power_of_two();
-    let _ = spartan2::provider::pcs::prewarm_brakedown_params(f_chunk_len);
+    let _ = spartan_inteval::provider::pcs::prewarm_brakedown_params(f_chunk_len);
     println!(
       "  (params prewarm for f-chunk length: {:.1} ms)",
       tw.elapsed().as_secs_f64() * 1e3

@@ -1,7 +1,5 @@
 # Support
 
-## How to file issues and get help  
+This repository is a research prototype accompanying the *Limber: Low Overhead SNARKs from Any PCS* paper. It is provided as-is, with no support commitment or release cadence.
 
-This project uses GitHub Issues to track bugs and feature requests. Please search the existing 
-issues before filing new issues to avoid duplicates.  For new issues, file your bug or 
-feature request as a new Issue.
+Bug reports and questions are welcome via GitHub Issues — please search existing issues before filing a new one. Pull requests are welcome but may take time to review.

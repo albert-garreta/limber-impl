@@ -24,7 +24,7 @@ use bellpepper_core::{
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use ff::{Field, PrimeField, PrimeFieldBits};
 use sha2::{Digest, Sha256};
-use spartan2::{
+use spartan_inteval::{
   provider::T256HyraxEngine,
   spartan::SpartanSNARK,
   traits::{Engine, circuit::SpartanCircuit, snark::R1CSSNARKTrait},

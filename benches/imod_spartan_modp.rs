@@ -18,7 +18,7 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ff::{Field, PrimeField};
 use num_bigint::{BigUint, RandBigInt};
 use rand::SeedableRng;
-use spartan2::{
+use spartan_inteval::{
   imod_r1cs_modp::{IntModR1CSShapeModp, IntModR1CSWitnessModp},
   imod_spartan_modp::{
     IntModSpartanModpProverKey, IntModSpartanModpSNARK, IntModSpartanModpVerifierKey,

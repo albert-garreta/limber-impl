@@ -1,12 +1,10 @@
 [package]
-name = "spartan2"
-version = "0.8.0"
-authors = ["Srinath Setty <srinath@microsoft.com>"]
+name = "spartan-inteval"
+version = "0.1.0"
 edition = "2024"
-description = "High-speed zkSNARKs without trusted setup"
-documentation = "https://docs.rs/spartan2"
+description = "SNARKs for integer Mod-R1CS (per-constraint moduli), built on Spartan's sum-check pipeline"
 readme = "README.md"
-repository = "https://github.com/Microsoft/Spartan2"
+repository = "https://github.com/j-cqy/spartan-inteval"
 license-file = "LICENSE"
 keywords = ["zkSNARKs", "cryptography", "proofs"]
 

@@ -13,7 +13,7 @@
 //! that the truncation broke.
 
 use num_bigint::BigUint;
-use spartan2::{
+use spartan_inteval::{
   imod_r1cs_modp::{IntModR1CSShapeModp, IntModR1CSWitnessModp},
   imod_spartan_modp::IntModSpartanModpSNARK,
   provider::T256DynPrimeEngine,

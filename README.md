@@ -66,9 +66,48 @@ Override thread counts with `BENCH_THREADS` (comma-separated):
 BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spartan
 ```
 
+## Reproducing the paper's numbers
+
+All numbers quoted in the paper are **single-threaded**
+(`RAYON_NUM_THREADS=1`) with native codegen
+(`RUSTFLAGS="-C target-cpu=native"`). Multi-threaded runs are not
+comparable across configurations (thermal throttling and rayon
+spin-up confound the ratios), so always pin the thread count when
+reproducing.
+
+**Native-overhead figure (`fig:nativeoverhead`) and the msshape
+plots/table** (`docs/plots/msshape_*`):
+
+```bash
+RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
+```
+
+This runs the shape-matched pair of sweeps
+(`cargo bench --bench imod_spartan_modp -- msshape` vs
+`cargo bench --bench spartan_synthetic -- msshape`) and renders the
+figures via `scripts/plot_msshape.py`; see the script header for
+knobs. Expected ballpark (Apple Silicon, 2026-08): 5.9–8.1× prover
+overhead over plain Spartan at 2^10–2^14 constraints, verify under
+30 ms vs 15–17 ms, proof 135–149 KB vs ~68 KB.
+
+**MultiSwap table (`tab:multiswap-bench`), our rows**:
+
+```bash
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
+```
+
+Set `PSIZE=1` to print serialized proof sizes and `KSWEEP=1` to sweep
+the reduction parameter `k` (see the bench's module docs for what is
+wired faithfully vs modeled by operation count). The Arkworks/Garuda
+baseline row comes from an external harness.
+
+**Zinc+ comparison**: our side is the `multiswap_modp` run above at
+2^13 rows; the Zinc+ side requires pinning specific revisions of
+their repo to build at all.
+
 ## References
 
-*SNARKs for Integers* — the protocol this repository implements.
+[Limber: Low Overhead SNARKs for Integers from Any PCS](https://eprint.iacr.org/2026/1635) — the protocol this repository implements.
 
 [Spartan: Efficient and general-purpose zkSNARKs without trusted setup](https://eprint.iacr.org/2019/550) \
 Srinath Setty \

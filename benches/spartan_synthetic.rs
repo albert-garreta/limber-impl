@@ -14,7 +14,7 @@ static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 use bellpepper_core::{ConstraintSystem, SynthesisError, num::AllocatedNum};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ff::{Field, PrimeField};
-use spartan2::{
+use spartan_inteval::{
   provider::T256HyraxEngine,
   spartan::SpartanSNARK,
   traits::{Engine, circuit::SpartanCircuit, snark::R1CSSNARKTrait},
