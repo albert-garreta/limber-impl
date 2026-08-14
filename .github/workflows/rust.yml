@@ -1,4 +1,4 @@
-name: Build and Test spartan-inteval
+name: Build and Test Limber
 
 permissions:
   contents: read

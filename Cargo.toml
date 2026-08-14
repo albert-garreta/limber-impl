@@ -1,10 +1,10 @@
 [package]
-name = "spartan-inteval"
+name = "limber"
 version = "0.1.0"
 edition = "2024"
 description = "SNARKs for integer Mod-R1CS (per-constraint moduli), built on Spartan's sum-check pipeline"
 readme = "README.md"
-repository = "https://github.com/j-cqy/spartan-inteval"
+repository = "https://github.com/j-cqy/limber-impl"
 license-file = "LICENSE"
 keywords = ["zkSNARKs", "cryptography", "proofs"]
 

@@ -2,7 +2,7 @@
 //! shapes. Run with:
 //!   cargo test --release --test param_sweep -- --nocapture
 
-use spartan_inteval::provider::pcs::integer_modpcs::{DEFAULT_LOG_T_F, IntEvalParams};
+use limber::provider::pcs::integer_modpcs::{DEFAULT_LOG_T_F, IntEvalParams};
 
 #[test]
 fn sweep_k_for_bench_shapes() {

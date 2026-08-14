@@ -12,13 +12,13 @@
 //! `wide_modulus_roundtrip_random_operands` is the honest general case
 //! that the truncation broke.
 
-use num_bigint::BigUint;
-use spartan_inteval::{
+use limber::{
   imod_r1cs_modp::{IntModR1CSShapeModp, IntModR1CSWitnessModp},
   imod_spartan_modp::IntModSpartanModpSNARK,
   provider::T256DynPrimeEngine,
   provider::pcs::integer_modpcs::{DEFAULT_K, IntEvalParams},
 };
+use num_bigint::BigUint;
 
 type M = T256DynPrimeEngine;
 

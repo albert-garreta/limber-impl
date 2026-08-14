@@ -16,9 +16,7 @@ static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use ff::{Field, PrimeField};
-use num_bigint::{BigUint, RandBigInt};
-use rand::SeedableRng;
-use spartan_inteval::{
+use limber::{
   imod_r1cs_modp::{IntModR1CSShapeModp, IntModR1CSWitnessModp},
   imod_spartan_modp::{
     IntModSpartanModpProverKey, IntModSpartanModpSNARK, IntModSpartanModpVerifierKey,
@@ -27,6 +25,8 @@ use spartan_inteval::{
   provider::pcs::integer_modpcs::{DEFAULT_K, DEFAULT_LOG_T_F, IntEvalParams},
   provider::pt256::t256,
 };
+use num_bigint::{BigUint, RandBigInt};
+use rand::SeedableRng;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 

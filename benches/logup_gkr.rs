@@ -1,6 +1,6 @@
 //! benches/logup_gkr.rs
 //! Criterion benchmarks for the LogUp-GKR range proof
-//! (`spartan_inteval::logup_gkr::LogUpRangeProof`): prove + verify of a 16-bit range
+//! (`limber::logup_gkr::LogUpRangeProof`): prove + verify of a 16-bit range
 //! check on `N` witnesses, over the T256 Hyrax base field. Sweeps `N`; the
 //! table side is fixed at `2^16`.
 //!
@@ -13,12 +13,12 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = tikv_jemallocator::Jemalloc;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use spartan_inteval::{
+use limber::{
   logup_gkr::LogUpRangeProof,
   provider::T256HyraxEngine,
   traits::{Engine, transcript::TranscriptEngineTrait},
 };
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::time::Duration;
 
 type E = T256HyraxEngine;

@@ -1,4 +1,4 @@
-# spartan-inteval: SNARKs for Integers on Spartan
+# Limber: SNARKs for Integers on Spartan
 
 A research prototype of **Integer Mod-R1CS** proving — SNARKs whose
 constraints are modular arithmetic over arbitrary, per-constraint
@@ -39,7 +39,6 @@ builds on and benchmarks against:
 - **Precomputable / online witness split** — both protocols expose
   `setup` → `prep_prove` → `prove`, so witness material known ahead of
   time is synthesized and committed once and reused across proofs.
-  on for low-latency proving.
 
 ## Benchmarks
 

@@ -25,7 +25,7 @@ use bellpepper_core::{
 };
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use ff::Field;
-use spartan_inteval::{
+use limber::{
   neutronnova_zk::NeutronNovaZkSNARK,
   provider::T256HyraxEngine,
   traits::{Engine, circuit::SpartanCircuit},
