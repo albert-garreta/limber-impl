@@ -561,16 +561,17 @@ pub struct SmallPrimeOpening {
 /// ([`IntEvalArgument::ab_comms`]); every claim here folds through
 /// [`chunk_fold_point`] and is discharged by the final batched opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IterationOracles {
+#[serde(bound = "F: Serialize + serde::de::DeserializeOwned")]
+pub struct IterationOracles<F = t256::Scalar> {
   /// Claimed `a_{j-1}(γ_ext)` where `γ_ext = (γ[0..n-jk], r^(i)[n-jk..n-(j-1)k])`.
   /// A claim on the input commitment for `j=1`, else on layer `j-1`'s
   /// `a` chunk commitment at `(bits(chain), γ_ext, x_*)`.
-  pub a_prev_eval: t256::Scalar,
+  pub a_prev_eval: F,
   /// Claimed `a_j(γ[0..n-jk])` — a claim on layer `j`'s `a` chunk
   /// commitment at `(bits(chain), γ_prefix, x_*)`.
-  pub a_curr_eval: t256::Scalar,
+  pub a_curr_eval: F,
   /// Claimed `b_j(γ[0..n-jk])` — same shape on the `b` chunk commitment.
-  pub b_curr_eval: t256::Scalar,
+  pub b_curr_eval: F,
 }
 
 /// Per-prime chain: `t = ⌈(n-k)/k⌉` iterations plus the claimed
@@ -578,11 +579,12 @@ pub struct IterationOracles {
 /// commitment for `t = 0`, else on the last layer's `a` chunk
 /// commitment).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChainData {
+#[serde(bound = "F: Serialize + serde::de::DeserializeOwned")]
+pub struct ChainData<F = t256::Scalar> {
   /// Per-iteration identity-check evaluation claims.
-  pub iterations: Vec<IterationOracles>,
+  pub iterations: Vec<IterationOracles<F>>,
   /// Claimed `a_t(r^(i)[0..n-tk])`, used by the CRT check.
-  pub final_eval: t256::Scalar,
+  pub final_eval: F,
 }
 
 /// Evaluation argument: the prover-sent integer evaluation `int_v'`,
@@ -607,7 +609,7 @@ pub struct IntEvalArgument<B: CommitBackend> {
   pub int_v_prime: BigInt,
   /// One per small prime sampled from the transcript. Length matches
   /// `params.s`.
-  pub chains: Vec<ChainData>,
+  pub chains: Vec<ChainData<B::Scalar>>,
   /// Two chunk commitments per iteration layer `j ∈ [1, t]` (`a_j` then
   /// `b_j`), each committing ALL chains' shifted values in the range-
   /// check chunk layout `((chain·m + x)·stride + c)` with chains padded
@@ -646,7 +648,7 @@ pub struct IntEvalPerPolyArgument<B: CommitBackend> {
   /// See [`IntEvalArgument::int_v_prime`].
   pub int_v_prime: BigInt,
   /// See [`IntEvalArgument::chains`].
-  pub chains: Vec<ChainData>,
+  pub chains: Vec<ChainData<B::Scalar>>,
   /// See [`IntEvalArgument::ab_comms`].
   pub(crate) ab_comms: Vec<B::Comm>,
 }
@@ -2175,25 +2177,25 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
 struct PerPolyProver<B: CommitBackend> {
   reduction_round_polys: Vec<Vec<BigUint>>,
   int_v_prime: BigInt,
-  chains: Vec<ChainData>,
+  chains: Vec<ChainData<B::Scalar>>,
   /// Per-layer chunk commitments, 2 per layer (`a_j` then `b_j`).
   ab_comms: Vec<B::Comm>,
   /// `f_limb` reduced to the Hyrax base field: F-batch value polynomial
   /// (chain-claim evaluations only — the combined open runs on chunks).
-  poly_fq: Vec<t256::Scalar>,
+  poly_fq: Vec<B::Scalar>,
   /// `f_limb` as integers: the F-batch's range-checked values.
   f_limb: Vec<BigUint>,
   /// Per-prime chain states feeding the `a_j`/`b_j` layer batches.
   chain_states: Vec<ChainProverState>,
   /// Per-layer, per-role stacked chunk polynomials (the committed
   /// oracles) and their blinds; index `2·(j−1) + role`.
-  ab_chunk_polys: Vec<Vec<t256::Scalar>>,
+  ab_chunk_polys: Vec<Vec<B::Scalar>>,
   ab_blinds: Vec<B::Blind>,
   /// Retained opening data for each layer chunk commitment.
   ab_open_aux: Vec<B::Data>,
   /// Accumulated multi-point claims on the input commitment / the
   /// per-layer chunk commitments (already in chunk coordinates).
-  f_claims: OpenClaims,
+  f_claims: OpenClaims<B::Scalar>,
   ab_claims: Vec<OpenClaims>,
   t_layers: usize,
 }
@@ -2809,9 +2811,9 @@ fn finish_batch_open<
 /// Per-polynomial verifier state: the accumulated open claims plus the
 /// public dimensions [`finish_batch_verify`] needs to pin batch shapes
 /// and combined-open point lengths.
-struct PerPolyVerifier {
-  f_claims: OpenClaims,
-  ab_claims: Vec<OpenClaims>,
+struct PerPolyVerifier<F = t256::Scalar> {
+  f_claims: OpenClaims<F>,
+  ab_claims: Vec<OpenClaims<F>>,
   num_vars: usize,
   t: usize,
   log_spad: usize,
