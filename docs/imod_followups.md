@@ -1312,3 +1312,29 @@ target λ = 128. May be lowered further if a future instantiation
 needs it. Paper obligation when the small-field instantiation ships:
 state achieved soundness as the min (~114-117 bits), as already done
 for the prime-sampling term.
+
+## Phase-1 field-genericization: state + remaining plan (2026-08-19)
+
+Done (each step green + committed): CommitBackend has `type Scalar`
+(both backends pin t256 for now); OpenTarget + trait methods generic;
+combined batch open (prove/verify), absorb_batch_claims,
+batch_weight, OpenClaims, CombinedBatchOpen all field-generic with
+byte-level transcripts (bo_lambda/cbo_c squeezes now
+from_uniform(squeeze_bytes) — transcript bytes changed, both sides
+together). Six pins remain: prove_one_poly, verify_one_poly,
+finish_batch_open, finish_batch_verify, prove/verify_shared_range_check.
+
+Remaining plan:
+1. Chains cluster: parameterize SmallPrimeOpening / IterationOracles /
+   ChainData + mle_evaluate_fq, convert prove/verify_one_poly.
+2. Range-check cluster: re-parameterize logup_gkr from `E: Engine` to
+   `E: SumcheckEngine` (+ `Scalar: PrimeField` bound — SumcheckEngine
+   already exists with standalone impls and an Engine blanket impl);
+   give CommitBackend a `type SE: SumcheckEngine<Scalar = Self::Scalar>`
+   so SharedRangeCheck stays single-parameter; Hyrax sets SE =
+   T256HyraxEngine, a future M127 backend mints a tiny curve-free
+   engine struct.
+3. Finishers: finish_batch_open/verify unpin once 1+2 land; then
+   LOG_Q moves from a module const to a B::Scalar-derived value
+   (params-driven), and the derive()/validate() formulas take it as
+   input.
