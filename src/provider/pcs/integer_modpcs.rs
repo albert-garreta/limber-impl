@@ -789,21 +789,21 @@ pub struct SharedRangeCheck<B: CommitBackend> {
 /// for inputs below the scalar field, otherwise reduces uniformly. Phase 3
 /// step D will add the range check that turns this into a *sound*
 /// commitment to a bounded integer.
-fn biguint_to_scalar(v: &BigUint) -> t256::Scalar {
+fn biguint_to_scalar<F: PrimeFieldExt>(v: &BigUint) -> F {
   // Fast path: values that fit one u64 digit (e.g. every limb at
   // T ≤ 2^64) skip the 512-bit uniform-reduction path.
   if v.bits() <= 64 {
-    return t256::Scalar::from(v.iter_u64_digits().next().unwrap_or(0));
+    return F::from(v.iter_u64_digits().next().unwrap_or(0));
   }
   let mut bytes = v.to_bytes_le();
   bytes.resize(64, 0);
-  <t256::Scalar as PrimeFieldExt>::from_uniform(&bytes)
+  F::from_uniform(&bytes)
 }
 
 /// `t256::Scalar → BigUint` via the canonical (non-Montgomery) integer
 /// representation. Inverse of `biguint_to_scalar` for inputs that fit
 /// in the scalar field.
-fn scalar_to_biguint(s: &t256::Scalar) -> BigUint {
+fn scalar_to_biguint<F: ff::PrimeField>(s: &F) -> BigUint {
   BigUint::from_bytes_le(s.to_repr().as_ref())
 }
 
@@ -813,9 +813,9 @@ fn scalar_to_biguint(s: &t256::Scalar) -> BigUint {
 /// IntEval CRT check: when the integer evaluation is negative, the F
 /// arithmetic produces a result near `q` (because `(1 - r_i)` wraps to
 /// `q + 1 - r_i`), so the verifier must lift back to a signed value.
-fn scalar_to_balanced_int(s: &t256::Scalar) -> BigInt {
+fn scalar_to_balanced_int<F: ff::PrimeField>(s: &F) -> BigInt {
   let v = scalar_to_biguint(s);
-  let q = t256_q();
+  let q = field_q::<F>();
   let half = &q >> 1;
   if v > half {
     BigInt::from(v) - BigInt::from(q)
@@ -827,11 +827,13 @@ fn scalar_to_balanced_int(s: &t256::Scalar) -> BigInt {
 /// The T256 scalar field's characteristic `q` as a `BigUint`. Computed
 /// once via `(q - 1) + 1` from `-Scalar::ONE`'s representation; cheap
 /// enough to recompute per call since it's just byte arithmetic.
-fn t256_q() -> BigUint {
+fn field_q<F: ff::PrimeField>() -> BigUint {
   // `q` is a compile-time constant of the curve; compute it once and
   // hand out clones (this is called per `shift_b`, i.e. per range check).
-  static Q: once_cell::sync::Lazy<BigUint> = once_cell::sync::Lazy::new(|| {
-    let q_minus_1 = (-<t256::Scalar as Field>::ONE).to_repr();
+  // Per-call compute: generic statics are unavailable and this is
+  // cheap byte arithmetic on a short repr.
+  {
+    let q_minus_1 = (-F::ONE).to_repr();
     let mut bytes = q_minus_1.as_ref().to_vec();
     let mut carry = 1u8;
     for b in bytes.iter_mut() {
@@ -841,8 +843,7 @@ fn t256_q() -> BigUint {
     }
     debug_assert_eq!(carry, 0);
     BigUint::from_bytes_le(&bytes)
-  });
-  Q.clone()
+  }
 }
 
 /// Canonical integer in `[0, p)` from a `DynPrime<2>` value.
@@ -975,11 +976,8 @@ fn build_chunk_poly(values: &[&[BigUint]], n_values: usize, log_bound: usize) ->
 /// built once per process — `t256::Scalar::from` costs a Montgomery
 /// multiplication, and the chunk pipelines (commit, layer commits, GKR
 /// witness prep) convert millions of sub-2^16 values per proof.
-fn scalar_from_chunk(c: u64) -> t256::Scalar {
-  static TABLE: std::sync::OnceLock<Vec<t256::Scalar>> = std::sync::OnceLock::new();
-  let table = TABLE.get_or_init(|| (0..(1u64 << CHUNK_BITS)).map(t256::Scalar::from).collect());
-  debug_assert!(c < (1u64 << CHUNK_BITS));
-  table[c as usize]
+fn scalar_from_chunk<F: PrimeFieldExt>(c: u64) -> F {
+  F::from_chunk(c)
 }
 
 /// The chunk-axis folding point and scale of the committed-chunk layout:
@@ -998,16 +996,16 @@ fn scalar_from_chunk(c: u64) -> t256::Scalar {
 /// range check pins them to zero soundness-grade with `range_zpad`
 /// claims (a fresh random-point opening of each padding slot, zero by
 /// Schwartz–Zippel), so any `numchunks` is supported.
-fn chunk_fold_point(log_stride: usize) -> (Vec<t256::Scalar>, t256::Scalar) {
+fn chunk_fold_point<F: ff::PrimeField>(log_stride: usize) -> (Vec<F>, F) {
   let mut coords_lsb_first = Vec::with_capacity(log_stride);
-  let mut alpha = t256::Scalar::ONE;
+  let mut alpha = F::ONE;
   for b in 0..log_stride {
     // u_b = 2^(16·2^b), by repeated squaring of 2^16.
-    let mut u = t256::Scalar::from(1u64 << CHUNK_BITS);
+    let mut u = F::from(1u64 << CHUNK_BITS);
     for _ in 0..b {
       u = u.square();
     }
-    let denom_inv = SumcheckField::invert(&(t256::Scalar::ONE + u))
+    let denom_inv = Option::<F>::from(ff::Field::invert(&(F::ONE + u)))
       .expect("1 + 2^(16·2^b) is invertible in a prime field of odd order");
     coords_lsb_first.push(u * denom_inv);
     alpha *= denom_inv;
@@ -1043,16 +1041,10 @@ fn bit_decompose_check_no_overflow(bytes: &[u8], num_bits: usize) -> bool {
 /// variables: `point[0]` is the most significant bit. Binding an MLE's
 /// trailing variables to this point selects the slot `idx` of the
 /// bottom axis.
-fn bool_point_of_index(idx: usize, num_bits: usize) -> Vec<t256::Scalar> {
+fn bool_point_of_index<F: ff::PrimeField>(idx: usize, num_bits: usize) -> Vec<F> {
   (0..num_bits)
     .rev()
-    .map(|b| {
-      if (idx >> b) & 1 == 1 {
-        t256::Scalar::ONE
-      } else {
-        t256::Scalar::ZERO
-      }
-    })
+    .map(|b| if (idx >> b) & 1 == 1 { F::ONE } else { F::ZERO })
     .collect()
 }
 
@@ -1187,7 +1179,7 @@ fn shift_a(params: &IntEvalParams) -> BigUint {
 /// So shifting by `⌊q/P⌋` is sound. Like `shift_a`, this is a public
 /// per-`params` constant.
 fn shift_b(params: &IntEvalParams) -> BigUint {
-  &t256_q() / (BigUint::one() << params.log_p)
+  &field_q::<t256::Scalar>() / (BigUint::one() << params.log_p)
 }
 
 /// Integer partial-evaluation at the *last* `k` variables. Given a
@@ -2186,7 +2178,7 @@ struct PerPolyProver<B: CommitBackend> {
   /// `f_limb` as integers: the F-batch's range-checked values.
   f_limb: Vec<BigUint>,
   /// Per-prime chain states feeding the `a_j`/`b_j` layer batches.
-  chain_states: Vec<ChainProverState>,
+  chain_states: Vec<ChainProverState<B::Scalar>>,
   /// Per-layer, per-role stacked chunk polynomials (the committed
   /// oracles) and their blinds; index `2·(j−1) + role`.
   ab_chunk_polys: Vec<Vec<B::Scalar>>,
@@ -2196,7 +2188,7 @@ struct PerPolyProver<B: CommitBackend> {
   /// Accumulated multi-point claims on the input commitment / the
   /// per-layer chunk commitments (already in chunk coordinates).
   f_claims: OpenClaims<B::Scalar>,
-  ab_claims: Vec<OpenClaims>,
+  ab_claims: Vec<OpenClaims<B::Scalar>>,
   t_layers: usize,
 }
 
@@ -2207,7 +2199,7 @@ struct PerPolyProver<B: CommitBackend> {
 /// proof outputs plus the witness data [`finish_batch_open`]'s shared
 /// range check and combined opening borrow from.
 fn prove_one_poly<
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -2321,7 +2313,7 @@ fn prove_one_poly<
   let with_iter = num_vars > params.k;
   let poly = f_limb.as_slice();
   let (_fq_span, fq_t) = start_span!("imod_pcs_red_to_fq");
-  let poly_fq: Vec<t256::Scalar> = poly.iter().map(biguint_to_scalar).collect();
+  let poly_fq: Vec<B::Scalar> = poly.iter().map(biguint_to_scalar::<B::Scalar>).collect();
   info!(elapsed_ms = %fq_t.elapsed().as_millis(), "imod_pcs_red_to_fq");
   info!(elapsed_ms = %red_t.elapsed().as_millis(), "imod_pcs_reduction");
 
@@ -2350,9 +2342,9 @@ fn prove_one_poly<
     .collect::<Result<Vec<_>, SpartanError>>()?;
 
   let (_cb_span, cb_t) = start_span!("imod_pcs_chain_build");
-  let chain_states: Vec<ChainProverState> = primes
+  let chain_states: Vec<ChainProverState<B::Scalar>> = primes
     .par_iter()
-    .map(|p_i| -> Result<ChainProverState, SpartanError> {
+    .map(|p_i| -> Result<ChainProverState<B::Scalar>, SpartanError> {
       let r_i_int: Vec<BigUint> = int_point.iter().map(|x| x % p_i).collect();
       let mut iters = Vec::new();
 
@@ -2419,10 +2411,14 @@ fn prove_one_poly<
             .map(|x| (x + &s_b).to_biguint().expect("shift makes non-negative"))
             .collect();
 
-          let a_j_shifted_fq: Vec<t256::Scalar> =
-            a_j_shifted.iter().map(biguint_to_scalar).collect();
-          let b_j_shifted_fq: Vec<t256::Scalar> =
-            b_j_shifted.iter().map(biguint_to_scalar).collect();
+          let a_j_shifted_fq: Vec<B::Scalar> = a_j_shifted
+            .iter()
+            .map(biguint_to_scalar::<B::Scalar>)
+            .collect();
+          let b_j_shifted_fq: Vec<B::Scalar> = b_j_shifted
+            .iter()
+            .map(biguint_to_scalar::<B::Scalar>)
+            .collect();
 
           iters.push(IterationProverState {
             a_shifted: a_j_shifted,
@@ -2458,7 +2454,7 @@ fn prove_one_poly<
   // layer commitment doubles as its chunk oracle (no duplicate MSM,
   // and the small-scalar fast path always applies). Order: per layer
   // `j`, the `a_j` chunk commitment then the `b_j` one (2t total).
-  let mut ab_chunk_polys: Vec<Vec<t256::Scalar>> = Vec::with_capacity(2 * t_layers);
+  let mut ab_chunk_polys: Vec<Vec<B::Scalar>> = Vec::with_capacity(2 * t_layers);
   let mut ab_blinds: Vec<B::Blind> = Vec::with_capacity(2 * t_layers);
   let mut ab_open_aux: Vec<B::Data> = Vec::with_capacity(2 * t_layers);
   let mut ab_comms: Vec<B::Comm> = Vec::with_capacity(2 * t_layers);
@@ -2478,9 +2474,9 @@ fn prove_one_poly<
         .collect();
       let log_bound = if role == 0 { log_bound_a } else { log_bound_b };
       let chunk_vals = build_chunk_poly(&values, m, log_bound);
-      let chunk_fq: Vec<t256::Scalar> = chunk_vals
+      let chunk_fq: Vec<B::Scalar> = chunk_vals
         .par_iter()
-        .map(|&c| scalar_from_chunk(c))
+        .map(|&c| scalar_from_chunk::<B::Scalar>(c))
         .collect();
       let blind = B::blind(backend_ck, chunk_fq.len());
       let (comm, data) = B::commit(backend_ck, &chunk_fq, &blind, true)?;
@@ -2495,13 +2491,13 @@ fn prove_one_poly<
   info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
   // Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
-  let gamma_fq: Vec<t256::Scalar> = if with_iter {
+  let gamma_fq: Vec<B::Scalar> = if with_iter {
     (0..(num_vars - params.k))
       .map(|i| {
         let bytes = transcript.squeeze_bytes(b"gamma")?;
         let label = (i as u64).to_le_bytes();
         transcript.absorb_bytes(b"gamma_idx", &label);
-        Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+        Ok(<B::Scalar as PrimeFieldExt>::from_uniform(&bytes))
       })
       .collect::<Result<Vec<_>, SpartanError>>()?
   } else {
@@ -2513,20 +2509,24 @@ fn prove_one_poly<
   // fold to chunk claims immediately (`value(z)·α = chunk(z ++ x_*)`);
   // `ab_claims[2·(j−1) + role]` targets layer j's role commitment.
   let (_open_span, open_t) = start_span!("imod_pcs_chain_claims");
-  let mut f_claims = OpenClaims::default();
-  let mut ab_claims: Vec<OpenClaims> = (0..2 * t_layers).map(|_| OpenClaims::default()).collect();
-  let (fold_a, alpha_a) = chunk_fold_point(chunk_stride(log_bound_a).trailing_zeros() as usize);
-  let (fold_b, alpha_b) = chunk_fold_point(chunk_stride(log_bound_b).trailing_zeros() as usize);
-  let ab_chunk_point = |role: u8, chain: usize, sub: &[t256::Scalar]| -> Vec<t256::Scalar> {
+  let mut f_claims = OpenClaims::<B::Scalar>::default();
+  let mut ab_claims: Vec<OpenClaims<B::Scalar>> = (0..2 * t_layers)
+    .map(|_| OpenClaims::<B::Scalar>::default())
+    .collect();
+  let (fold_a, alpha_a) =
+    chunk_fold_point::<B::Scalar>(chunk_stride(log_bound_a).trailing_zeros() as usize);
+  let (fold_b, alpha_b) =
+    chunk_fold_point::<B::Scalar>(chunk_stride(log_bound_b).trailing_zeros() as usize);
+  let ab_chunk_point = |role: u8, chain: usize, sub: &[B::Scalar]| -> Vec<B::Scalar> {
     let fold = if role == 0 { &fold_a } else { &fold_b };
     let mut pt = Vec::with_capacity(log_spad + sub.len() + fold.len());
-    pt.extend(bool_point_of_index(chain, log_spad));
+    pt.extend(bool_point_of_index::<B::Scalar>(chain, log_spad));
     pt.extend_from_slice(sub);
     pt.extend_from_slice(fold);
     pt
   };
 
-  let poly_at_gamma: Vec<t256::Scalar> = if with_iter {
+  let poly_at_gamma: Vec<B::Scalar> = if with_iter {
     let mut m = crate::polys::multilinear::MultilinearPolynomial::new(poly_fq.clone());
     for r in &gamma_fq[..(num_vars - params.k)] {
       m.bind_poly_var_top(r);
@@ -2536,7 +2536,7 @@ fn prove_one_poly<
     Vec::new()
   };
 
-  let mut chains: Vec<ChainData> = Vec::with_capacity(params.s);
+  let mut chains: Vec<ChainData<B::Scalar>> = Vec::with_capacity(params.s);
   for (ci, state) in chain_states.iter().enumerate() {
     let r_i_int = &state.r_i_int;
     let iters = &state.iters;
@@ -2549,9 +2549,12 @@ fn prove_one_poly<
       let prefix_len = n - j * k;
       let lo = n - j * k;
       let hi = n - (j - 1) * k;
-      let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
-      let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
-      let gamma_extended: Vec<t256::Scalar> = gamma_prefix
+      let r_lower_fq: Vec<B::Scalar> = r_i_int[lo..hi]
+        .iter()
+        .map(biguint_to_scalar::<B::Scalar>)
+        .collect();
+      let gamma_prefix: Vec<B::Scalar> = gamma_fq[..prefix_len].to_vec();
+      let gamma_extended: Vec<B::Scalar> = gamma_prefix
         .iter()
         .chain(r_lower_fq.iter())
         .copied()
@@ -2581,9 +2584,9 @@ fn prove_one_poly<
     }
 
     let t = iters.len();
-    let final_point_fq: Vec<t256::Scalar> = r_i_int[..(num_vars - t * params.k)]
+    let final_point_fq: Vec<B::Scalar> = r_i_int[..(num_vars - t * params.k)]
       .iter()
-      .map(biguint_to_scalar)
+      .map(biguint_to_scalar::<B::Scalar>)
       .collect();
     let final_eval = if t == 0 {
       let v = mle_evaluate_fq(&poly_fq, &final_point_fq);
@@ -2825,7 +2828,7 @@ struct PerPolyVerifier<F = t256::Scalar> {
 /// dimensions for [`finish_batch_verify`].
 #[allow(clippy::too_many_arguments)]
 fn verify_one_poly<
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -2837,9 +2840,9 @@ fn verify_one_poly<
   eval: &BigUint,
   reduction_round_polys: &[Vec<BigUint>],
   int_v_prime: &BigInt,
-  chains: &[ChainData],
+  chains: &[ChainData<B::Scalar>],
   ab_comms: &[B::Comm],
-) -> Result<PerPolyVerifier, SpartanError> {
+) -> Result<PerPolyVerifier<B::Scalar>, SpartanError> {
   let monty = point
     .first()
     .map(|p| *p.params())
@@ -2938,49 +2941,56 @@ fn verify_one_poly<
     transcript.absorb_bytes(b"ab_chunk", &B::comm_transcript_bytes(c));
   }
 
-  let gamma_fq: Vec<t256::Scalar> = if with_iter {
+  let gamma_fq: Vec<B::Scalar> = if with_iter {
     (0..(n - k))
       .map(|i| {
         let bytes = transcript.squeeze_bytes(b"gamma")?;
         let label = (i as u64).to_le_bytes();
         transcript.absorb_bytes(b"gamma_idx", &label);
-        Ok(<t256::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+        Ok(<B::Scalar as PrimeFieldExt>::from_uniform(&bytes))
       })
       .collect::<Result<Vec<_>, SpartanError>>()?
   } else {
     Vec::new()
   };
 
-  let shift_a_fq = biguint_to_scalar(&shift_a(params));
-  let shift_b_fq = biguint_to_scalar(&shift_b(params));
+  let shift_a_fq = biguint_to_scalar::<B::Scalar>(&shift_a(params));
+  let shift_b_fq = biguint_to_scalar::<B::Scalar>(&shift_b(params));
 
   let log_bound_a = params.log_p + 1;
   let log_bound_b = LOG_Q - params.log_p + 1;
-  let (fold_a, alpha_a) = chunk_fold_point(chunk_stride(log_bound_a).trailing_zeros() as usize);
-  let (fold_b, alpha_b) = chunk_fold_point(chunk_stride(log_bound_b).trailing_zeros() as usize);
-  let ab_chunk_point = |role: u8, chain: usize, sub: &[t256::Scalar]| -> Vec<t256::Scalar> {
+  let (fold_a, alpha_a) =
+    chunk_fold_point::<B::Scalar>(chunk_stride(log_bound_a).trailing_zeros() as usize);
+  let (fold_b, alpha_b) =
+    chunk_fold_point::<B::Scalar>(chunk_stride(log_bound_b).trailing_zeros() as usize);
+  let ab_chunk_point = |role: u8, chain: usize, sub: &[B::Scalar]| -> Vec<B::Scalar> {
     let fold = if role == 0 { &fold_a } else { &fold_b };
     let mut pt = Vec::with_capacity(log_spad + sub.len() + fold.len());
-    pt.extend(bool_point_of_index(chain, log_spad));
+    pt.extend(bool_point_of_index::<B::Scalar>(chain, log_spad));
     pt.extend_from_slice(sub);
     pt.extend_from_slice(fold);
     pt
   };
 
-  let mut f_claims = OpenClaims::default();
-  let mut ab_claims: Vec<OpenClaims> = (0..2 * t).map(|_| OpenClaims::default()).collect();
+  let mut f_claims = OpenClaims::<B::Scalar>::default();
+  let mut ab_claims: Vec<OpenClaims<B::Scalar>> = (0..2 * t)
+    .map(|_| OpenClaims::<B::Scalar>::default())
+    .collect();
   for (chain_idx, chain) in chains.iter().enumerate() {
     let (p_i, r_i_int) = &chain_primes[chain_idx];
-    let p_i_fq = biguint_to_scalar(p_i);
+    let p_i_fq = biguint_to_scalar::<B::Scalar>(p_i);
 
     for (jm1, iter) in chain.iterations.iter().enumerate() {
       let j = jm1 + 1;
       let prefix_len = n - j * k;
       let lo = n - j * k;
       let hi = n - (j - 1) * k;
-      let r_lower_fq: Vec<t256::Scalar> = r_i_int[lo..hi].iter().map(biguint_to_scalar).collect();
-      let gamma_prefix: Vec<t256::Scalar> = gamma_fq[..prefix_len].to_vec();
-      let gamma_extended: Vec<t256::Scalar> = gamma_prefix
+      let r_lower_fq: Vec<B::Scalar> = r_i_int[lo..hi]
+        .iter()
+        .map(biguint_to_scalar::<B::Scalar>)
+        .collect();
+      let gamma_prefix: Vec<B::Scalar> = gamma_fq[..prefix_len].to_vec();
+      let gamma_extended: Vec<B::Scalar> = gamma_prefix
         .iter()
         .chain(r_lower_fq.iter())
         .copied()
@@ -3019,9 +3029,9 @@ fn verify_one_poly<
       }
     }
 
-    let final_point_fq: Vec<t256::Scalar> = r_i_int[..(n - t * k)]
+    let final_point_fq: Vec<B::Scalar> = r_i_int[..(n - t * k)]
       .iter()
-      .map(biguint_to_scalar)
+      .map(biguint_to_scalar::<B::Scalar>)
       .collect();
     if t == 0 {
       f_claims.push(final_point_fq, chain.final_eval);
@@ -3184,10 +3194,10 @@ fn finish_batch_verify<
 
 /// Multilinear evaluation of `poly_fq` at point `r` over F. Mirrors the
 /// dot-product form `sum_k chi(r, k) · poly[k]` used elsewhere.
-fn mle_evaluate_fq(poly_fq: &[t256::Scalar], r: &[t256::Scalar]) -> t256::Scalar {
+fn mle_evaluate_fq<F: ff::PrimeField>(poly_fq: &[F], r: &[F]) -> F {
   let chis = EqPolynomial::evals_from_points(r);
   debug_assert_eq!(chis.len(), poly_fq.len());
-  let mut acc = t256::Scalar::ZERO;
+  let mut acc = F::ZERO;
   for (c, v) in chis.iter().zip(poly_fq.iter()) {
     acc += *c * *v;
   }
@@ -3198,22 +3208,22 @@ fn mle_evaluate_fq(poly_fq: &[t256::Scalar], r: &[t256::Scalar]) -> t256::Scalar
 /// serialized — holds the underlying F polynomial / blind / commitment
 /// for both `a_j_shifted` and `b_j_shifted` so phase 2 can produce
 /// openings at γ.
-struct IterationProverState {
+struct IterationProverState<F = t256::Scalar> {
   /// `a_j_shifted` as integers; kept so the range check can re-chunk
   /// without re-shifting / re-casting from F.
   a_shifted: Vec<BigUint>,
-  a_shifted_fq: Vec<t256::Scalar>,
+  a_shifted_fq: Vec<F>,
   /// `b_j_shifted` as integers (same reason).
   b_shifted: Vec<BigUint>,
-  b_shifted_fq: Vec<t256::Scalar>,
+  b_shifted_fq: Vec<F>,
 }
 
 /// Prover-side per-chain state collected in phase 1 and consumed in
 /// phase 2.
-struct ChainProverState {
+struct ChainProverState<F = t256::Scalar> {
   p_i: BigUint,
   r_i_int: Vec<BigUint>,
-  iters: Vec<IterationProverState>,
+  iters: Vec<IterationProverState<F>>,
 }
 
 /// The Hyrax/Pedersen instantiation of the F-side backend seam:

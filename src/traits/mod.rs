@@ -65,4 +65,12 @@ pub trait Engine: Clone + Copy + Debug + Send + Sync + Sized + Eq + PartialEq + 
 pub trait PrimeFieldExt: PrimeField {
   /// Returns a scalar representing the bytes
   fn from_uniform(bytes: &[u8]) -> Self;
+
+  /// Lift a `CHUNK_BITS`-sized value (< 2^16) into the field. Default
+  /// is a plain `from`; engines may override with a cached table (the
+  /// curve scalars do — one Montgomery multiplication per lift adds up
+  /// over 2^20-element chunk polynomials).
+  fn from_chunk(c: u64) -> Self {
+    Self::from(c)
+  }
 }

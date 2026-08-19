@@ -277,6 +277,13 @@ macro_rules! impl_traits_no_dlog_ext {
         let bytes_arr: [u8; 64] = bytes.try_into().unwrap();
         $name::Scalar::from_uniform_bytes(&bytes_arr)
       }
+
+      fn from_chunk(c: u64) -> Self {
+        static TABLE: std::sync::OnceLock<Vec<$name::Scalar>> = std::sync::OnceLock::new();
+        let table = TABLE.get_or_init(|| (0..(1u64 << 16)).map($name::Scalar::from).collect());
+        debug_assert!(c < (1u64 << 16));
+        table[c as usize]
+      }
     }
 
     impl TranscriptReprTrait for $name::Scalar {
