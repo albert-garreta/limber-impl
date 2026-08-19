@@ -1274,3 +1274,41 @@ M127/F127 field (start from ff_derive; specialize hot paths to the
 Mersenne fold where profiles say so) -> wire as ModEngine q-side ->
 port Brakedown with base-field data / extension-field coins ->
 head-to-head vs Zinc+ at the fast-prover operating point.
+
+## Brakedown commit over F127: measured 1.8-1.9x (2026-08-19)
+
+`brakedown_field_ab` (ignored test, brakedown/mod.rs): the generic
+commit path instantiated over ff_derive M127 vs t256, equal element
+count (16-bit chunk data, single-thread, native). Total commit
+1.75-1.92x faster; BDSPLIT decomposition at 2^20: encode 353.5 ->
+177.8 ms (2.0x, 82% of commit), column hash 64.8 -> 35.7 ms (1.8x,
+half the bytes), Merkle tree ~unchanged (field-blind). Encode lands
+at 2x rather than the mul microbench's 3-4x because the expander
+encode is add- and bandwidth-heavy, not mul-bound.
+
+Implications: (a) the commit layer of the q=128 operating point is
+real and needed no backend changes (PrimeFieldExt was already
+generic; F127 needed only a 10-line derive + from_uniform via
+2^128 = 2 mod M127); (b) net commit gain in the full q=127 design
+after the ~1.45x aux-volume tax: ~1.3x vs Brakedown-t256 at equal
+witness — the bigger q-side wins (GKR, chains, opens at 3-5x ops)
+still require the ModEngine reparameterization port; (c) next encode
+lever if it matters: unrolled/SIMD Mersenne-fold in the encode inner
+loop (the hand-M127 kernel's 4.9x throughput suggests headroom over
+ff_derive's Montgomery in exactly this loop shape).
+
+## Challenge-soundness target lowered to 117 bits (2026-08-19)
+
+`LAMBDA_BOUND2 = 117` (new constant, integer_modpcs.rs) now drives the
+Soundness Bound 2 check instead of the hardcoded λ = 128, by explicit
+decision: overall system soundness is already bounded by the ~2^-114
+fingerprint prime-sampling term, so full 128-bit challenge soundness
+over-secured one term. Consequence: a ~2^127 base field (M127) passes
+Bound 2 with challenges drawn from the BASE field — no extension
+field needed anywhere in the q=127 design, which removes an entire
+work item (dual-field arithmetic) from the Brakedown/small-field
+port. Bound 1 (prime-count) and the value-magnitude bound still
+target λ = 128. May be lowered further if a future instantiation
+needs it. Paper obligation when the small-field instantiation ships:
+state achieved soundness as the min (~114-117 bits), as already done
+for the prime-sampling term.

@@ -89,11 +89,15 @@ pub fn commit<F: PrimeFieldExt>(
 ) -> (Hash, BrakedownCommitData<F>) {
   assert_eq!(poly.len(), params.poly_len(), "poly length mismatch");
   let rl = params.row_len;
+  let split = std::env::var_os("BDSPLIT").is_some();
+  let t0 = std::time::Instant::now();
   // Encode each row in parallel; rows tile the poly with no padding (pow2 dims).
   let encoded: Vec<Vec<F>> = (0..params.n_rows)
     .into_par_iter()
     .map(|i| params.code.encode(&poly[i * rl..(i + 1) * rl]))
     .collect();
+  let t_enc = t0.elapsed();
+  let t1 = std::time::Instant::now();
   // Hash each encoded column into a leaf, in parallel.
   let leaves: Vec<Hash> = (0..params.n_cols)
     .into_par_iter()
@@ -102,7 +106,21 @@ pub fn commit<F: PrimeFieldExt>(
       hash_leaf(&column_to_bytes(&col))
     })
     .collect();
+  let t_hash = t1.elapsed();
+  let t2 = std::time::Instant::now();
   let tree = MerkleTree::from_leaves(leaves);
+  if split {
+    eprintln!(
+      "BDSPLIT n_rows={} row_len={} n_cols={} (sys={}): encode={:.1}ms hash={:.1}ms tree={:.1}ms",
+      params.n_rows,
+      rl,
+      params.n_cols,
+      rl,
+      t_enc.as_secs_f64() * 1e3,
+      t_hash.as_secs_f64() * 1e3,
+      t2.elapsed().as_secs_f64() * 1e3,
+    );
+  }
   (tree.root(), BrakedownCommitData { encoded, tree })
 }
 
