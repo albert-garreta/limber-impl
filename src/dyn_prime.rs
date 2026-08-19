@@ -352,10 +352,10 @@ mod tests {
     let m127_lat = t.elapsed().as_nanos() as f64 / CHAIN as f64;
     std::hint::black_box(x);
     let mut av: Vec<u128> = (0..SLOTS)
-      .map(|i| (i as u128) << 64 | 0xdead_beef)
+      .map(|i| ((i as u128) << 64) | 0xdead_beef)
       .collect();
     let bv: Vec<u128> = (0..SLOTS)
-      .map(|i| (1u128 << 126) | (i as u128) * 0x9e37_79b9)
+      .map(|i| (1u128 << 126) | ((i as u128) * 0x9e37_79b9))
       .collect();
     let t = Instant::now();
     for _ in 0..PASSES {
