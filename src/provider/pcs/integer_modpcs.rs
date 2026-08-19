@@ -706,9 +706,9 @@ where
 pub struct CombinedBatchOpen<B: crate::provider::pcs::commit_backend::CommitBackend> {
   /// Per-commitment compressed sumcheck round polynomials, tail-aligned
   /// to the shared challenge vector (entry `j` has `n_j` rounds).
-  pub(crate) round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<t256::Scalar>>>,
+  pub(crate) round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<B::Scalar>>>,
   /// Per-commitment claimed final evaluation `f_j(r_j)`.
-  pub(crate) final_evals: Vec<t256::Scalar>,
+  pub(crate) final_evals: Vec<B::Scalar>,
   /// The backend's discharge of the per-commitment single-point
   /// openings (Hyrax: μ-merged same-column IPA + small-size fallback
   /// opens; Brakedown: per-target tensor-IOPP arguments).
@@ -3454,13 +3454,13 @@ enum RcTarget {
 
 /// Accumulated multi-point evaluation claims against one commitment.
 #[derive(Default, Clone, Debug)]
-struct OpenClaims {
-  points: Vec<Vec<t256::Scalar>>,
-  evals: Vec<t256::Scalar>,
+struct OpenClaims<F = t256::Scalar> {
+  points: Vec<Vec<F>>,
+  evals: Vec<F>,
 }
 
-impl OpenClaims {
-  fn push(&mut self, point: Vec<t256::Scalar>, eval: t256::Scalar) {
+impl<F> OpenClaims<F> {
+  fn push(&mut self, point: Vec<F>, eval: F) {
     self.points.push(point);
     self.evals.push(eval);
   }
@@ -3617,10 +3617,10 @@ fn spawn_batch_subtranscript<
 
 /// Absorb a commitment and its claims into the batch sub-transcript,
 /// binding them before the RLC challenge λ is squeezed.
-fn absorb_batch_claims<B: CommitBackend<Scalar = t256::Scalar>>(
-  sub: &mut Keccak256Transcript<T256HyraxEngine>,
+fn absorb_batch_claims<B: CommitBackend>(
+  sub: &mut impl ByteTranscript,
   comm: &B::Comm,
-  claims: &OpenClaims,
+  claims: &OpenClaims<B::Scalar>,
 ) {
   sub.absorb_bytes(b"bo_comm", &B::comm_transcript_bytes(comm));
   for (z, y) in claims.points.iter().zip(claims.evals.iter()) {
@@ -3633,10 +3633,16 @@ fn absorb_batch_claims<B: CommitBackend<Scalar = t256::Scalar>>(
 
 /// Prove the combined multi-point opening (see [`CombinedBatchOpen`]).
 /// `targets` are `(commitment, poly, blind, claims)` in canonical order.
-fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
+fn prove_combined_batch_open<B: CommitBackend>(
   ck: &B::Ck,
-  sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  targets: &[(&B::Comm, &[t256::Scalar], &B::Blind, &B::Data, &OpenClaims)],
+  sub: &mut impl ByteTranscript,
+  targets: &[(
+    &B::Comm,
+    &[B::Scalar],
+    &B::Blind,
+    &B::Data,
+    &OpenClaims<B::Scalar>,
+  )],
 ) -> Result<CombinedBatchOpen<B>, SpartanError> {
   use crate::polys::univariate::UniPoly;
   let m = targets.len();
@@ -3651,7 +3657,7 @@ fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
   for (comm, poly, _, _, claims) in targets {
     debug_assert!(!claims.points.is_empty());
     absorb_batch_claims::<B>(sub, comm, claims);
-    let lambda = sub.squeeze(b"bo_lambda")?;
+    let lambda = B::Scalar::from_uniform(&sub.squeeze_bytes(b"bo_lambda")?);
     let (w, c) = batch_weight(&claims.points, &claims.evals, lambda, poly.len());
     fs.push(crate::polys::multilinear::MultilinearPolynomial::new(
       poly.to_vec(),
@@ -3667,11 +3673,11 @@ fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
   // 2. Interleaved, tail-aligned sumcheck rounds: per global round, all
   //    active instances absorb their round polynomial, then ONE shared
   //    challenge is squeezed and binds them all.
-  let mut round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<t256::Scalar>>> =
+  let mut round_polys: Vec<Vec<crate::polys::univariate::CompressedUniPoly<B::Scalar>>> =
     vec![Vec::new(); m];
-  let mut challenges: Vec<t256::Scalar> = Vec::with_capacity(n_max);
+  let mut challenges: Vec<B::Scalar> = Vec::with_capacity(n_max);
   for g in 0..n_max {
-    let mut staged: Vec<(usize, UniPoly<t256::Scalar>)> = Vec::new();
+    let mut staged: Vec<(usize, UniPoly<B::Scalar>)> = Vec::new();
     for j in 0..m {
       if g < n_max - nv[j] {
         continue; // joins later
@@ -3688,19 +3694,19 @@ fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
             let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
             let f0z = f0.is_zero_vartime();
             if f0z && f1.is_zero_vartime() {
-              return (t256::Scalar::ZERO, t256::Scalar::ZERO);
+              return (B::Scalar::ZERO, B::Scalar::ZERO);
             }
             let (w0, w1) = (ws[j].Z[i], ws[j].Z[i + h]);
-            let t0 = if f0z { t256::Scalar::ZERO } else { f0 * w0 };
+            let t0 = if f0z { B::Scalar::ZERO } else { f0 * w0 };
             (t0, (f1 + f1 - f0) * (w1 + w1 - w0))
           })
           .reduce(
-            || (t256::Scalar::ZERO, t256::Scalar::ZERO),
+            || (B::Scalar::ZERO, B::Scalar::ZERO),
             |a, b| (a.0 + b.0, a.1 + b.1),
           )
       } else {
-        let mut e0 = t256::Scalar::ZERO;
-        let mut e2 = t256::Scalar::ZERO;
+        let mut e0 = B::Scalar::ZERO;
+        let mut e2 = B::Scalar::ZERO;
         for i in 0..h {
           let (f0, f1) = (fs[j].Z[i], fs[j].Z[i + h]);
           let f0z = f0.is_zero_vartime();
@@ -3719,7 +3725,7 @@ fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
       sub.absorb(b"cbo_p", &uni);
       staged.push((j, uni));
     }
-    let r_g = sub.squeeze(b"cbo_c")?;
+    let r_g = B::Scalar::from_uniform(&sub.squeeze_bytes(b"cbo_c")?);
     for (j, uni) in staged {
       run[j] = uni.evaluate(&r_g);
       round_polys[j].push(uni.compress());
@@ -3733,7 +3739,7 @@ fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
 
   // 3. Send the per-commitment final evaluations; the backend
   //    discharges the resulting one-evaluation-per-commitment claims.
-  let final_evals: Vec<t256::Scalar> = fs.iter().map(|f| f[0]).collect();
+  let final_evals: Vec<B::Scalar> = fs.iter().map(|f| f[0]).collect();
   for y in &final_evals {
     sub.absorb_bytes(b"cbo_fe", y.to_repr().as_ref());
   }
@@ -3764,10 +3770,10 @@ fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
 /// Verifier mirror of [`prove_combined_batch_open`]. `targets` are
 /// `(commitment, num_vars, claims)` in canonical order; every claim's
 /// point length is pinned to its commitment's variable count.
-fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
+fn verify_combined_batch_open<B: CommitBackend>(
   vk: &B::Vk,
-  sub: &mut Keccak256Transcript<T256HyraxEngine>,
-  targets: &[(&B::Comm, usize, &OpenClaims)],
+  sub: &mut impl ByteTranscript,
+  targets: &[(&B::Comm, usize, &OpenClaims<B::Scalar>)],
   arg: &CombinedBatchOpen<B>,
 ) -> Result<(), SpartanError> {
   let m = targets.len();
@@ -3785,9 +3791,9 @@ fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
       return Err(SpartanError::InvalidSumcheckProof);
     }
     absorb_batch_claims::<B>(sub, comm, claims);
-    let lambda = sub.squeeze(b"bo_lambda")?;
-    let mut c = t256::Scalar::ZERO;
-    let mut lam_pow = t256::Scalar::ONE;
+    let lambda = B::Scalar::from_uniform(&sub.squeeze_bytes(b"bo_lambda")?);
+    let mut c = B::Scalar::ZERO;
+    let mut lam_pow = B::Scalar::ONE;
     for y in &claims.evals {
       c += lam_pow * y;
       lam_pow *= lambda;
@@ -3798,9 +3804,9 @@ fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
   }
   let n_max = *nv.iter().max().expect("non-empty targets");
 
-  let mut challenges: Vec<t256::Scalar> = Vec::with_capacity(n_max);
+  let mut challenges: Vec<B::Scalar> = Vec::with_capacity(n_max);
   for g in 0..n_max {
-    let mut staged: Vec<(usize, crate::polys::univariate::UniPoly<t256::Scalar>)> = Vec::new();
+    let mut staged: Vec<(usize, crate::polys::univariate::UniPoly<B::Scalar>)> = Vec::new();
     for j in 0..m {
       if g < n_max - nv[j] {
         continue;
@@ -3812,7 +3818,7 @@ fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
       sub.absorb(b"cbo_p", &uni);
       staged.push((j, uni));
     }
-    let r_g = sub.squeeze(b"cbo_c")?;
+    let r_g = B::Scalar::from_uniform(&sub.squeeze_bytes(b"cbo_c")?);
     for (j, uni) in staged {
       run[j] = uni.evaluate(&r_g);
     }
@@ -3823,10 +3829,10 @@ fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
   // recomputed in closed form.
   for (j, (_, _, claims)) in targets.iter().enumerate() {
     let r_j = &challenges[n_max - nv[j]..];
-    let mut w_at_r = t256::Scalar::ZERO;
-    let mut lam_pow = t256::Scalar::ONE;
+    let mut w_at_r = B::Scalar::ZERO;
+    let mut lam_pow = B::Scalar::ONE;
     for z in &claims.points {
-      w_at_r += lam_pow * EqPolynomial::<t256::Scalar>::new(z.clone()).evaluate(r_j);
+      w_at_r += lam_pow * EqPolynomial::<B::Scalar>::new(z.clone()).evaluate(r_j);
       lam_pow *= lambdas[j];
     }
     if run[j] != arg.final_evals[j] * w_at_r {
@@ -3838,7 +3844,7 @@ fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
     sub.absorb_bytes(b"cbo_fe", y.to_repr().as_ref());
   }
 
-  let vt: Vec<(&B::Comm, Vec<t256::Scalar>, t256::Scalar)> = targets
+  let vt: Vec<(&B::Comm, Vec<B::Scalar>, B::Scalar)> = targets
     .iter()
     .enumerate()
     .map(|(j, (comm, _, _))| {
@@ -3868,28 +3874,27 @@ fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
 /// The output is bit-identical to the naive construction (the structure
 /// only changes how the same table is assembled), so the transcript and
 /// verifier are unaffected.
-fn batch_weight(
-  points: &[Vec<t256::Scalar>],
-  evals: &[t256::Scalar],
-  lambda: t256::Scalar,
+fn batch_weight<F: ff::PrimeField>(
+  points: &[Vec<F>],
+  evals: &[F],
+  lambda: F,
   n: usize,
-) -> (Vec<t256::Scalar>, t256::Scalar) {
+) -> (Vec<F>, F) {
   let n_vars = n.trailing_zeros() as usize;
   debug_assert_eq!(1usize << n_vars, n);
-  let mut w = vec![t256::Scalar::ZERO; n];
-  let mut claim = t256::Scalar::ZERO;
-  let mut lam_pow = t256::Scalar::ONE;
+  let mut w = vec![F::ZERO; n];
+  let mut claim = F::ZERO;
+  let mut lam_pow = F::ONE;
 
   // Length of the leading run of exactly-boolean coordinates.
-  let bool_head = |z: &[t256::Scalar]| -> usize {
+  let bool_head = |z: &[F]| -> usize {
     z.iter()
-      .take_while(|c| **c == t256::Scalar::ZERO || **c == t256::Scalar::ONE)
+      .take_while(|c| **c == F::ZERO || **c == F::ONE)
       .count()
   };
   // Longest common prefix of two points.
-  let lcp = |a: &[t256::Scalar], b: &[t256::Scalar]| -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-  };
+  let lcp =
+    |a: &[F], b: &[F]| -> usize { a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count() };
 
   let mut i = 0;
   while i < points.len() {
@@ -3900,9 +3905,9 @@ fn batch_weight(
       // Block write: λ^i·eq(z[h..]) into the block selected by z[..h].
       let mut block = 0usize;
       for c in &z[..h] {
-        block = (block << 1) | usize::from(*c == t256::Scalar::ONE);
+        block = (block << 1) | usize::from(*c == F::ONE);
       }
-      let tail = EqPolynomial::<t256::Scalar>::evals_from_points(&z[h..]);
+      let tail = EqPolynomial::<F>::evals_from_points(&z[h..]);
       let bs = tail.len();
       let lam = lam_pow;
       w[block * bs..(block + 1) * bs]
@@ -3927,10 +3932,10 @@ fn batch_weight(
     if j > i + 1 && p > 0 && p < n_vars {
       // Tensor: eq(z[..p]) ⊗ Σ_c λ^c·eq(z_c[p..]).
       let tail_len = 1usize << (n_vars - p);
-      let mut small = vec![t256::Scalar::ZERO; tail_len];
+      let mut small = vec![F::ZERO; tail_len];
       for c in i..j {
         debug_assert_eq!(&points[c][..p], &z[..p]);
-        let tail = EqPolynomial::<t256::Scalar>::evals_from_points(&points[c][p..]);
+        let tail = EqPolynomial::<F>::evals_from_points(&points[c][p..]);
         let lam = lam_pow;
         for (sj, e) in small.iter_mut().zip(tail.iter()) {
           *sj += lam * e;
@@ -3938,7 +3943,7 @@ fn batch_weight(
         claim += lam_pow * evals[c];
         lam_pow *= lambda;
       }
-      let pref = EqPolynomial::<t256::Scalar>::evals_from_points(&z[..p]);
+      let pref = EqPolynomial::<F>::evals_from_points(&z[..p]);
       w.par_chunks_mut(tail_len)
         .zip(pref.par_iter())
         .for_each(|(chunk, pe)| {
@@ -3951,7 +3956,7 @@ fn batch_weight(
     }
 
     // Singleton: one full-size accumulate.
-    let eq_c = EqPolynomial::<t256::Scalar>::evals_from_points(z);
+    let eq_c = EqPolynomial::<F>::evals_from_points(z);
     let lam = lam_pow;
     w.par_iter_mut()
       .zip(eq_c.par_iter())
