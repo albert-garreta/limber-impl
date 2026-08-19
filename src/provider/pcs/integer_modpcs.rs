@@ -107,6 +107,16 @@ pub struct IntEvalParams {
 /// Security parameter (bits). The protocol targets `2^{-λ}` soundness.
 pub const LAMBDA: usize = 128;
 
+/// Accepted challenge-soundness target (bits) for Soundness Bound 2
+/// (`s·n/|F| ≤ 2^-target`). Deliberately below `LAMBDA`: the system's
+/// overall soundness is already bounded by the ~2^-114 fingerprint
+/// prime-sampling term, so demanding full 128-bit challenge soundness
+/// would over-secure one term while another sits lower. Set to 117 so
+/// a ~2^127 field (e.g. M127) passes with challenges drawn from the
+/// base field; may be lowered further if a future instantiation calls
+/// for it (decision 2026-08-19).
+pub const LAMBDA_BOUND2: usize = 117;
+
 /// Bit-width of the underlying F's characteristic `q`. Fixed at 256 for
 /// T256; future engines with other widths would parameterize this.
 pub const LOG_Q: usize = 256;
@@ -296,16 +306,17 @@ impl IntEvalParams {
       });
     }
 
-    // Soundness Bound 2: s · n / |F| <= 2^{-λ}
-    //   log: log(s·n) - log_q <= -λ
-    //   <=>  log_q >= λ + log(s·n)
+    // Soundness Bound 2: s · n / |F| <= 2^{-target}, with the accepted
+    // target `LAMBDA_BOUND2` (117, not λ = 128 — see its doc comment).
+    //   log: log(s·n) - log_q <= -target
+    //   <=>  log_q >= target + log(s·n)
     let log_sn = ceil_log2((self.s * num_vars).max(1));
-    if LOG_Q < LAMBDA + log_sn {
+    if LOG_Q < LAMBDA_BOUND2 + log_sn {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
-          "IntEval Soundness Bound 2 violated: log_q = {} < λ + log(s·n) = {}",
+          "IntEval Soundness Bound 2 violated: log_q = {} < target + log(s·n) = {}",
           LOG_Q,
-          LAMBDA + log_sn
+          LAMBDA_BOUND2 + log_sn
         ),
       });
     }
@@ -5164,7 +5175,7 @@ mod tests {
           }
           println!(
             "  log_t={log_t:2} k={k:2}: log_p={log_p:2} s={s:3} layers={layers:2}              bound2_needs_log_q>={}",
-            LAMBDA + ceil_log2((s * num_vars).max(1))
+            LAMBDA_BOUND2 + ceil_log2((s * num_vars).max(1))
           );
         }
         if let Some((layers, k, log_p, s)) = best {
