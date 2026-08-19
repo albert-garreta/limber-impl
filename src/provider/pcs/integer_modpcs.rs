@@ -2205,7 +2205,7 @@ struct PerPolyProver<B: CommitBackend> {
 /// proof outputs plus the witness data [`finish_batch_open`]'s shared
 /// range check and combined opening borrow from.
 fn prove_one_poly<
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -2629,7 +2629,7 @@ fn prove_one_poly<
 /// batches), then all chunk commitments in that batch order, then the
 /// shared multiplicity table.
 fn finish_batch_open<
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -2823,7 +2823,7 @@ struct PerPolyVerifier {
 /// dimensions for [`finish_batch_verify`].
 #[allow(clippy::too_many_arguments)]
 fn verify_one_poly<
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -3064,7 +3064,7 @@ fn verify_one_poly<
 /// every commitment, in the same canonical order the prover used.
 #[allow(clippy::too_many_arguments)]
 fn finish_batch_verify<
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -3223,6 +3223,7 @@ struct ChainProverState {
 pub struct HyBackend;
 
 impl CommitBackend for HyBackend {
+  type Scalar = t256::Scalar;
   type Ck = IntegerModCommitmentKey;
   type Vk = IntegerModVerifierKey;
   type Comm = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
@@ -3573,7 +3574,7 @@ fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
 /// reconstruct it identically.
 fn spawn_shared_range_subtranscript<
   'a,
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -3616,7 +3617,7 @@ fn spawn_batch_subtranscript<
 
 /// Absorb a commitment and its claims into the batch sub-transcript,
 /// binding them before the RLC challenge λ is squeezed.
-fn absorb_batch_claims<B: CommitBackend>(
+fn absorb_batch_claims<B: CommitBackend<Scalar = t256::Scalar>>(
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
   comm: &B::Comm,
   claims: &OpenClaims,
@@ -3632,7 +3633,7 @@ fn absorb_batch_claims<B: CommitBackend>(
 
 /// Prove the combined multi-point opening (see [`CombinedBatchOpen`]).
 /// `targets` are `(commitment, poly, blind, claims)` in canonical order.
-fn prove_combined_batch_open<B: CommitBackend>(
+fn prove_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
   ck: &B::Ck,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
   targets: &[(&B::Comm, &[t256::Scalar], &B::Blind, &B::Data, &OpenClaims)],
@@ -3763,7 +3764,7 @@ fn prove_combined_batch_open<B: CommitBackend>(
 /// Verifier mirror of [`prove_combined_batch_open`]. `targets` are
 /// `(commitment, num_vars, claims)` in canonical order; every claim's
 /// point length is pinned to its commitment's variable count.
-fn verify_combined_batch_open<B: CommitBackend>(
+fn verify_combined_batch_open<B: CommitBackend<Scalar = t256::Scalar>>(
   vk: &B::Vk,
   sub: &mut Keccak256Transcript<T256HyraxEngine>,
   targets: &[(&B::Comm, usize, &OpenClaims)],
@@ -3994,7 +3995,7 @@ struct RcVerifyClaims {
 /// final chunk evaluations) are returned as CLAIMS to be discharged by
 /// the caller's batched opens — this function performs no Hyrax opens.
 fn prove_shared_range_check<
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -4319,7 +4320,7 @@ fn prove_shared_range_check<
 /// reconstruction sumcheck against the claimed evaluations, and returns
 /// the claims for the batched-open verification.
 fn verify_shared_range_check<
-  B: CommitBackend,
+  B: CommitBackend<Scalar = t256::Scalar>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,

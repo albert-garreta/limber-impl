@@ -33,6 +33,7 @@ use crate::{
     brakedown_open_with_data, brakedown_verify_open,
   },
   provider::pt256::t256,
+  traits::PrimeFieldExt,
   traits::transcript::ByteTranscript,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -100,17 +101,22 @@ fn bd_data_cache() -> &'static Mutex<HashMap<[u8; 32], BrakedownCommitData<t256:
 /// by the claim reduction).
 pub struct OpenTarget<'a, B: CommitBackend> {
   pub comm: &'a B::Comm,
-  pub poly: &'a [t256::Scalar],
+  pub poly: &'a [B::Scalar],
   pub blind: &'a B::Blind,
   pub data: &'a B::Data,
-  pub point: Vec<t256::Scalar>,
-  pub eval: t256::Scalar,
+  pub point: Vec<B::Scalar>,
+  pub eval: B::Scalar,
 }
 
 /// The F-side commitment backend seam. `Data` is whatever the prover
 /// retains alongside a commitment to answer openings (Hyrax: the blind;
 /// Brakedown: the encoded matrix + Merkle tree).
 pub trait CommitBackend: Sized + Send + Sync + 'static {
+  /// The prime field the committed polynomials live over (the q-side
+  /// field). Today both backends set this to `t256::Scalar`; making it
+  /// an associated type is what lets the same protocol instantiate
+  /// over a smaller field (e.g. M127) without touching protocol code.
+  type Scalar: PrimeFieldExt + Serialize + DeserializeOwned + Send + Sync + 'static;
   type Ck: Send + Sync + Clone;
   type Vk: Send + Sync + Clone;
   type Comm: Clone + core::fmt::Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync;
@@ -133,7 +139,7 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
   fn recommit_data(
     ck: &Self::Ck,
     comm: &Self::Comm,
-    poly: &[t256::Scalar],
+    poly: &[Self::Scalar],
     blind: &Self::Blind,
     small: bool,
   ) -> Result<Self::Data, SpartanError>;
@@ -144,7 +150,7 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
   /// recommit to check commitment equality.
   fn commit(
     ck: &Self::Ck,
-    poly: &[t256::Scalar],
+    poly: &[Self::Scalar],
     blind: &Self::Blind,
     small: bool,
   ) -> Result<(Self::Comm, Self::Data), SpartanError>;
@@ -161,7 +167,7 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
   /// Verifier mirror of [`Self::open_targets`].
   fn verify_targets(
     vk: &Self::Vk,
-    targets: &[(&Self::Comm, Vec<t256::Scalar>, t256::Scalar)],
+    targets: &[(&Self::Comm, Vec<Self::Scalar>, Self::Scalar)],
     arg: &Self::BatchOpenArg,
     sub: &mut impl ByteTranscript,
   ) -> Result<(), SpartanError>;
@@ -173,6 +179,7 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
 pub struct BdBackend;
 
 impl CommitBackend for BdBackend {
+  type Scalar = t256::Scalar;
   type Ck = ();
   type Vk = ();
   type Comm = [u8; 32];
