@@ -4,8 +4,10 @@ A research prototype of **Integer Mod-R1CS** proving — SNARKs whose
 constraints are modular arithmetic over arbitrary, per-constraint
 integer moduli — built as a fork of
 [Microsoft Spartan2](https://github.com/Microsoft/Spartan2). It
-implements the protocol from the accompanying *SNARKs for Integers*
-paper (Def. 5.4) on top of Spartan's sum-check pipeline.
+implements the protocol from the accompanying paper
+[*Limber: Low Overhead SNARKs for Integers from Any
+PCS*](https://eprint.iacr.org/2026/1635) (Def. 5.4) on top of
+Spartan's sum-check pipeline.
 
 ## Why integer Mod-R1CS
 
