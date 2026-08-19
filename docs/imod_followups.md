@@ -1214,3 +1214,63 @@ benchmarks — those can land publicly afterwards. The only real
 gates are the identity/metadata fixes and settling the working
 tree; everything else is incremental polish an early release does
 not preclude.
+
+## Batch-affine msm_small: null result (2026-08-14)
+
+Implemented batch-affine bucket accumulation for `msm_small_rest`
+(raw-coordinate affine adds, Montgomery-batched inversions, buckets
+lifted to checked points once at aggregation; doubling/cancellation
+edges handled). Correct (203 tests + adversarial doubling/cancel
+cases) but MEASURED SLOWER on the target workload: msshape c2^14
+one-shot single-thread `wq_commit` 324 -> 365 ms (+13%), ab_commit
+also up. (One-shot numbers, ±~10%; the confirming baseline rerun was
+not completed.)
+
+Why the win doesn't materialize: the Montgomery trick itself costs
+~3M per element, so batch-affine is ~5.8M-equiv per add vs mixed
+Jacobian's ~9.4M — only ~1.6x headroom — and the per-row MSMs are
+short (~2k elements, ~350 rows at c2^14), so staging copies (72 B per
+point per window), collision deferral, and per-window vectors eat the
+margin. Library-class batch-affine wins come on million-point MSMs.
+
+Reverted; implementation preserved off-tree for reference. Retry only
+with one of: (a) cross-row scheduling — one batch stream spanning all
+~350 row-MSMs of a commit so batches fill and the inversion amortizes
+globally; (b) precomputed per-generator window tables (commitment key
+is fixed; memory-bound, ~512 MB at 4-bit windows for 2^19 gens); or
+(c) row lengths >= 2^15. The commit-time gap vs native (5.5x at
+msshape c2^14: 324 vs 59 ms) remains open; next candidate is the
+aspect-ratio lever (longer rows amortize buckets AND raise the
+batch-affine ceiling — the two compose).
+
+## 128-bit field microbench: q=128 branch is GO (2026-08-19)
+
+Four-way mul microbench (`field_128_candidates_microbench` in
+dyn_prime.rs, --ignored; single-thread, target-cpu=native, M4 Pro),
+all 128-bit candidates over M127 = 2^127 − 1:
+
+| candidate | latency ns (vs t256) | throughput ns (vs t256) |
+|---|---|---|
+| t256 (4-limb, today) | 14.44 | 8.38 |
+| DynPrime<2> (runtime modulus) | 7.52 (1.9x) | 3.53 (2.4x) |
+| ff_derive F127 (compile-time Montgomery) | 3.60 (4.0x) | 2.75 (3.1x) |
+| hand M127 (u128 + Mersenne fold) | 3.76 (3.8x) | 1.72 (4.9x) |
+
+The >=3x go/no-go gate for the q=128 / hash-based-PCS operating point
+CLEARS: ff_derive alone (10 lines, zkcrypto-audited codegen, ff-trait
+native) hits 3-4x; the hand-rolled Mersenne fold hits 4.9x on
+throughput (the metric that matters — binds/evals are
+independent-slot loops). DynPrime's runtime-modulus tax is ~2x vs
+compile-time at equal limb count, confirming it was never the right
+performance vehicle.
+
+M127 is uniquely available to us: two-adicity 1 (no FFTs — fatal for
+FRI/STARK stacks, irrelevant for our sumcheck+expander-code stack).
+Norm-bound grid at log_q=127 ~ the 128 row: k=5-6, log_p 17-20,
+s=16-25, ~0.4-0.5x commit overhead; challenges from F_{q^2} = 2^254.
+
+Next steps for the branch (est. ~1 month total): promote a fixed
+M127/F127 field (start from ff_derive; specialize hot paths to the
+Mersenne fold where profiles say so) -> wire as ModEngine q-side ->
+port Brakedown with base-field data / extension-field coins ->
+head-to-head vs Zinc+ at the fast-prover operating point.

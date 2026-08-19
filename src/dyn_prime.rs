@@ -218,6 +218,184 @@ mod tests {
     );
   }
 
+  /// ff_derive fixed-modulus field over M127 = 2^127 − 1, to compare
+  /// generic compile-time 2-limb Montgomery against DynPrime's
+  /// runtime-modulus form and a hand-rolled Mersenne reduction.
+  /// Generator 3 is a quadratic nonresidue mod M127 (p ≡ 7 mod 12).
+  #[derive(ff::PrimeField)]
+  #[PrimeFieldModulus = "170141183460469231731687303715884105727"]
+  #[PrimeFieldGenerator = "3"]
+  #[PrimeFieldReprEndianness = "little"]
+  struct F127Derived([u64; 2]);
+
+  /// Hand-rolled M127 = 2^127 − 1 arithmetic on a bare u128:
+  /// schoolbook 128×128→256 via u64 halves, then the Mersenne fold
+  /// X = hi·2^128 + lo ≡ 2·hi + (lo >> 127) + (lo & M) (mod 2^127−1).
+  const M127: u128 = (1u128 << 127) - 1;
+  #[inline(always)]
+  fn m127_mul(a: u128, b: u128) -> u128 {
+    let (a0, a1) = (a as u64 as u128, a >> 64);
+    let (b0, b1) = (b as u64 as u128, b >> 64);
+    let ll = a0 * b0;
+    let mid = a0 * b1 + a1 * b0; // < 2^128: each term < 2^127
+    let hh = a1 * b1;
+    let (lo, carry) = ll.overflowing_add(mid << 64);
+    let hi = hh + (mid >> 64) + carry as u128; // < 2^126
+    let mut r = (lo & M127) + (lo >> 127) + (hi << 1);
+    r = (r & M127) + (r >> 127);
+    if r >= M127 {
+      r -= M127;
+    }
+    r
+  }
+
+  /// Four-way 128-bit field candidate microbench (dependent-chain mul
+  /// latency + independent-slot mul throughput), all single-threaded.
+  /// Run: cargo test --release field_128_candidates -- --ignored --nocapture
+  #[test]
+  #[ignore]
+  fn field_128_candidates_microbench() {
+    use crate::provider::pt256::t256;
+    use crypto_bigint::U128;
+    use ff::{Field, PrimeField as _};
+    use rand_core::OsRng;
+    use std::time::Instant;
+
+    const CHAIN: usize = 10_000_000;
+    const SLOTS: usize = 4096;
+    const PASSES: usize = 4096; // SLOTS × PASSES ≈ 16.8M muls
+
+    // --- t256::Scalar (4-limb fixed Montgomery, today's q-side) ---
+    let mut x = t256::Scalar::random(OsRng);
+    let y = t256::Scalar::random(OsRng);
+    let t = Instant::now();
+    for _ in 0..CHAIN {
+      x *= y;
+    }
+    let t256_lat = t.elapsed().as_nanos() as f64 / CHAIN as f64;
+    std::hint::black_box(x);
+    let mut av: Vec<t256::Scalar> = (0..SLOTS).map(|_| t256::Scalar::random(OsRng)).collect();
+    let bv: Vec<t256::Scalar> = (0..SLOTS).map(|_| t256::Scalar::random(OsRng)).collect();
+    let t = Instant::now();
+    for _ in 0..PASSES {
+      for i in 0..SLOTS {
+        av[i] *= bv[i];
+      }
+    }
+    let t256_tp = t.elapsed().as_nanos() as f64 / (SLOTS * PASSES) as f64;
+    std::hint::black_box(&av);
+
+    // --- DynPrime<2> over M127 (runtime-modulus 2-limb Montgomery) ---
+    let m: U128 = U128::from_be_hex("7fffffffffffffffffffffffffffffff");
+    let params = FixedMontyParams::new(Odd::new(m).unwrap());
+    let mut x = DynPrime::<2>::new(U128::from(0x1234_5678_9abc_def0_u64), &params);
+    let y = DynPrime::<2>::new(U128::from(0x0fed_cba9_8765_4321_u64), &params);
+    let t = Instant::now();
+    for _ in 0..CHAIN {
+      x *= y;
+    }
+    let dyn_lat = t.elapsed().as_nanos() as f64 / CHAIN as f64;
+    std::hint::black_box(x);
+    let mut av: Vec<DynPrime<2>> = (0..SLOTS)
+      .map(|i| DynPrime::<2>::new(U128::from(0x9e37_79b9_7f4a_7c15_u64 ^ i as u64), &params))
+      .collect();
+    let bv: Vec<DynPrime<2>> = (0..SLOTS)
+      .map(|i| DynPrime::<2>::new(U128::from(0xc2b2_ae3d_27d4_eb4f_u64 ^ i as u64), &params))
+      .collect();
+    let t = Instant::now();
+    for _ in 0..PASSES {
+      for i in 0..SLOTS {
+        av[i] *= bv[i];
+      }
+    }
+    let dyn_tp = t.elapsed().as_nanos() as f64 / (SLOTS * PASSES) as f64;
+    std::hint::black_box(&av);
+
+    // --- ff_derive F127 (compile-time 2-limb Montgomery, same prime) ---
+    let mut x = F127Derived::random(OsRng);
+    let y = F127Derived::random(OsRng);
+    let t = Instant::now();
+    for _ in 0..CHAIN {
+      x *= y;
+    }
+    let drv_lat = t.elapsed().as_nanos() as f64 / CHAIN as f64;
+    std::hint::black_box(x);
+    let mut av: Vec<F127Derived> = (0..SLOTS).map(|_| F127Derived::random(OsRng)).collect();
+    let bv: Vec<F127Derived> = (0..SLOTS).map(|_| F127Derived::random(OsRng)).collect();
+    let t = Instant::now();
+    for _ in 0..PASSES {
+      for i in 0..SLOTS {
+        av[i] *= bv[i];
+      }
+    }
+    let drv_tp = t.elapsed().as_nanos() as f64 / (SLOTS * PASSES) as f64;
+    std::hint::black_box(&av);
+
+    // --- hand-rolled M127 (u128 + Mersenne fold, no Montgomery) ---
+    // Correctness spot-check against the derived field first.
+    for (a, b) in [(3u128, 5u128), (M127 - 1, M127 - 1), (1u128 << 126, 12345)] {
+      let expect = {
+        let fa = F127Derived::from_u128(a);
+        let fb = F127Derived::from_u128(b);
+        let mut le = [0u8; 16];
+        le.copy_from_slice((fa * fb).to_repr().as_ref());
+        u128::from_le_bytes(le)
+      };
+      assert_eq!(m127_mul(a, b), expect, "m127_mul({a}, {b})");
+    }
+    let mut x: u128 = 0x1234_5678_9abc_def0;
+    let y: u128 = (1 << 126) | 0x0fed_cba9_8765_4321;
+    let t = Instant::now();
+    for _ in 0..CHAIN {
+      x = m127_mul(x, y);
+    }
+    let m127_lat = t.elapsed().as_nanos() as f64 / CHAIN as f64;
+    std::hint::black_box(x);
+    let mut av: Vec<u128> = (0..SLOTS)
+      .map(|i| (i as u128) << 64 | 0xdead_beef)
+      .collect();
+    let bv: Vec<u128> = (0..SLOTS)
+      .map(|i| (1u128 << 126) | (i as u128) * 0x9e37_79b9)
+      .collect();
+    let t = Instant::now();
+    for _ in 0..PASSES {
+      for i in 0..SLOTS {
+        av[i] = m127_mul(av[i], bv[i]);
+      }
+    }
+    let m127_tp = t.elapsed().as_nanos() as f64 / (SLOTS * PASSES) as f64;
+    std::hint::black_box(&av);
+
+    println!("mul latency   (dependent chain, ns/op):");
+    println!("  t256 (4-limb)      {t256_lat:.2}");
+    println!(
+      "  DynPrime<2>        {dyn_lat:.2}   ({:.2}x vs t256)",
+      t256_lat / dyn_lat
+    );
+    println!(
+      "  ff_derive F127     {drv_lat:.2}   ({:.2}x vs t256)",
+      t256_lat / drv_lat
+    );
+    println!(
+      "  hand M127          {m127_lat:.2}   ({:.2}x vs t256)",
+      t256_lat / m127_lat
+    );
+    println!("mul throughput (independent slots, ns/op):");
+    println!("  t256 (4-limb)      {t256_tp:.2}");
+    println!(
+      "  DynPrime<2>        {dyn_tp:.2}   ({:.2}x vs t256)",
+      t256_tp / dyn_tp
+    );
+    println!(
+      "  ff_derive F127     {drv_tp:.2}   ({:.2}x vs t256)",
+      t256_tp / drv_tp
+    );
+    println!(
+      "  hand M127          {m127_tp:.2}   ({:.2}x vs t256)",
+      t256_tp / m127_tp
+    );
+  }
+
   // Small Mersenne prime 2^61 - 1, easy to verify against u128 arithmetic.
   fn test_params() -> FixedMontyParams<4> {
     let modulus: U256 = U256::from(0x1fff_ffff_ffff_ffff_u64);
