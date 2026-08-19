@@ -3574,7 +3574,7 @@ fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
 /// reconstruct it identically.
 fn spawn_shared_range_subtranscript<
   'a,
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
