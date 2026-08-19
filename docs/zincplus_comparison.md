@@ -474,7 +474,11 @@ evaluations collapse to one per round.
 Updated scoreboard vs Zinc+ (proof sizes deterministic, timing pairs
 unchanged from 2026-08-07): **ours 174.7 KB raw vs their chained
 4.84 MB raw → ~28× smaller** (vs probe 4.76 MB raw: ~27×; vs the
-probe's realistic 1.24 MB zstd: ~7×). Remaining proof-size structure:
+probe's realistic 1.24 MB zstd: ~7×). **Paper quotes the zstd-fair
+pairing (user decision 2026-08-14): 175 KB vs 1.2 MB → 7×**, with the
+raw 4.8 MB disclosed in the table footnote; their zstd is quoted from
+the PROBE's realistic data, never the chained run's 79 KB
+degenerate-value artifact. Remaining proof-size structure:
 combined_open 74.5 KB (√n Hyrax IPA-free opening) + range-check
 finals ~85 KB + per_poly 10.3 KB; next lever if ever needed is
 RC_BLOCK_LOG=18 (fewer trees → fewer finals) or trimming the

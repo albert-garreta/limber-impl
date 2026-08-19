@@ -140,7 +140,12 @@ fn spartan_synthetic_benches(c: &mut Criterion) {
       .with_target(false)
       .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
       .try_init();
-    let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new_wide(2730);
+    // SPAN_GATES overrides the msshape config (default 2730 = c2^12).
+    let span_gates: usize = std::env::var("SPAN_GATES")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(2730);
+    let circuit = SyntheticMulCircuit::<<E as Engine>::Scalar>::new_wide(span_gates);
     let (pk, vk) = SpartanSNARK::<E>::setup(circuit.clone()).unwrap();
     let prep = SpartanSNARK::<E>::prep_prove(&pk, circuit.clone(), false).unwrap();
     let (proof, _) = SpartanSNARK::<E>::prove(&pk, circuit, prep, false).unwrap();
