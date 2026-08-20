@@ -757,9 +757,9 @@ fn multiswap_modp_benches(c: &mut Criterion) {
   // Brakedown openings (no two-tree batching yet).
   if std::env::var_os("M127").is_some() {
     use std::time::Instant;
-    type SFE = limber::provider::M127DynPrimeBdEngine;
+    type Sf = limber::provider::M127DynPrimeBdEngine;
     let dims = Dims::multiswap(0);
-    let (shape, w, q) = multiswap_shape_and_witness_for::<SFE>(dims);
+    let (shape, w, q) = multiswap_shape_and_witness_for::<Sf>(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
     // q = 127; 16-bit limbs (= chunks); k = 5 per the parameter grid.
     let params =
@@ -768,11 +768,11 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       "M127 params: log_p={} s={} k={} numlimb={}",
       params.log_p, params.s, params.k, params.numlimb
     );
-    let (pk, vk) = IntModSpartanModpSNARK::<SFE>::setup_with_params(shape.clone(), params).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<Sf>::setup_with_params(shape.clone(), params).unwrap();
     let t0 = Instant::now();
     let (witness, instance) =
-      IntModR1CSWitnessModp::<SFE>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
-    let proof = IntModSpartanModpSNARK::<SFE>::prove(&pk, &instance, &witness).unwrap();
+      IntModR1CSWitnessModp::<Sf>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let proof = IntModSpartanModpSNARK::<Sf>::prove(&pk, &instance, &witness).unwrap();
     let t_prove = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
     proof.verify(&vk, &instance).unwrap();
