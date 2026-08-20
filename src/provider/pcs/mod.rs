@@ -20,5 +20,5 @@ pub mod kzh_pc;
 /// length (public code matrices; conceptually setup work). Returns the
 /// column-open count for informational use.
 pub fn prewarm_brakedown_params(n: usize) -> usize {
-  commit_backend::bd_params(n).n_col_opens
+  commit_backend::bd_params::<crate::provider::pt256::t256::Scalar>(n).n_col_opens
 }

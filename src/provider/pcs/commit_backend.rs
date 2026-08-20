@@ -32,7 +32,6 @@ use crate::{
     BrakedownCommitData, BrakedownEvalArg, BrakedownParams, brakedown_commit,
     brakedown_open_with_data, brakedown_verify_open,
   },
-  provider::pt256::t256,
   traits::PrimeFieldExt,
   traits::transcript::ByteTranscript,
 };
@@ -48,21 +47,25 @@ const BD_SEED: &[u8] = b"imod-modpcs-brakedown-v1";
 
 /// Per-length Brakedown layout cache (code sampling is deterministic in
 /// the public seed, so prover and verifier agree without transport).
-pub(crate) fn bd_params(n: usize) -> &'static BrakedownParams<t256::Scalar> {
-  static CACHE: OnceLock<Mutex<HashMap<usize, &'static BrakedownParams<t256::Scalar>>>> =
+pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static BrakedownParams<F> {
+  use std::any::{Any, TypeId};
+  // One cache across all field instantiations, keyed by (field, length);
+  // generic statics are unavailable, so entries go through `dyn Any`.
+  static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize), &'static (dyn Any + Send + Sync)>>> =
     OnceLock::new();
   let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
   let mut guard = cache.lock().expect("bd params cache poisoned");
-  if let Some(p) = guard.get(&n) {
-    return p;
+  let key = (TypeId::of::<F>(), n);
+  if let Some(p) = guard.get(&key) {
+    return p.downcast_ref::<BrakedownParams<F>>().expect("cache type");
   }
-  let params = Box::leak(Box::new(BrakedownParams::new(
+  let params: &'static BrakedownParams<F> = Box::leak(Box::new(BrakedownParams::new(
     n,
     crate::provider::pcs::brakedown::DEFAULT_SPEC,
     BD_LAMBDA,
     BD_SEED,
   )));
-  guard.insert(n, params);
+  guard.insert(key, params as &'static (dyn Any + Send + Sync));
   params
 }
 
@@ -71,27 +74,37 @@ pub(crate) fn bd_params(n: usize) -> &'static BrakedownParams<t256::Scalar> {
 /// earlier through the ModPCS surface. Purely a prover-side
 /// memoization: on a miss the data is recomputed and checked against
 /// the expected root.
-fn bd_data_cache_put(root: [u8; 32], data: BrakedownCommitData<t256::Scalar>) {
+fn bd_data_cache_put<F: crate::traits::PrimeFieldExt>(
+  root: [u8; 32],
+  data: BrakedownCommitData<F>,
+) {
   let cache = bd_data_cache();
   let mut guard = cache.lock().expect("bd data cache poisoned");
   if guard.len() >= 8 {
     guard.clear();
   }
-  guard.insert(root, data);
+  guard.insert(
+    (std::any::TypeId::of::<F>(), root),
+    Box::new(data) as Box<dyn std::any::Any + Send + Sync>,
+  );
 }
 
-fn bd_data_cache_get(root: &[u8; 32]) -> Option<BrakedownCommitData<t256::Scalar>> {
+fn bd_data_cache_get<F: crate::traits::PrimeFieldExt>(
+  root: &[u8; 32],
+) -> Option<BrakedownCommitData<F>> {
   bd_data_cache()
     .lock()
     .expect("bd data cache poisoned")
-    .get(root)
-    .cloned()
+    .get(&(std::any::TypeId::of::<F>(), *root))
+    .and_then(|b| b.downcast_ref::<BrakedownCommitData<F>>().cloned())
 }
 
 #[allow(clippy::type_complexity)]
-fn bd_data_cache() -> &'static Mutex<HashMap<[u8; 32], BrakedownCommitData<t256::Scalar>>> {
-  static CACHE: OnceLock<Mutex<HashMap<[u8; 32], BrakedownCommitData<t256::Scalar>>>> =
-    OnceLock::new();
+fn bd_data_cache()
+-> &'static Mutex<HashMap<(std::any::TypeId, [u8; 32]), Box<dyn std::any::Any + Send + Sync>>> {
+  static CACHE: OnceLock<
+    Mutex<HashMap<(std::any::TypeId, [u8; 32]), Box<dyn std::any::Any + Send + Sync>>>,
+  > = OnceLock::new();
   CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -187,17 +200,27 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
 /// Brakedown (hash-based) backend: non-hiding, MSM-free, per-target
 /// tensor-IOPP openings. The comparison instantiation.
 #[derive(Clone, Debug)]
-pub struct BdBackend;
+pub struct BdBackend<SE = crate::provider::T256HyraxEngine>(core::marker::PhantomData<SE>);
 
-impl CommitBackend for BdBackend {
-  type Scalar = t256::Scalar;
-  type SE = crate::provider::T256HyraxEngine;
+impl<SE> CommitBackend for BdBackend<SE>
+where
+  SE: crate::traits::mod_engine::SumcheckEngine,
+  SE::Scalar: PrimeFieldExt
+    + crate::traits::transcript::TranscriptReprTrait
+    + Serialize
+    + DeserializeOwned
+    + Send
+    + Sync
+    + 'static,
+{
+  type Scalar = SE::Scalar;
+  type SE = SE;
   type Ck = ();
   type Vk = ();
   type Comm = [u8; 32];
   type Blind = ();
-  type Data = BrakedownCommitData<t256::Scalar>;
-  type BatchOpenArg = Vec<BrakedownEvalArg<t256::Scalar>>;
+  type Data = BrakedownCommitData<SE::Scalar>;
+  type BatchOpenArg = Vec<BrakedownEvalArg<SE::Scalar>>;
 
   fn blind(_ck: &Self::Ck, _n: usize) -> Self::Blind {}
 
@@ -207,7 +230,7 @@ impl CommitBackend for BdBackend {
 
   fn commit(
     _ck: &Self::Ck,
-    poly: &[t256::Scalar],
+    poly: &[Self::Scalar],
     _blind: &Self::Blind,
     _small: bool,
   ) -> Result<(Self::Comm, Self::Data), SpartanError> {
@@ -217,7 +240,7 @@ impl CommitBackend for BdBackend {
       poly
     } else {
       padded = poly.to_vec();
-      padded.resize(params.poly_len(), t256::Scalar::from(0u64));
+      padded.resize(params.poly_len(), Self::Scalar::from(0u64));
       &padded[..]
     };
     let (root, data) = brakedown_commit(params, poly);
@@ -228,7 +251,7 @@ impl CommitBackend for BdBackend {
   fn recommit_data(
     ck: &Self::Ck,
     comm: &Self::Comm,
-    poly: &[t256::Scalar],
+    poly: &[Self::Scalar],
     blind: &Self::Blind,
     small: bool,
   ) -> Result<Self::Data, SpartanError> {
@@ -261,7 +284,7 @@ impl CommitBackend for BdBackend {
 
   fn verify_targets(
     _vk: &Self::Vk,
-    targets: &[(&Self::Comm, Vec<t256::Scalar>, t256::Scalar)],
+    targets: &[(&Self::Comm, Vec<Self::Scalar>, Self::Scalar)],
     arg: &Self::BatchOpenArg,
     sub: &mut impl ByteTranscript,
   ) -> Result<(), SpartanError> {

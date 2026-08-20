@@ -1990,7 +1990,7 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
       .par_iter()
       .map(|&c| scalar_from_chunk(c))
       .collect();
-    let (root, _data) = BdBackend::commit(&(), &chunk_fq, &(), true)?;
+    let (root, _data) = BdBackend::<T256HyraxEngine>::commit(&(), &chunk_fq, &(), true)?;
     Ok(BdModCommitment { root })
   }
 
