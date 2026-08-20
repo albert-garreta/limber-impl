@@ -63,9 +63,9 @@ pub fn mul_u64_scaled<F: MontgomeryLimbs + Copy>(a: &F, b: u64) -> F {
   // top ∈ {0, 1}: fold it as 2^256 ≡ R_MOD, then normalize below p.
   if top != 0 {
     let mut carry2: u128 = 0;
-    for i in 0..4 {
-      let v = out[i] as u128 + F::R_MOD[i] as u128 + carry2;
-      out[i] = v as u64;
+    for (o, r) in out.iter_mut().zip(F::R_MOD.iter()) {
+      let v = *o as u128 + *r as u128 + carry2;
+      *o = v as u64;
       carry2 = v >> 64;
     }
     debug_assert_eq!(carry2, 0, "second fold cannot carry");
