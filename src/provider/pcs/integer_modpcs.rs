@@ -2221,7 +2221,31 @@ struct PerPolyProver<B: CommitBackend> {
 /// a standalone open would through the chain-claim phase, and returns the
 /// proof outputs plus the witness data [`finish_batch_open`]'s shared
 /// range check and combined opening borrow from.
-fn prove_one_poly<
+
+/// Everything phase 1 of a per-polynomial open produces and phase 2
+/// consumes: the reduction outputs, the chain state, and the committed
+/// chunk polynomials. Splitting here lets the batch prover commit ALL
+/// polynomials' chains before ANY checking challenge is squeezed (the
+/// two-tree batching schedule).
+struct ChainPhase1<B: CommitBackend> {
+  num_vars: usize,
+  with_iter: bool,
+  t_layers: usize,
+  log_spad: usize,
+  log_bound_a: usize,
+  log_bound_b: usize,
+  f_limb: Vec<BigUint>,
+  poly_fq: Vec<B::Scalar>,
+  int_v_prime: BigInt,
+  reduction_round_polys: Vec<Vec<BigUint>>,
+  chain_states: Vec<ChainProverState<B::Scalar>>,
+  ab_chunk_polys: Vec<Vec<B::Scalar>>,
+  ab_blinds: Vec<B::Blind>,
+  ab_comms: Vec<B::Comm>,
+  ab_open_aux: Vec<B::Data>,
+}
+
+fn prove_one_poly_phase1<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
@@ -2234,7 +2258,7 @@ fn prove_one_poly<
   poly: &[BigUint],
   point: &[crate::dyn_prime::DynPrime<2>],
   eval: &BigUint,
-) -> Result<PerPolyProver<B>, SpartanError> {
+) -> Result<ChainPhase1<B>, SpartanError> {
   let monty = point
     .first()
     .map(|p| *p.params())
@@ -2522,6 +2546,57 @@ fn prove_one_poly<
   info!(elapsed_ms = %ab_t.elapsed().as_millis(), "imod_pcs_ab_commit");
   info!(elapsed_ms = %p1_t.elapsed().as_millis(), "imod_pcs_chain_phase1");
 
+  Ok(ChainPhase1 {
+    num_vars,
+    with_iter,
+    t_layers,
+    log_spad,
+    log_bound_a,
+    log_bound_b,
+    f_limb,
+    poly_fq,
+    int_v_prime,
+    reduction_round_polys,
+    chain_states,
+    ab_chunk_polys,
+    ab_blinds,
+    ab_comms,
+    ab_open_aux,
+  })
+}
+
+/// Phase 2: squeeze the gammas and build every evaluation claim from
+/// the phase-1 state. Consumes the state; returns the assembled
+/// [`PerPolyProver`].
+fn prove_one_poly_phase2<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  params: &IntEvalParams,
+  transcript: &mut Keccak256Transcript<ME>,
+  ph1: ChainPhase1<B>,
+) -> Result<PerPolyProver<B>, SpartanError> {
+  let ChainPhase1 {
+    num_vars,
+    with_iter,
+    t_layers,
+    log_spad,
+    log_bound_a,
+    log_bound_b,
+    f_limb,
+    poly_fq,
+    int_v_prime,
+    reduction_round_polys,
+    chain_states,
+    ab_chunk_polys,
+    ab_blinds,
+    ab_comms,
+    ab_open_aux,
+  } = ph1;
+
   // Sample γ ∈ F^{n-k} after all phase-1 commits are absorbed.
   let gamma_fq: Vec<B::Scalar> = if with_iter {
     (0..(num_vars - params.k))
@@ -2654,6 +2729,26 @@ fn prove_one_poly<
     ab_claims,
     t_layers,
   })
+}
+
+/// Single-polynomial open: phase 1 then phase 2 back to back (the
+/// transcript order matches the pre-split protocol for one poly).
+fn prove_one_poly<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  params: &IntEvalParams,
+  backend_ck: &B::Ck,
+  transcript: &mut Keccak256Transcript<ME>,
+  poly: &[BigUint],
+  point: &[crate::dyn_prime::DynPrime<2>],
+  eval: &BigUint,
+) -> Result<PerPolyProver<B>, SpartanError> {
+  let ph1 = prove_one_poly_phase1::<B, ME>(params, backend_ck, transcript, poly, point, eval)?;
+  prove_one_poly_phase2::<B, ME>(params, transcript, ph1)
 }
 
 /// Shared finish of a (batched) Mod-PCS open: ONE LogUp-GKR range check
