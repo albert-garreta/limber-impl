@@ -170,6 +170,28 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
   }
 }
 
+impl IntModSpartanModpSNARK<crate::provider::M127DynPrimeBdEngine> {
+  /// Small-field (F127/Brakedown) analog of `setup_with_params`. The
+  /// params should come from `IntEvalParams::derive_for_q(127, ...)`.
+  pub fn setup_with_params(
+    shape: IntModR1CSShapeModp<crate::provider::M127DynPrimeBdEngine>,
+    params: crate::provider::pcs::integer_modpcs::IntEvalParams,
+  ) -> Result<
+    (
+      IntModSpartanModpProverKey<crate::provider::M127DynPrimeBdEngine>,
+      IntModSpartanModpVerifierKey<crate::provider::M127DynPrimeBdEngine>,
+    ),
+    SpartanError,
+  > {
+    let n = shape.num_vars.max(shape.num_cons);
+    let num_vars = n.max(1).ilog2() as usize + if n.is_power_of_two() { 0 } else { 1 };
+    params.validate(num_vars)?;
+    let ck = crate::provider::pcs::integer_modpcs::BdModCommitmentKey::new(params.clone());
+    let vk = crate::provider::pcs::integer_modpcs::BdModVerifierKey::new(params);
+    Ok(Self::assemble_keys(shape, ck, vk))
+  }
+}
+
 impl<M> IntModSpartanModpSNARK<M>
 where
   M: ModEngine<TE = Keccak256Transcript<M>>,
@@ -714,6 +736,45 @@ mod tests {
 
     // Tampering the witness commitment (a Merkle root byte) must break
     // verification via the transcript binding.
+    let mut bad_u = U.clone();
+    bad_u.comm_w.root[0] ^= 1;
+    assert!(proof.verify(&vk, &bad_u).is_err());
+  }
+
+  /// THE small-field smoke test: the same toy circuit proved and
+  /// verified entirely over F127 (mod 2^127 − 1) with Brakedown
+  /// commitments — no 256-bit field, no curve, anywhere in the flow.
+  /// Parameters derived at log_q = 127 under the accepted
+  /// challenge-soundness target.
+  #[test]
+  fn imod_modp_m127_toy_roundtrip() {
+    type SE = crate::provider::M127DynPrimeBdEngine;
+    let num_cons = 2usize;
+    let num_vars = 4usize;
+    let one = BigUint::from(1u32);
+    let zero = BigUint::from(0u32);
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one)];
+    let mods = vec![BigUint::from(14u64), zero.clone()];
+    let shape =
+      IntModR1CSShapeModp::<SE>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods).unwrap();
+    let w = vec![
+      BigUint::from(3u64),
+      BigUint::from(5u64),
+      BigUint::from(1u64),
+      zero.clone(),
+    ];
+    let q = vec![BigUint::from(1u64), zero];
+    let params =
+      crate::provider::pcs::integer_modpcs::IntEvalParams::derive_for_q(127, 16, 16, 2, 2).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<SE>::setup_with_params(shape.clone(), params).unwrap();
+    let (W, U) = IntModR1CSWitnessModp::<SE>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &U, &W).unwrap();
+    let proof = IntModSpartanModpSNARK::<SE>::prove(&pk, &U, &W).unwrap();
+    proof.verify(&vk, &U).unwrap();
+
+    // Same Merkle-root tamper check as the t256 Brakedown test.
     let mut bad_u = U.clone();
     bad_u.comm_w.root[0] ^= 1;
     assert!(proof.verify(&vk, &bad_u).is_err());

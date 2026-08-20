@@ -156,6 +156,47 @@ impl ModEngine for T256DynPrimeBdEngine {
   }
 }
 
+/// Curve-free q-side engine of the small-field instantiation: `F127`
+/// scalars (mod 2^127 − 1) with the Keccak transcript. Exists so the
+/// Brakedown backend and the GKR/sumcheck sub-protocols — generic over
+/// `SumcheckEngine` — can name the (field, transcript) pair without a
+/// curve anywhere.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct F127Engine;
+
+impl SumcheckEngine for F127Engine {
+  type Scalar = f127::F127;
+  type TE = Keccak256Transcript<Self>;
+}
+
+/// The small-field instantiation: identical p-side (DynPrime<2> prime
+/// sampling) to the t256 engines, with the Mod-PCS committing over
+/// F127 through Brakedown. Hash-based only — no curve exists at this
+/// field size — and non-hiding, like [`T256DynPrimeBdEngine`].
+/// Parameters come from `IntEvalParams::derive_for_q(127, ...)` under
+/// the accepted `LAMBDA_BOUND2` challenge-soundness target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct M127DynPrimeBdEngine;
+
+impl SumcheckEngine for M127DynPrimeBdEngine {
+  type Scalar = DynPrime<2>;
+  type TE = Keccak256Transcript<Self>;
+}
+
+impl ModEngine for M127DynPrimeBdEngine {
+  type ModPCS = crate::provider::pcs::integer_modpcs::IntegerModPCSBd<F127Engine>;
+
+  fn bootstrap_params() -> crypto_bigint::modular::FixedMontyParams<2> {
+    <T256DynPrimeEngine as ModEngine>::bootstrap_params()
+  }
+
+  fn sample_params<T: crate::traits::transcript::ByteTranscript>(
+    transcript: &mut T,
+  ) -> crypto_bigint::modular::FixedMontyParams<2> {
+    <T256DynPrimeEngine as ModEngine>::sample_params(transcript)
+  }
+}
+
 impl ModEngine for T256DynPrimeEngine {
   // Phase-3 step B: sound IntegerModPCS (small-prime fingerprinting +
   // Hyrax-T256 underneath).
