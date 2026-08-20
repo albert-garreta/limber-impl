@@ -1338,3 +1338,29 @@ Remaining plan:
    LOG_Q moves from a module const to a B::Scalar-derived value
    (params-driven), and the derive()/validate() formulas take it as
    input.
+
+## Phase-1 function genericization COMPLETE (2026-08-19)
+
+Zero pinned protocol functions remain in integer_modpcs.rs; the only
+t256 binding left is HyBackend's own `type Scalar` declaration.
+Nine green commits, each gated (tests/clippy/fmt/typos). Structure:
+CommitBackend carries `type Scalar` + `type SE: SumcheckEngine`;
+logup_gkr and sumcheck.rs are SumcheckEngine-bound (zk methods split
+into an Engine impl); all protocol structs parameterized (t256
+defaults so callers didn't churn); transcripts byte-level or B::SE::TE.
+
+Remaining for a full field swap:
+1. **LOG_Q -> field-derived.** Still a module const (=256) used by
+   derive()/validate() and the chain bounds; should become a
+   B::Scalar-derived value (field_q::<F>().bits()) threaded through
+   IntEvalParams.
+2. **MontgomeryLimbs is 4-limb-hardcoded** ([u64; 4]); the sumcheck
+   hot kernels require it (explicit where-clauses). An M127/F127 field
+   needs the trait generalized over limb count or a padded 4-limb impl
+   (correct but wasteful; generalizing is the right fix and also
+   speeds the 2-limb field's delayed reduction).
+3. **Driver level**: imod_spartan_modp.rs still names t256 engines
+   (~13 sites) - the top-level SNARK types, not protocol internals.
+4. Then: F127 SumcheckField/TranscriptRepr/PrimeFieldExt impls + a
+   curve-free SE struct + a Brakedown backend declaration at
+   Scalar = F127 = the end-to-end smoke test.
