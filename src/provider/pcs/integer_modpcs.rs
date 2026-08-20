@@ -1785,10 +1785,19 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // Per polynomial: reduction sumcheck + chains, advancing the shared
     // transcript in index order. The expensive range check and inner-
     // product opening are then run ONCE over every polynomial's batches.
-    let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
+    // Two-phase schedule: every polynomial's reduction + chain COMMITS
+    // land on the transcript before ANY checking challenge (gammas) is
+    // squeezed — the batching-friendly ordering (see followups doc).
+    let mut ph1s: Vec<ChainPhase1<HyBackend>> = Vec::with_capacity(n);
     for i in 0..n {
-      states.push(prove_one_poly::<HyBackend, T256DynPrimeEngine>(
+      ph1s.push(prove_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
         &ck.params, ck, transcript, polys[i], points[i], evals[i],
+      )?);
+    }
+    let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
+    for ph1 in ph1s {
+      states.push(prove_one_poly_phase2::<HyBackend, T256DynPrimeEngine>(
+        &ck.params, transcript, ph1,
       )?);
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
@@ -1864,10 +1873,10 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     if comms.len() != n || points.len() != n || evals.len() != n {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
+    let mut vph1s: Vec<VerifyPhase1> = Vec::with_capacity(n);
     for i in 0..n {
       let pp = &arg.per_poly[i];
-      vs.push(verify_one_poly::<HyBackend, T256DynPrimeEngine>(
+      vph1s.push(verify_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
         &vk.params,
         transcript,
         points[i],
@@ -1876,6 +1885,17 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
         &pp.int_v_prime,
         &pp.chains,
         &pp.ab_comms,
+      )?);
+    }
+    let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
+    for (i, ph1) in vph1s.into_iter().enumerate() {
+      let pp = &arg.per_poly[i];
+      vs.push(verify_one_poly_phase2::<HyBackend, T256DynPrimeEngine>(
+        &vk.params,
+        transcript,
+        &pp.chains,
+        &pp.int_v_prime,
+        ph1,
       )?);
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
@@ -2067,15 +2087,23 @@ where
         reason: "IntegerModPCSBd::prove_batch: empty or mismatched inputs".to_string(),
       });
     }
-    let mut states: Vec<PerPolyProver<BdBackend<SE>>> = Vec::with_capacity(n);
+    // Two-phase schedule (see the Hyrax impl / followups doc): all
+    // commits before all checking challenges.
+    let mut ph1s: Vec<ChainPhase1<BdBackend<SE>>> = Vec::with_capacity(n);
     for i in 0..n {
-      states.push(prove_one_poly::<BdBackend<SE>, ME>(
+      ph1s.push(prove_one_poly_phase1::<BdBackend<SE>, ME>(
         &ck.params,
         &(),
         transcript,
         polys[i],
         points[i],
         evals[i],
+      )?);
+    }
+    let mut states: Vec<PerPolyProver<BdBackend<SE>>> = Vec::with_capacity(n);
+    for ph1 in ph1s {
+      states.push(prove_one_poly_phase2::<BdBackend<SE>, ME>(
+        &ck.params, transcript, ph1,
       )?);
     }
     let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
@@ -2150,10 +2178,10 @@ where
     if comms.len() != n || points.len() != n || evals.len() != n {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    let mut vs: Vec<PerPolyVerifier<SE::Scalar>> = Vec::with_capacity(n);
+    let mut vph1s: Vec<VerifyPhase1> = Vec::with_capacity(n);
     for i in 0..n {
       let pp = &arg.per_poly[i];
-      vs.push(verify_one_poly::<BdBackend<SE>, ME>(
+      vph1s.push(verify_one_poly_phase1::<BdBackend<SE>, ME>(
         &vk.params,
         transcript,
         points[i],
@@ -2162,6 +2190,17 @@ where
         &pp.int_v_prime,
         &pp.chains,
         &pp.ab_comms,
+      )?);
+    }
+    let mut vs: Vec<PerPolyVerifier<SE::Scalar>> = Vec::with_capacity(n);
+    for (i, ph1) in vph1s.into_iter().enumerate() {
+      let pp = &arg.per_poly[i];
+      vs.push(verify_one_poly_phase2::<BdBackend<SE>, ME>(
+        &vk.params,
+        transcript,
+        &pp.chains,
+        &pp.int_v_prime,
+        ph1,
       )?);
     }
     let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
