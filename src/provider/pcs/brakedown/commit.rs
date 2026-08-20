@@ -74,9 +74,18 @@ pub struct BrakedownCommitData<F> {
 /// Serialize a column (the field elements at one column index) to bytes. Shared
 /// by `commit` (building leaves) and the verifier (recomputing a leaf).
 pub(crate) fn column_to_bytes<F: PrimeField>(col: &[F]) -> Vec<u8> {
-  let mut buf = Vec::with_capacity(col.len() * 32);
+  // Canonical length-prefixed encoding: each entry is `len (1 byte) ||
+  // minimal little-endian bytes` (trailing zeros dropped). Injective on
+  // sequences, so the Merkle binding is unaffected; hashed bytes drop
+  // ~2x on committed chunk data (systematic entries are <= 16-bit,
+  // zeros are 1 byte) while full-width parity entries pay +1 byte.
+  let mut buf = Vec::with_capacity(col.len() * 8);
   for x in col {
-    buf.extend_from_slice(x.to_repr().as_ref());
+    let repr = x.to_repr();
+    let bytes = repr.as_ref();
+    let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    buf.push(len as u8);
+    buf.extend_from_slice(&bytes[..len]);
   }
   buf
 }

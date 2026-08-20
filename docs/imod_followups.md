@@ -1516,3 +1516,26 @@ layers, verifier barycentric + proof-format change, differential
 tests, tune ell in {3,4,5}). Payoff estimate at current numbers:
 range-check GKR 389 ms -> ~260-300 ms, hash-mode total ~1.42 ->
 ~1.30-1.35 s.
+
+## Prover race vs curve mode: 80 ms short; uniskip is the closer (2026-08-20)
+
+Median-of-5 same-state one-shots: hash mode 1.429 s (tight:
+1.425-1.442) vs curve mode 1.35 s. Landed today: compact
+length-prefixed leaf serialization (hash 57 -> 41 ms per big poly;
+floor is per-leaf blake3 overhead at 107k tiny leaves, not bytes;
+transcript bytes change benignly). Remaining lever: the GKR
+univariate skip (301 ms range-check GKR, primitive validated at
+3.60x throughput).
+
+Design note for the skip in the CURRENT (post gamma-RLC lockstep)
+GKR: the zero-block layout makes ALL range-check trees depth 16
+(2^16-leaf blocks + the 2^16 table tree), so every tree reaches its
+leaf layer at the SAME lockstep layer - the skip round synchronizes
+across trees and gamma-RLC combines the per-tree evaluation-form
+skip polynomials exactly like normal rounds. Leaf data is
+small-value structured for every tree (witness trees: r + w with
+w < 2^16, ones-numerators elided; table tree: r + j index-affine,
+multiplicity counts). Skip ell in {3,4,5} of the 16 leaf rounds,
+proof grows ~3*2^ell*32 B per layer (KB-scale). Projected: GKR
+301 -> ~200-230 ms, total ~1.30-1.33 s vs curve 1.35 - clearing the
+bar narrowly; combined with remaining opening trims, margin grows.
