@@ -84,6 +84,11 @@ type Hyrax = HyraxPCS<T256HyraxEngine>;
 /// from §4.4 — Final Eval, Partial Eval Norm, Soundness 1, Soundness 2.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IntEvalParams {
+  /// Bit-width of the q-side field's characteristic these parameters
+  /// were derived for. `LOG_Q` (=256, t256) via the plain
+  /// constructors; other fields use [`IntEvalParams::derive_for_q`].
+  /// Every norm/soundness bound checks against this value.
+  pub log_q: usize,
   /// Per-iteration variables consumed during partial evaluation.
   pub k: usize,
   /// Bit-width upper bound on the random small primes `p_i ∈ [P/2, P]`.
@@ -132,6 +137,18 @@ impl IntEvalParams {
     k: usize,
     num_vars: usize,
   ) -> Result<Self, SpartanError> {
+    Self::derive_for_q(LOG_Q, log_t_f, log_t, k, num_vars)
+  }
+
+  /// [`IntEvalParams::derive`] for an arbitrary field-characteristic
+  /// width (the norm/soundness bounds all scale with `log_q`).
+  pub fn derive_for_q(
+    log_q: usize,
+    log_t_f: usize,
+    log_t: usize,
+    k: usize,
+    num_vars: usize,
+  ) -> Result<Self, SpartanError> {
     let nl_pre = numlimb(log_t_f, log_t);
     let nlv_pre = numlimb_var(nl_pre);
     let num_vars_total = num_vars + nlv_pre;
@@ -139,9 +156,9 @@ impl IntEvalParams {
     // Find max log_p satisfying Partial Evaluation Norm Bound:
     //   k + k·log_p + max(log_t, log_p) < log_q   (uses limb bound T)
     let mut log_p = 0usize;
-    for lp in 1..LOG_Q {
+    for lp in 1..log_q {
       let partial = k + k * lp + log_t.max(lp);
-      if partial < LOG_Q {
+      if partial < log_q {
         log_p = lp;
       } else {
         break;
@@ -151,7 +168,7 @@ impl IntEvalParams {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
           "IntEvalParams::derive: no log P > 1 satisfies Partial Eval Norm \
-           for k={k}, log T={log_t}, log q={LOG_Q}"
+           for k={k}, log T={log_t}, log q={log_q}"
         ),
       });
     }
@@ -177,6 +194,7 @@ impl IntEvalParams {
 
     let nl = numlimb(log_t_f, log_t);
     let p = Self {
+      log_q,
       k,
       log_p,
       s,
@@ -212,6 +230,7 @@ impl IntEvalParams {
   ) -> Result<Self, SpartanError> {
     let nl = numlimb(log_t_f, log_t);
     let p = Self {
+      log_q: LOG_Q,
       k,
       log_p,
       s,
@@ -259,11 +278,11 @@ impl IntEvalParams {
     // Final Evaluation Bound: 2^k * P^(k+1) < q
     //   log: k + (k+1)·log_p < log_q
     let final_eval_lhs = self.k + (self.k + 1) * self.log_p;
-    if final_eval_lhs >= LOG_Q {
+    if final_eval_lhs >= self.log_q {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
           "IntEval Final Evaluation Bound violated: k + (k+1)·log_p = {} >= log_q = {}",
-          final_eval_lhs, LOG_Q
+          final_eval_lhs, self.log_q
         ),
       });
     }
@@ -273,11 +292,11 @@ impl IntEvalParams {
     // Uses `log_t` (the *limb* bound), not `log_t_f`, since IntEval
     // operates on the (possibly limb-split) polynomial.
     let partial_norm_lhs = self.k + self.k * self.log_p + self.log_t.max(self.log_p);
-    if partial_norm_lhs >= LOG_Q {
+    if partial_norm_lhs >= self.log_q {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
           "IntEval Partial Evaluation Norm Bound violated: k + k·log_p + max(log_B, log_p) = {} >= log_q = {}",
-          partial_norm_lhs, LOG_Q
+          partial_norm_lhs, self.log_q
         ),
       });
     }
@@ -311,11 +330,11 @@ impl IntEvalParams {
     //   log: log(s·n) - log_q <= -target
     //   <=>  log_q >= target + log(s·n)
     let log_sn = ceil_log2((self.s * num_vars).max(1));
-    if LOG_Q < LAMBDA_BOUND2 + log_sn {
+    if self.log_q < LAMBDA_BOUND2 + log_sn {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
           "IntEval Soundness Bound 2 violated: log_q = {} < target + log(s·n) = {}",
-          LOG_Q,
+          self.log_q,
           LAMBDA_BOUND2 + log_sn
         ),
       });
@@ -358,7 +377,7 @@ impl IntEvalParams {
     // Iteration layers (none when n_tot <= k).
     let t_layers = n_tot.saturating_sub(self.k).div_ceil(self.k);
     let ab_chunks = ((self.log_p + 1).div_ceil(CHUNK_BITS)
-      + (LOG_Q - self.log_p + 1).div_ceil(CHUNK_BITS)) as f64;
+      + (self.log_q - self.log_p + 1).div_ceil(CHUNK_BITS)) as f64;
     let words = (self.k * (self.log_p + 1) + self.log_t).div_ceil(64) as f64;
     for j in 1..=t_layers {
       let m = two(n_tot - j * self.k);
@@ -2446,7 +2465,7 @@ fn prove_one_poly<
   let s_pad = params.s.next_power_of_two();
   let log_spad = s_pad.trailing_zeros() as usize;
   let log_bound_a = params.log_p + 1;
-  let log_bound_b = LOG_Q - params.log_p + 1;
+  let log_bound_b = params.log_q - params.log_p + 1;
   // Per layer and role, the committed oracle is the 16-bit CHUNK
   // decomposition of the shifted values in the shared range-check
   // layout (`index = (chain·m + x)·stride + c`, chains padded to
@@ -2648,7 +2667,7 @@ fn finish_batch_open<
   blinds: &[&B::Blind],
 ) -> Result<(SharedRangeCheck<B>, CombinedBatchOpen<B>), SpartanError> {
   let log_bound_a = params.log_p + 1;
-  let log_bound_b = LOG_Q - params.log_p + 1;
+  let log_bound_b = params.log_q - params.log_p + 1;
 
   // ONE shared LogUp-GKR range check across every polynomial's batches.
   // Each poly's F batch is PRECOMMITTED: the input commitment already
@@ -2963,7 +2982,7 @@ fn verify_one_poly<
   let shift_b_fq = biguint_to_scalar::<B::Scalar>(&shift_b(params));
 
   let log_bound_a = params.log_p + 1;
-  let log_bound_b = LOG_Q - params.log_p + 1;
+  let log_bound_b = params.log_q - params.log_p + 1;
   let (fold_a, alpha_a) =
     chunk_fold_point::<B::Scalar>(chunk_stride(log_bound_a).trailing_zeros() as usize);
   let (fold_b, alpha_b) =
@@ -3097,7 +3116,7 @@ fn finish_batch_verify<
   combined_open: &CombinedBatchOpen<B>,
 ) -> Result<(), SpartanError> {
   let log_bound_a = params.log_p + 1;
-  let log_bound_b = LOG_Q - params.log_p + 1;
+  let log_bound_b = params.log_q - params.log_p + 1;
 
   let (_vrc_span, vrc_t) = start_span!("imod_pcs_verify_rc");
   let mut rc_metas: Vec<RangeBatchMeta<'_, B>> = Vec::new();
@@ -4898,6 +4917,7 @@ mod tests {
   #[test]
   fn validate_rejects_bad_numlimb() {
     let bad = IntEvalParams {
+      log_q: LOG_Q,
       k: 7,
       log_p: 27,
       s: 10,
@@ -5246,6 +5266,7 @@ mod tests {
 
     // Bad params: zero `s` makes soundness_1 fail trivially.
     let bad = IntEvalParams {
+      log_q: LOG_Q,
       k: 7,
       log_p: 20,
       s: 0,
