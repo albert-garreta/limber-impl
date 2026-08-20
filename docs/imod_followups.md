@@ -1480,3 +1480,23 @@ Tree membership then:
 
 Note: the reduction sumcheck's rounds sit before prime sampling and
 involve no commitments — unaffected by the restructure.
+
+## Hash-mode prover at curve-mode parity (2026-08-20)
+
+Two optimizations on the q=256 Brakedown mode, both measured on
+MultiSwap 2^13 single-thread:
+1. Input-sparsity guard in the encoder (mul_vec skips zero inputs):
+   wq_commit 916 -> 581 ms.
+2. Code-spec + k sweep on guarded code (BDSPEC/BDK knobs): k=11
+   dominates k=9 everywhere; spec1 (beta=.0444, R=1.47) is the
+   prover-time optimum. New defaults: spec1 + k=11.
+
+Frontier (spec/k=11): spec1 1.35s/142ms/28.0MB; spec2 1.42/145/24.9;
+spec3 1.43/141/22.5; spec5 1.58/162/20.0. Chosen point 1.41s
+measured post-default (run variance ~4%).
+
+Scoreboard: hash mode 1.41 s prove / 151 ms verify / 28 MB — prover
+at PARITY with the curve mode (1.32 s), 1.5x ahead of Zinc+ (2.06 s)
+with 3.4x their verify. Remaining prover levers: GKR uniskip (389 ms
+range check), opening machinery (~290 ms). Proof-size ladder
+unchanged (batching ~-30%, packing for the big cut).

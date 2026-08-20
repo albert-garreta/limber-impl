@@ -717,8 +717,12 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let dims = Dims::multiswap(0);
     let (shape, w, q) = multiswap_shape_and_witness_for::<BE>(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
+    let bdk: usize = std::env::var("BDK")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(11); // k=11 dominates k=9 across the sweep for the hash backend
     let params =
-      IntEvalParams::derive(2048, LOG_T, DEFAULT_K, log_n).expect("IntEval params satisfy bounds");
+      IntEvalParams::derive(2048, LOG_T, bdk, log_n).expect("IntEval params satisfy bounds");
     let (pk, vk) = IntModSpartanModpSNARK::<BE>::setup_with_params(shape.clone(), params).unwrap();
     // Pre-warm the per-length code layouts (deterministic public
     // matrices; conceptually part of setup, not of commit).

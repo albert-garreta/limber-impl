@@ -59,12 +59,19 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
   if let Some(p) = guard.get(&key) {
     return p.downcast_ref::<BrakedownParams<F>>().expect("cache type");
   }
-  let params: &'static BrakedownParams<F> = Box::leak(Box::new(BrakedownParams::new(
-    n,
-    crate::provider::pcs::brakedown::DEFAULT_SPEC,
-    BD_LAMBDA,
-    BD_SEED,
-  )));
+  // BDSPEC=<0..5> overrides the code spec (benching knob; prover and
+  // verifier share the process, so layouts agree).
+  let spec = std::env::var("BDSPEC")
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    .map(|i| crate::provider::pcs::brakedown::SPECS[i])
+    // Default for the Mod-PCS backend: spec1 (beta=0.0444, R=1.47) — the
+    // prover-time optimum of the 2026-08-20 sweep (1.35 s vs 1.58 s at
+    // spec5/k=11 on MultiSwap 2^13), trading ~8 MB of proof for ~15%
+    // prover and best-tier verify. See docs/imod_followups.md.
+    .unwrap_or(crate::provider::pcs::brakedown::SPECS[1]);
+  let params: &'static BrakedownParams<F> =
+    Box::leak(Box::new(BrakedownParams::new(n, spec, BD_LAMBDA, BD_SEED)));
   guard.insert(key, params as &'static (dyn Any + Send + Sync));
   params
 }
