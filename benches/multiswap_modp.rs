@@ -751,6 +751,41 @@ fn multiswap_modp_benches(c: &mut Criterion) {
   // the dynamic-prime side (outer/inner sumcheck round polynomials and
   // claimed evals, ~1.2 KB at 2^13) is not yet `Serialize` and is
   // reported analytically alongside.
+  // M127=1: the small-field instantiation (F127 + Brakedown) on the
+  // standard workload — first honest numbers for the fast-prover
+  // operating point. Unoptimized: eager delayed-reduction, per-target
+  // Brakedown openings (no two-tree batching yet).
+  if std::env::var_os("M127").is_some() {
+    use std::time::Instant;
+    type SFE = limber::provider::M127DynPrimeBdEngine;
+    let dims = Dims::multiswap(0);
+    let (shape, w, q) = multiswap_shape_and_witness_for::<SFE>(dims);
+    let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
+    // q = 127; 16-bit limbs (= chunks); k = 5 per the parameter grid.
+    let params =
+      IntEvalParams::derive_for_q(127, 2048, 16, 5, log_n).expect("M127 params satisfy bounds");
+    println!(
+      "M127 params: log_p={} s={} k={} numlimb={}",
+      params.log_p, params.s, params.k, params.numlimb
+    );
+    let (pk, vk) = IntModSpartanModpSNARK::<SFE>::setup_with_params(shape.clone(), params).unwrap();
+    let t0 = Instant::now();
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<SFE>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let proof = IntModSpartanModpSNARK::<SFE>::prove(&pk, &instance, &witness).unwrap();
+    let t_prove = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
+    proof.verify(&vk, &instance).unwrap();
+    let t_verify = t1.elapsed().as_secs_f64() * 1e3;
+    let (pp, rc, co) = proof.eval_arg_component_sizes();
+    println!(
+      "MultiSwap 2^13 / M127-Brakedown: commit+prove {t_prove:.2} s, verify {t_verify:.1} ms, \
+       eval_arg {:.2} MB [per_poly {pp} B, range_check {rc} B, combined_open {co} B]",
+      (pp + rc + co) as f64 / 1e6,
+    );
+    return;
+  }
+
   if std::env::var_os("PSIZE").is_some() {
     use std::time::Instant;
     let dims = Dims::multiswap(0);

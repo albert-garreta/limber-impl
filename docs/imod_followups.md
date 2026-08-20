@@ -1391,3 +1391,30 @@ pattern:
    over the M127 stack. Fat proofs, unoptimized — validates the
    pipeline; perf work (2-limb delayed reduction, two-tree opening)
    comes after.
+
+## M127 first real-scale run: chain-bound slack bug found (2026-08-20)
+
+The M127/Brakedown MultiSwap one-shot (M127=1 bench block; params
+derive_for_q(127, 2048, 16, k=5, 13) -> log_p=20 s=16) fails in the
+range check: "witness 216 value 126975 >= 2^16" — a b-side chain
+value's chunk spilled the 16-bit table. Setup, witness commit, and
+the chain build all ran; the failure is a NORM-BOUND issue, not
+plumbing: `log_bound_b = log_q - log_p + 1` (integer_modpcs, two
+sites, no derivation comment) under-budgets the b-side chain values.
+Back-derivation from the spilled chunk puts the real magnitude near
+2^112-113 vs the formula's 2^107 budget at these params — consistent
+with a missing k-dependent term (2^k interpolation-sum factor in the
+chain identity). At q=256 the ~130 bits of slack masked this
+entirely; the toy M127 smoke test passed because its values are tiny.
+
+Next steps (in order):
+1. Instrument: log max |b_j_shifted| bit-length per layer in a q=127
+   run to measure the true bound empirically.
+2. Re-derive log_bound_b from the paper's Partial Evaluation analysis
+   for general (q, p, k); fix the formula; check whether the q=256
+   configuration's stated bounds also need the correction on paper
+   even though padding absorbed it in practice.
+3. Re-run the M127 MultiSwap one-shot.
+
+The toy roundtrip (imod_modp_m127_toy_roundtrip) stays green; this is
+exactly the class of bug the real-scale smoke run exists to catch.

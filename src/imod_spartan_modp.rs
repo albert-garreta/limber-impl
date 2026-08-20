@@ -171,6 +171,12 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
 }
 
 impl IntModSpartanModpSNARK<crate::provider::M127DynPrimeBdEngine> {
+  /// Per-component serialized sizes of the batch evaluation argument
+  /// (proof-size accounting, mirrors the t256 accessor).
+  pub fn eval_arg_component_sizes(&self) -> (usize, usize, usize) {
+    self.eval_arg.component_sizes()
+  }
+
   /// Small-field (F127/Brakedown) analog of `setup_with_params`. The
   /// params should come from `IntEvalParams::derive_for_q(127, ...)`.
   pub fn setup_with_params(
