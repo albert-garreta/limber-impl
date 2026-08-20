@@ -745,6 +745,11 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let t2 = Instant::now();
     proof.verify(&vk, &instance).unwrap();
     let t_verify = t2.elapsed().as_secs_f64() * 1e3;
+    if let Some(path) = std::env::var_os("BDDUMP") {
+      let bytes = bincode::serialize(proof.eval_arg_ref()).unwrap();
+      std::fs::write(&path, &bytes).unwrap();
+      println!("  dumped eval_arg ({} bytes) to {:?}", bytes.len(), path);
+    }
     if std::env::var_os("BDANATOMY").is_some() {
       for (t, a) in proof.bd_open_args().iter().enumerate() {
         let (wp, we, cols, auth) = a.component_sizes();

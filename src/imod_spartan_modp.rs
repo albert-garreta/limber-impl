@@ -150,6 +150,15 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
 }
 
 impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
+  /// The full batch evaluation argument, for serialization accounting.
+  pub fn eval_arg_ref(
+    &self,
+  ) -> &crate::provider::pcs::integer_modpcs::IntEvalBatchArgument<
+    crate::provider::pcs::commit_backend::BdBackend,
+  > {
+    &self.eval_arg
+  }
+
   /// The flat list of per-target Brakedown opening arguments, for
   /// proof-size anatomy accounting.
   pub fn bd_open_args(
