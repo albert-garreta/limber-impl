@@ -741,6 +741,12 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let t2 = Instant::now();
     proof.verify(&vk, &instance).unwrap();
     let t_verify = t2.elapsed().as_secs_f64() * 1e3;
+    if std::env::var_os("BDANATOMY").is_some() {
+      for (t, a) in proof.bd_open_args().iter().enumerate() {
+        let (wp, we, cols, auth) = a.component_sizes();
+        println!("  target {t}: w_prox {wp} B, w_eval {we} B, columns {cols} B, auth {auth} B");
+      }
+    }
     println!(
       "MultiSwap 2^13 / Brakedown Mod-PCS: commit {t_commit:.1} ms, prove {t_prove:.1} ms, \
        total {:.1} ms, verify {t_verify:.1} ms, proof {} bytes ({:.2} MB)",

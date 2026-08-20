@@ -39,6 +39,19 @@ pub struct BrakedownEvalArg<F> {
   auth: Vec<Hash>,
 }
 
+impl<F: serde::Serialize> BrakedownEvalArg<F> {
+  /// Serialized size of each component, for proof-size accounting:
+  /// `(w_prox, w_eval, columns, auth)` in bytes.
+  pub fn component_sizes(&self) -> (usize, usize, usize, usize) {
+    (
+      bincode::serialized_size(&self.w_prox).unwrap_or(0) as usize,
+      bincode::serialized_size(&self.w_eval).unwrap_or(0) as usize,
+      bincode::serialized_size(&self.columns).unwrap_or(0) as usize,
+      bincode::serialized_size(&self.auth).unwrap_or(0) as usize,
+    )
+  }
+}
+
 /// eq-polynomial evaluations over `r`, high-bit-first: `out[k] = ∏_b (k_b?
 /// r_b : 1-r_b)` with `r[0]` the most-significant index bit. Factorizes as
 /// `eq(r_hi||r_lo)[i·2^|lo| + j] = eq(r_hi)[i]·eq(r_lo)[j]`.

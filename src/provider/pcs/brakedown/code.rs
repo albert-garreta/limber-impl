@@ -156,6 +156,13 @@ impl<F: PrimeFieldExt> SparseMat<F> {
     let mut y = vec![F::ZERO; self.cols];
     for (i, row) in self.rows.iter().enumerate() {
       let xi = x[i];
+      // Input-sparsity guard: zero inputs contribute nothing, and the
+      // committed data (limb/chunk polynomials of real witnesses) is
+      // mostly structural zeros — the check is ~10x cheaper than the
+      // multiply it skips.
+      if xi.is_zero_vartime() {
+        continue;
+      }
       for (c, v) in row {
         y[*c] += xi * *v;
       }

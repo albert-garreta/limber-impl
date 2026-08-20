@@ -150,6 +150,15 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
 }
 
 impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
+  /// The flat list of per-target Brakedown opening arguments, for
+  /// proof-size anatomy accounting.
+  pub fn bd_open_args(
+    &self,
+  ) -> &[crate::provider::pcs::brakedown::BrakedownEvalArg<crate::provider::pt256::t256::Scalar>]
+  {
+    &self.eval_arg.combined_open.backend
+  }
+
   /// Brakedown-engine analog of `setup_with_params`.
   pub fn setup_with_params(
     shape: IntModR1CSShapeModp<crate::provider::T256DynPrimeBdEngine>,
