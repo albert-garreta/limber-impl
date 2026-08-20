@@ -1445,3 +1445,38 @@ the WideLimbs<5> fast path pending); (c) 16-bit limbs quadruple the
 limb-slot count vs log_t=64. The range check at 374 KB (vs 89 KB on
 t256+Hyrax at coarser limbs) says the protocol core is healthy;
 the floor is real and the levers are known.
+
+## Two-tree batched opening: commit schedule VERIFIED (2026-08-20)
+
+Traced every transcript absorb/squeeze through the Bd prove path.
+Actual order per polynomial (prove_one_poly): absorb int_v' +
+reduction rounds -> sample the s primes -> compute ALL chain layers ->
+commit ab chunk polys (absorbed) -> squeeze gammas -> absorb claim
+evals. Then finish_batch_open: range sub-transcript (absorbs all
+chunk + mult comms, THEN LogUp r / zblk / zpad / rv), batch
+sub-transcript (lambdas, cbo challenges). Confirms the user's
+argument: the whole IntEval is computable and committable before ANY
+checking challenge — gammas, range, and batch challenges all come
+after, and nothing in the chain data depends on them.
+
+One restructure needed: prove_batch currently runs prove_one_poly
+per polynomial SEQUENTIALLY, so poly i+1's chain commits land after
+poly i's gammas. The dependency analysis says this interleaving is
+unnecessary; the code even anticipates the split (ChainProverState:
+"collected in phase 1, consumed in phase 2"). Hoist: all polys'
+phase-1 (reduction, primes, chain commits) first, then all gammas +
+claims. Transcript ordering changes (self-consistent, both sides).
+
+Tree membership then:
+- Tree 1 (exists already): the instance's witness/quotient Brakedown
+  commitments (could merge comm_w/comm_q into one root).
+- Tree 2 (new): ALL ab chunk polys across layers/primes/polys + the
+  range-check F chunk polys + the multiplicity table — everything the
+  open creates, committed in one stacked matrix after prime sampling.
+- Then every challenge, then the checks; opened via ~128 shared
+  columns per tree. Aspect chosen for short columns (opening size),
+  proof target ~1-1.5 MB at MultiSwap 2^13 (from 21.7 MB), verify
+  ~50-70 ms (from ~190), prove -200-400 ms.
+
+Note: the reduction sumcheck's rounds sit before prime sampling and
+involve no commitments — unaffected by the restructure.

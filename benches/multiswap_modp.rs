@@ -708,6 +708,12 @@ fn multiswap_modp_benches(c: &mut Criterion) {
   if std::env::var_os("BDPCS").is_some() {
     use limber::provider::T256DynPrimeBdEngine as BE;
     use std::time::Instant;
+    if std::env::var_os("RUST_LOG").is_some() {
+      let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    }
     let dims = Dims::multiswap(0);
     let (shape, w, q) = multiswap_shape_and_witness_for::<BE>(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
@@ -794,6 +800,12 @@ fn multiswap_modp_benches(c: &mut Criterion) {
 
   if std::env::var_os("PSIZE").is_some() {
     use std::time::Instant;
+    if std::env::var_os("RUST_LOG").is_some() {
+      let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    }
     let dims = Dims::multiswap(0);
     let (shape, w, q) = multiswap_shape_and_witness(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
