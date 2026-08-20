@@ -1364,3 +1364,30 @@ Remaining for a full field swap:
 4. Then: F127 SumcheckField/TranscriptRepr/PrimeFieldExt impls + a
    curve-free SE struct + a Brakedown backend declaration at
    Scalar = F127 = the end-to-end smoke test.
+
+## Smoke-test checklist for the M127/Brakedown stack (2026-08-20)
+
+Phase-1 plumbing is COMPLETE through this point: protocol functions
+field-generic, log_q in IntEvalParams (derive_for_q), hot-kernel
+bounds on DelayedReduction (not 4-limb MontgomeryLimbs). What remains
+is declaration work, mirroring the existing T256DynPrimeBdEngine
+pattern:
+
+1. F127 field module: ff_derive M127 + PrimeFieldExt +
+   TranscriptReprTrait + an eager DelayedReduction impl (correctness
+   first; a WideLimbs<5> 2-limb fast path later). SumcheckField
+   arrives via the blanket impl.
+2. F127Engine: 4-line SumcheckEngine (Scalar = F127, TE = Keccak).
+3. Bd127Backend: CommitBackend at Scalar = F127, SE = F127Engine —
+   copy BdBackend (~80 lines; its param/data caches are t256-typed
+   statics, so a parallel impl not a generic one).
+4. M127DynPrimeBdEngine: ModEngine mirroring T256DynPrimeBdEngine +
+   an IntegerModPCS instantiation at Bd127Backend + a driver
+   setup impl (~30 lines). CHECK: the IntegerModPCSBd struct layer
+   (BdModCommitmentKey etc.) may still be t256-typed internally.
+5. Params: derive_for_q(127, ...) — LAMBDA_BOUND2=117 already admits
+   a 127-bit field (127 >= 117 + log2(s*n) for our shapes).
+6. The smoke test: small Mod-R1CS instance, prove+verify end-to-end
+   over the M127 stack. Fat proofs, unoptimized — validates the
+   pipeline; perf work (2-limb delayed reduction, two-tree opening)
+   comes after.
