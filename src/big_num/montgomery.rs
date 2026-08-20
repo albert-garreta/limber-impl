@@ -21,6 +21,91 @@ pub trait MontgomeryLimbs: FieldReductionConstants {
   fn to_limbs(&self) -> &[u64; 4];
 }
 
+/// Multiply a Montgomery-form field element by a plain `u64`, at one
+/// Montgomery-fold cost: returns `a · b · 2^-64 (mod p)` — note the
+/// extra `2^-64` scale. Callers accumulating many such products fix
+/// the uniform scale once at the end by multiplying with
+/// `F::from_u128(1 << 64)` (the Montgomery image of `2^64`). About
+/// 8 limb-mults vs ~32 for a full field multiplication.
+///
+/// This is the scalar primitive version of what `msm_small` does
+/// internally; the GKR univariate skip accumulates with it.
+// Staged: consumed by the GKR univariate-skip prover (gkr_uniskip_plan
+// steps 2-5); until then only tests exercise it.
+#[allow(dead_code)]
+#[inline]
+pub fn mul_u64_scaled<F: MontgomeryLimbs + Copy>(a: &F, b: u64) -> F {
+  let al = a.to_limbs();
+  // t = a * b: 5 limbs.
+  let mut t = [0u64; 5];
+  let mut carry: u128 = 0;
+  for i in 0..4 {
+    let v = al[i] as u128 * b as u128 + carry;
+    t[i] = v as u64;
+    carry = v >> 64;
+  }
+  t[4] = carry as u64;
+
+  // One Montgomery fold: m = t0 * (-p^-1) mod 2^64; t += m*p; t >>= 64.
+  let m = t[0].wrapping_mul(F::MONT_INV);
+  let p = F::MODULUS;
+  let mut carry: u128 = (t[0] as u128 + m as u128 * p[0] as u128) >> 64;
+  let mut out = [0u64; 4];
+  for i in 1..4 {
+    let v = t[i] as u128 + m as u128 * p[i] as u128 + carry;
+    out[i - 1] = v as u64;
+    carry = v >> 64;
+  }
+  let v = t[4] as u128 + carry;
+  out[3] = v as u64;
+  let top = (v >> 64) as u64;
+
+  // top ∈ {0, 1}: fold it as 2^256 ≡ R_MOD, then normalize below p.
+  if top != 0 {
+    let mut carry2: u128 = 0;
+    for i in 0..4 {
+      let v = out[i] as u128 + F::R_MOD[i] as u128 + carry2;
+      out[i] = v as u64;
+      carry2 = v >> 64;
+    }
+    debug_assert_eq!(carry2, 0, "second fold cannot carry");
+  }
+  // Conditional subtractions into [0, p).
+  for _ in 0..=F::MAX_REDC_SUB_CORRECTIONS {
+    if !limbs_geq(&out, &p) {
+      break;
+    }
+    out = limbs_sub(&out, &p);
+  }
+  F::from_limbs(out)
+}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn limbs_geq(a: &[u64; 4], b: &[u64; 4]) -> bool {
+  for i in (0..4).rev() {
+    if a[i] != b[i] {
+      return a[i] > b[i];
+    }
+  }
+  true
+}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn limbs_sub(a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
+  let mut out = [0u64; 4];
+  let mut borrow = 0u64;
+  for i in 0..4 {
+    let (v, b1) = a[i].overflowing_sub(b[i]);
+    let (v, b2) = v.overflowing_sub(borrow);
+    out[i] = v;
+    borrow = u64::from(b1) + u64::from(b2);
+  }
+  debug_assert!(borrow == 0);
+  out
+}
+
 /// Montgomery REDC for 9-limb input (optimized single-fold algorithm).
 ///
 /// Reduces a 2R-scaled value (sum of field×field products) to 1R-scaled.
@@ -248,4 +333,85 @@ macro_rules! test_montgomery {
       }
     }
   };
+}
+
+#[cfg(test)]
+mod mul_u64_tests {
+  use super::*;
+  use crate::provider::pt256::t256;
+  use ff::{Field, PrimeField};
+  use rand::{Rng, SeedableRng, rngs::StdRng};
+
+  #[test]
+  fn mul_u64_scaled_matches_full_mult() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let fixup = t256::Scalar::from_u128(1u128 << 64);
+    for _ in 0..2000 {
+      let a = t256::Scalar::random(&mut rng);
+      let b: u64 = rng.r#gen();
+      let fast = mul_u64_scaled(&a, b) * fixup;
+      let slow = a * t256::Scalar::from(b);
+      assert_eq!(fast, slow);
+    }
+    // Edge cases.
+    for b in [0u64, 1, u64::MAX] {
+      let a = t256::Scalar::random(&mut rng);
+      assert_eq!(mul_u64_scaled(&a, b) * fixup, a * t256::Scalar::from(b));
+    }
+  }
+
+  /// Run: cargo test --release mul_u64_speed -- --ignored --nocapture
+  #[test]
+  #[ignore]
+  fn mul_u64_speed() {
+    use std::time::Instant;
+    let mut rng = StdRng::seed_from_u64(9);
+    let mut a = t256::Scalar::random(&mut rng);
+    let b: u64 = rng.r#gen();
+    let bf = t256::Scalar::from(b);
+    const N: usize = 10_000_000;
+    let t = Instant::now();
+    for _ in 0..N {
+      a = mul_u64_scaled(&a, b);
+    }
+    let small = t.elapsed().as_nanos() as f64 / N as f64;
+    std::hint::black_box(a);
+    let t = Instant::now();
+    for _ in 0..N {
+      a *= bf;
+    }
+    let full = t.elapsed().as_nanos() as f64 / N as f64;
+    std::hint::black_box(a);
+    println!(
+      "mul_u64_scaled {small:.2} ns  vs full mult {full:.2} ns  ({:.2}x)  [latency]",
+      full / small
+    );
+
+    // Throughput: independent slots, the accumulation-loop shape.
+    const SLOTS: usize = 1024;
+    let mut av: Vec<t256::Scalar> = (0..SLOTS).map(|_| t256::Scalar::random(&mut rng)).collect();
+    let bs: Vec<u64> = (0..SLOTS).map(|_| rng.r#gen()).collect();
+    let passes = N / SLOTS;
+    let t = Instant::now();
+    for _ in 0..passes {
+      for i in 0..SLOTS {
+        av[i] = mul_u64_scaled(&av[i], bs[i]);
+      }
+    }
+    let small_tp = t.elapsed().as_nanos() as f64 / (passes * SLOTS) as f64;
+    std::hint::black_box(&av);
+    let bfs: Vec<t256::Scalar> = bs.iter().map(|&b| t256::Scalar::from(b)).collect();
+    let t = Instant::now();
+    for _ in 0..passes {
+      for i in 0..SLOTS {
+        av[i] *= bfs[i];
+      }
+    }
+    let full_tp = t.elapsed().as_nanos() as f64 / (passes * SLOTS) as f64;
+    std::hint::black_box(&av);
+    println!(
+      "mul_u64_scaled {small_tp:.2} ns  vs full mult {full_tp:.2} ns  ({:.2}x)  [throughput]",
+      full_tp / small_tp
+    );
+  }
 }

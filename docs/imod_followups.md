@@ -1500,3 +1500,19 @@ at PARITY with the curve mode (1.32 s), 1.5x ahead of Zinc+ (2.06 s)
 with 3.4x their verify. Remaining prover levers: GKR uniskip (389 ms
 range check), opening machinery (~290 ms). Proof-size ladder
 unchanged (batching ~-30%, packing for the big cut).
+
+## GKR uniskip step 1 landed: mul_u64_scaled (2026-08-20)
+
+The prerequisite primitive from gkr_uniskip_plan.md: multiply a
+Montgomery-form element by a plain u64 at one-fold cost, returning
+a*b*2^-64 (uniform scale fixed once per accumulated sum via
+from_u128(1<<64)). Differential-tested (2000 cases + edges).
+Measured on M4 Pro, native codegen: latency 1.22x over the full
+mult (ASM full mult is too fast for a chain win) but THROUGHPUT
+3.60x (2.29 vs 8.23 ns) in the independent-slot accumulation shape
+the skip round uses - the plan's >=3x gate passes where it counts.
+Remaining: steps 2-5 (skip-round prover for witness-tree leaf
+layers, verifier barycentric + proof-format change, differential
+tests, tune ell in {3,4,5}). Payoff estimate at current numbers:
+range-check GKR 389 ms -> ~260-300 ms, hash-mode total ~1.42 ->
+~1.30-1.35 s.
