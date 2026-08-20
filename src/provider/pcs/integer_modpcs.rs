@@ -2653,7 +2653,7 @@ fn prove_one_poly<
 /// batches), then all chunk commitments in that batch order, then the
 /// shared multiplicity table.
 fn finish_batch_open<
-  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -2665,7 +2665,10 @@ fn finish_batch_open<
   states: &mut [PerPolyProver<B>],
   comms: &[&B::Comm],
   blinds: &[&B::Blind],
-) -> Result<(SharedRangeCheck<B>, CombinedBatchOpen<B>), SpartanError> {
+) -> Result<(SharedRangeCheck<B>, CombinedBatchOpen<B>), SpartanError>
+where
+  B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
+{
   let log_bound_a = params.log_p + 1;
   let log_bound_b = params.log_q - params.log_p + 1;
 
@@ -3100,7 +3103,7 @@ fn verify_one_poly<
 /// every commitment, in the same canonical order the prover used.
 #[allow(clippy::too_many_arguments)]
 fn finish_batch_verify<
-  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -3114,7 +3117,10 @@ fn finish_batch_verify<
   ab_comms_per_poly: &[&[B::Comm]],
   range_check: &SharedRangeCheck<B>,
   combined_open: &CombinedBatchOpen<B>,
-) -> Result<(), SpartanError> {
+) -> Result<(), SpartanError>
+where
+  B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
+{
   let log_bound_a = params.log_p + 1;
   let log_bound_b = params.log_q - params.log_p + 1;
 
@@ -4036,7 +4042,7 @@ struct RcVerifyClaims<F = t256::Scalar> {
 /// final chunk evaluations) are returned as CLAIMS to be discharged by
 /// the caller's batched opens — this function performs no Hyrax opens.
 fn prove_shared_range_check<
-  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -4045,7 +4051,10 @@ fn prove_shared_range_check<
   backend_ck: &B::Ck,
   batches: &[RangeBatchInputs<'_, B>],
   parent: &mut Keccak256Transcript<ME>,
-) -> Result<(SharedRangeCheck<B>, RcProverArtifacts<B>), SpartanError> {
+) -> Result<(SharedRangeCheck<B>, RcProverArtifacts<B>), SpartanError>
+where
+  B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
+{
   debug_assert!(!batches.is_empty());
 
   let dims: Vec<BatchDims> = batches
@@ -4360,7 +4369,7 @@ fn prove_shared_range_check<
 /// reconstruction sumcheck against the claimed evaluations, and returns
 /// the claims for the batched-open verification.
 fn verify_shared_range_check<
-  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -4369,7 +4378,10 @@ fn verify_shared_range_check<
   metas: &[RangeBatchMeta<'_, B>],
   arg: &SharedRangeCheck<B>,
   parent: &mut Keccak256Transcript<ME>,
-) -> Result<RcVerifyClaims<B::Scalar>, SpartanError> {
+) -> Result<RcVerifyClaims<B::Scalar>, SpartanError>
+where
+  B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
+{
   // The proof carries per-batch data only for batches that committed a
   // fresh chunk polynomial; precommitted batches (F) contribute their
   // target's own commitment and skip reconstruction.

@@ -52,7 +52,7 @@ impl<
   E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
 > SumcheckProof<E>
 where
-  E::Scalar: crate::big_num::MontgomeryLimbs,
+  E::Scalar: crate::big_num::DelayedReduction<E::Scalar>,
 {
   /// Returns a new proof with `round0_poly` prepended to the existing rounds.
   pub fn prepend_round(self, round0_poly: UniPoly<E::Scalar>) -> Self {
@@ -1051,7 +1051,7 @@ pub(crate) mod eq_sumcheck {
     E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
   > EqSumCheckInstance<E>
   where
-    E::Scalar: crate::big_num::MontgomeryLimbs,
+    E::Scalar: crate::big_num::DelayedReduction<E::Scalar>,
   {
     /// Creates a new EqSumCheckInstance for optimized sumcheck with equality polynomials.
     ///
