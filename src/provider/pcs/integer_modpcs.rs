@@ -2962,7 +2962,17 @@ struct PerPolyVerifier<F = t256::Scalar> {
 /// advancing `transcript` identically, and return the open claims and
 /// dimensions for [`finish_batch_verify`].
 #[allow(clippy::too_many_arguments)]
-fn verify_one_poly<
+/// Verifier phase-1 state: everything derived while replaying the
+/// commit phase (reduction checks, prime derivation, ab-comm absorbs)
+/// that the claims phase consumes.
+struct VerifyPhase1 {
+  num_vars: usize,
+  with_iter: bool,
+  log_spad: usize,
+  chain_primes: Vec<(BigUint, Vec<BigUint>)>,
+}
+
+fn verify_one_poly_phase1<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
@@ -2977,7 +2987,7 @@ fn verify_one_poly<
   int_v_prime: &BigInt,
   chains: &[ChainData<B::Scalar>],
   ab_comms: &[B::Comm],
-) -> Result<PerPolyVerifier<B::Scalar>, SpartanError> {
+) -> Result<VerifyPhase1, SpartanError> {
   let monty = point
     .first()
     .map(|p| *p.params())
@@ -3055,7 +3065,7 @@ fn verify_one_poly<
   let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
   info!(elapsed_ms = %vred_t.elapsed().as_millis(), "imod_pcs_verify_reduction_sc");
 
-  let (_vchain_span, vchain_t) = start_span!("imod_pcs_verify_chains");
+  let _vchain_span = start_span!("imod_pcs_verify_chains").0;
   let primes: Vec<BigUint> = (0..params.s)
     .map(|_| sample_small_prime(transcript, params.log_p))
     .collect::<Result<Vec<_>, SpartanError>>()?;
@@ -3075,6 +3085,40 @@ fn verify_one_poly<
   for c in ab_comms {
     transcript.absorb_bytes(b"ab_chunk", &B::comm_transcript_bytes(c));
   }
+
+  Ok(VerifyPhase1 {
+    num_vars,
+    with_iter,
+    log_spad,
+    chain_primes,
+  })
+}
+
+/// Verifier phase 2: squeeze gammas, rebuild every claim, run the
+/// per-layer identity and CRT checks.
+fn verify_one_poly_phase2<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  params: &IntEvalParams,
+  transcript: &mut Keccak256Transcript<ME>,
+  chains: &[ChainData<B::Scalar>],
+  int_v_prime: &BigInt,
+  ph1: VerifyPhase1,
+) -> Result<PerPolyVerifier<B::Scalar>, SpartanError> {
+  let VerifyPhase1 {
+    num_vars,
+    with_iter,
+    log_spad,
+    chain_primes,
+  } = ph1;
+  let n = num_vars;
+  let k = params.k;
+  let t = if with_iter { (n - k).div_ceil(k) } else { 0 };
+  let (_vclaims_span, vchain_t) = start_span!("imod_pcs_verify_claims");
 
   let gamma_fq: Vec<B::Scalar> = if with_iter {
     (0..(n - k))
@@ -3204,6 +3248,36 @@ fn verify_one_poly<
     t,
     log_spad,
   })
+}
+
+/// Single-polynomial verify: phase 1 then phase 2 back to back.
+fn verify_one_poly<
+  B: CommitBackend,
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+>(
+  params: &IntEvalParams,
+  transcript: &mut Keccak256Transcript<ME>,
+  point: &[crate::dyn_prime::DynPrime<2>],
+  eval: &BigUint,
+  reduction_round_polys: &[Vec<BigUint>],
+  int_v_prime: &BigInt,
+  chains: &[ChainData<B::Scalar>],
+  ab_comms: &[B::Comm],
+) -> Result<PerPolyVerifier<B::Scalar>, SpartanError> {
+  let ph1 = verify_one_poly_phase1::<B, ME>(
+    params,
+    transcript,
+    point,
+    eval,
+    reduction_round_polys,
+    int_v_prime,
+    chains,
+    ab_comms,
+  )?;
+  verify_one_poly_phase2::<B, ME>(params, transcript, chains, int_v_prime, ph1)
 }
 
 /// Verifier mirror of [`finish_batch_open`]: ONE shared range check over
