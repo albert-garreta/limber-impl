@@ -1903,7 +1903,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 /// instantiation: no elliptic-curve operations anywhere in the prover,
 /// at the cost of megabyte-scale proofs and slower verification.
 #[derive(Clone, Debug)]
-pub struct IntegerModPCSBd;
+pub struct IntegerModPCSBd<SE = T256HyraxEngine>(core::marker::PhantomData<SE>);
 
 /// Commitment key for the Brakedown Mod-PCS: only the IntEval
 /// parameters (Brakedown itself needs no key material — its code
@@ -1946,13 +1946,28 @@ impl BdModVerifierKey {
   }
 }
 
-impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSBd {
+impl<ME, SE> ModPCSEngineTrait<ME> for IntegerModPCSBd<SE>
+where
+  ME: crate::traits::mod_engine::ModEngine<
+      Scalar = crate::dyn_prime::DynPrime<2>,
+      TE = Keccak256Transcript<ME>,
+    >,
+  SE: crate::traits::mod_engine::SumcheckEngine,
+  SE::Scalar: crate::traits::PrimeFieldExt
+    + crate::traits::transcript::TranscriptReprTrait
+    + Serialize
+    + serde::de::DeserializeOwned
+    + crate::big_num::DelayedReduction<SE::Scalar>
+    + Send
+    + Sync
+    + 'static,
+{
   type CommitmentKey = BdModCommitmentKey;
   type VerifierKey = BdModVerifierKey;
   type Commitment = BdModCommitment;
   type Blind = ();
-  type EvaluationArgument = IntEvalArgument<BdBackend>;
-  type BatchEvaluationArgument = IntEvalBatchArgument<BdBackend>;
+  type EvaluationArgument = IntEvalArgument<BdBackend<SE>>;
+  type BatchEvaluationArgument = IntEvalBatchArgument<BdBackend<SE>>;
 
   fn setup(
     _label: &'static [u8],
@@ -1986,11 +2001,11 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
     let params = &ck.params;
     let v_limbs = limb_split_polynomial(v, params.log_t, params.log_t_f);
     let chunk_vals = build_chunk_poly(&[&v_limbs], v_limbs.len(), params.log_t);
-    let chunk_fq: Vec<t256::Scalar> = chunk_vals
+    let chunk_fq: Vec<SE::Scalar> = chunk_vals
       .par_iter()
       .map(|&c| scalar_from_chunk(c))
       .collect();
-    let (root, _data) = BdBackend::<T256HyraxEngine>::commit(&(), &chunk_fq, &(), true)?;
+    let (root, _data) = BdBackend::<SE>::commit(&(), &chunk_fq, &(), true)?;
     Ok(BdModCommitment { root })
   }
 
@@ -2004,31 +2019,24 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
 
   fn prove(
     ck: &Self::CommitmentKey,
-    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    transcript: &mut <ME as SumcheckEngine>::TE,
     comm: &Self::Commitment,
     poly: &[BigUint],
     blind: &Self::Blind,
-    point: &[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar],
+    point: &[<ME as SumcheckEngine>::Scalar],
     eval: &BigUint,
   ) -> Result<Self::EvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove");
-    let mut st = prove_one_poly::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+    let mut st =
+      prove_one_poly::<BdBackend<SE>, ME>(&ck.params, &(), transcript, poly, point, eval)?;
+    let (range_check, combined_open) = finish_batch_open::<BdBackend<SE>, ME>(
       &ck.params,
       &(),
       transcript,
-      poly,
-      point,
-      eval,
+      std::slice::from_mut(&mut st),
+      &[&comm.root],
+      &[blind],
     )?;
-    let (range_check, combined_open) =
-      finish_batch_open::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
-        &ck.params,
-        &(),
-        transcript,
-        std::slice::from_mut(&mut st),
-        &[&comm.root],
-        &[blind],
-      )?;
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_bd_prove");
     Ok(IntEvalArgument {
       reduction_round_polys: st.reduction_round_polys,
@@ -2042,11 +2050,11 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
 
   fn prove_batch(
     ck: &Self::CommitmentKey,
-    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    transcript: &mut <ME as SumcheckEngine>::TE,
     comms: &[&Self::Commitment],
     polys: &[&[BigUint]],
     blinds: &[&Self::Blind],
-    points: &[&[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar]],
+    points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove_batch");
@@ -2056,12 +2064,9 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
         reason: "IntegerModPCSBd::prove_batch: empty or mismatched inputs".to_string(),
       });
     }
-    let mut states: Vec<PerPolyProver<BdBackend>> = Vec::with_capacity(n);
+    let mut states: Vec<PerPolyProver<BdBackend<SE>>> = Vec::with_capacity(n);
     for i in 0..n {
-      states.push(prove_one_poly::<
-        BdBackend,
-        crate::provider::T256DynPrimeBdEngine,
-      >(
+      states.push(prove_one_poly::<BdBackend<SE>, ME>(
         &ck.params,
         &(),
         transcript,
@@ -2071,15 +2076,14 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
       )?);
     }
     let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
-    let (range_check, combined_open) =
-      finish_batch_open::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
-        &ck.params,
-        &(),
-        transcript,
-        &mut states,
-        &comm_roots,
-        blinds,
-      )?;
+    let (range_check, combined_open) = finish_batch_open::<BdBackend<SE>, ME>(
+      &ck.params,
+      &(),
+      transcript,
+      &mut states,
+      &comm_roots,
+      blinds,
+    )?;
     let per_poly = states
       .into_iter()
       .map(|st| IntEvalPerPolyArgument {
@@ -2099,14 +2103,14 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
 
   fn verify(
     vk: &Self::VerifierKey,
-    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    transcript: &mut <ME as SumcheckEngine>::TE,
     comm: &Self::Commitment,
-    point: &[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar],
+    point: &[<ME as SumcheckEngine>::Scalar],
     eval: &BigUint,
     arg: &Self::EvaluationArgument,
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("integer_modpcs_bd_verify");
-    let mut v = verify_one_poly::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+    let mut v = verify_one_poly::<BdBackend<SE>, ME>(
       &vk.params,
       transcript,
       point,
@@ -2116,7 +2120,7 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
       &arg.chains,
       &arg.ab_comms,
     )?;
-    finish_batch_verify::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+    finish_batch_verify::<BdBackend<SE>, ME>(
       &vk.params,
       &(),
       transcript,
@@ -2132,9 +2136,9 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
 
   fn verify_batch(
     vk: &Self::VerifierKey,
-    transcript: &mut <crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::TE,
+    transcript: &mut <ME as SumcheckEngine>::TE,
     comms: &[&Self::Commitment],
-    points: &[&[<crate::provider::T256DynPrimeBdEngine as SumcheckEngine>::Scalar]],
+    points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
     arg: &Self::BatchEvaluationArgument,
   ) -> Result<(), SpartanError> {
@@ -2143,13 +2147,10 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
     if comms.len() != n || points.len() != n || evals.len() != n {
       return Err(SpartanError::InvalidSumcheckProof);
     }
-    let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
+    let mut vs: Vec<PerPolyVerifier<SE::Scalar>> = Vec::with_capacity(n);
     for i in 0..n {
       let pp = &arg.per_poly[i];
-      vs.push(verify_one_poly::<
-        BdBackend,
-        crate::provider::T256DynPrimeBdEngine,
-      >(
+      vs.push(verify_one_poly::<BdBackend<SE>, ME>(
         &vk.params,
         transcript,
         points[i],
@@ -2166,7 +2167,7 @@ impl ModPCSEngineTrait<crate::provider::T256DynPrimeBdEngine> for IntegerModPCSB
       .iter()
       .map(|pp| pp.ab_comms.as_slice())
       .collect();
-    finish_batch_verify::<BdBackend, crate::provider::T256DynPrimeBdEngine>(
+    finish_batch_verify::<BdBackend<SE>, ME>(
       &vk.params,
       &(),
       transcript,
