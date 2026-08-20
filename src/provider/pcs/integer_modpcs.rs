@@ -2254,13 +2254,6 @@ struct PerPolyProver<B: CommitBackend> {
   t_layers: usize,
 }
 
-/// Per-polynomial prover stages of a (batched) Mod-PCS open: the
-/// reduction sumcheck (Phase-3 step D3) and the per-prime chains, up to
-/// and including all evaluation CLAIMS. Advances `transcript` exactly as
-/// a standalone open would through the chain-claim phase, and returns the
-/// proof outputs plus the witness data [`finish_batch_open`]'s shared
-/// range check and combined opening borrow from.
-
 /// Everything phase 1 of a per-polynomial open produces and phase 2
 /// consumes: the reduction outputs, the chain state, and the committed
 /// chunk polynomials. Splitting here lets the batch prover commit ALL
