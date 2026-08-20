@@ -745,13 +745,13 @@ pub struct RangeCheckBatchData<B: CommitBackend> {
   /// `a/b` batch this equals the stacked layer MLE at `(role, r_v)`, for
   /// the `f_limb` batch it is `f(r_v_within)`; discharged by the
   /// corresponding commitment's batched open.
-  pub(crate) value_eval: t256::Scalar,
+  pub(crate) value_eval: B::Scalar,
   /// Claimed `chunk(r_v ++ r_b)` — the reconstruction sumcheck's final
   /// chunk evaluation, discharged by the chunk commitment's batched open.
-  pub(crate) reconstr_eval: t256::Scalar,
+  pub(crate) reconstr_eval: B::Scalar,
   /// Value-reconstruction sumcheck (`Σ_c 2^(16c)·chunk(r_v, c) =
   /// value(r_v)`), over the Hyrax base field.
-  pub(crate) value_reconstr_sumcheck: crate::sumcheck::SumcheckProof<T256HyraxEngine>,
+  pub(crate) value_reconstr_sumcheck: crate::sumcheck::SumcheckProof<B::SE>,
 }
 
 /// ONE shared LogUp-GKR range check covering all `(bound, size)` batch
@@ -769,7 +769,7 @@ pub struct SharedRangeCheck<B: CommitBackend> {
   /// Commitment to the shared `2^16`-entry multiplicity table.
   pub(crate) mult_comm: B::Comm,
   /// The multi-witness LogUp-GKR membership argument.
-  pub(crate) logup: crate::logup_gkr::LogUpMultiRangeProof<T256HyraxEngine>,
+  pub(crate) logup: crate::logup_gkr::LogUpMultiRangeProof<B::SE>,
   /// Per-batch commitments, openings, and reconstruction sumchecks for
   /// batches that commit a FRESH chunk polynomial, in canonical batch
   /// order. In the current protocol EVERY batch is precommitted (its
@@ -2634,7 +2634,7 @@ fn prove_one_poly<
 /// batches), then all chunk commitments in that batch order, then the
 /// shared multiplicity table.
 fn finish_batch_open<
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -2727,12 +2727,12 @@ fn finish_batch_open<
   // are claims on the same commitments. `ab_claims` are already in
   // chunk coordinates. Canonical batch index of poly `p` layer `j` role
   // `r` is `f_batch_idx[p] + 1 + 2j + r`.
-  let mut f_target_claims: Vec<OpenClaims> = Vec::with_capacity(states.len());
-  let mut ab_target_claims: Vec<Vec<OpenClaims>> = Vec::with_capacity(states.len());
+  let mut f_target_claims: Vec<OpenClaims<B::Scalar>> = Vec::with_capacity(states.len());
+  let mut ab_target_claims: Vec<Vec<OpenClaims<B::Scalar>>> = Vec::with_capacity(states.len());
   for (p, st) in states.iter().enumerate() {
     let d = BatchDims::new(1, st.f_limb.len(), params.log_t);
-    let (fold_pt, alpha) = chunk_fold_point(d.log_stride);
-    let mut cl = OpenClaims::default();
+    let (fold_pt, alpha) = chunk_fold_point::<B::Scalar>(d.log_stride);
+    let mut cl = OpenClaims::<B::Scalar>::default();
     for (z, y) in st.f_claims.points.iter().zip(st.f_claims.evals.iter()) {
       let mut zc = Vec::with_capacity(z.len() + fold_pt.len());
       zc.extend_from_slice(z);
@@ -2760,9 +2760,14 @@ fn finish_batch_open<
   // ONE combined opening over all commitments — every target opens as
   // its chunk polynomial.
   let (_bo_span, bo_t) = start_span!("imod_pcs_batched_opens");
-  let mut bsub = spawn_batch_subtranscript(transcript)?;
-  let mut bo_targets: Vec<(&B::Comm, &[t256::Scalar], &B::Blind, &B::Data, &OpenClaims)> =
-    Vec::new();
+  let mut bsub = spawn_batch_subtranscript::<B, _>(transcript)?;
+  let mut bo_targets: Vec<(
+    &B::Comm,
+    &[B::Scalar],
+    &B::Blind,
+    &B::Data,
+    &OpenClaims<B::Scalar>,
+  )> = Vec::new();
   // The input commitments were made through the ModPCS surface, which
   // returns no retained opening data — regenerate it (free for Hyrax,
   // a re-encode for Brakedown).
@@ -3076,7 +3081,7 @@ fn verify_one_poly<
 /// every commitment, in the same canonical order the prover used.
 #[allow(clippy::too_many_arguments)]
 fn finish_batch_verify<
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -3086,7 +3091,7 @@ fn finish_batch_verify<
   backend_vk: &B::Vk,
   transcript: &mut Keccak256Transcript<ME>,
   comms: &[&B::Comm],
-  verifiers: &mut [PerPolyVerifier],
+  verifiers: &mut [PerPolyVerifier<B::Scalar>],
   ab_comms_per_poly: &[&[B::Comm]],
   range_check: &SharedRangeCheck<B>,
   combined_open: &CombinedBatchOpen<B>,
@@ -3134,13 +3139,13 @@ fn finish_batch_verify<
   // chunk coordinates.
   let log_stride_a = chunk_stride(log_bound_a).trailing_zeros() as usize;
   let log_stride_b = chunk_stride(log_bound_b).trailing_zeros() as usize;
-  let mut f_target_claims: Vec<OpenClaims> = Vec::with_capacity(verifiers.len());
-  let mut ab_target_claims: Vec<Vec<OpenClaims>> = Vec::with_capacity(verifiers.len());
+  let mut f_target_claims: Vec<OpenClaims<B::Scalar>> = Vec::with_capacity(verifiers.len());
+  let mut ab_target_claims: Vec<Vec<OpenClaims<B::Scalar>>> = Vec::with_capacity(verifiers.len());
   let mut f_log_stride: Vec<usize> = Vec::with_capacity(verifiers.len());
   for (p, v) in verifiers.iter().enumerate() {
     let d = BatchDims::new(1, 1usize << v.num_vars, params.log_t);
-    let (fold_pt, alpha) = chunk_fold_point(d.log_stride);
-    let mut cl = OpenClaims::default();
+    let (fold_pt, alpha) = chunk_fold_point::<B::Scalar>(d.log_stride);
+    let mut cl = OpenClaims::<B::Scalar>::default();
     for (z, y) in v.f_claims.points.iter().zip(v.f_claims.evals.iter()) {
       let mut zc = Vec::with_capacity(z.len() + fold_pt.len());
       zc.extend_from_slice(z);
@@ -3167,8 +3172,8 @@ fn finish_batch_verify<
   }
 
   let (_vbo_span, vbo_t) = start_span!("imod_pcs_verify_batched_opens");
-  let mut bsub = spawn_batch_subtranscript(transcript)?;
-  let mut bo_targets: Vec<(&B::Comm, usize, &OpenClaims)> = Vec::new();
+  let mut bsub = spawn_batch_subtranscript::<B, _>(transcript)?;
+  let mut bo_targets: Vec<(&B::Comm, usize, &OpenClaims<B::Scalar>)> = Vec::new();
   for (p, v) in verifiers.iter().enumerate() {
     bo_targets.push((comms[p], v.num_vars + f_log_stride[p], &f_target_claims[p]));
     for (idx, ab_comm) in ab_comms_per_poly[p].iter().enumerate() {
@@ -3236,6 +3241,7 @@ pub struct HyBackend;
 
 impl CommitBackend for HyBackend {
   type Scalar = t256::Scalar;
+  type SE = T256HyraxEngine;
   type Ck = IntegerModCommitmentKey;
   type Vk = IntegerModVerifierKey;
   type Comm = <Hyrax as PCSEngineTrait<T256HyraxEngine>>::Commitment;
@@ -3484,7 +3490,7 @@ impl<F> OpenClaims<F> {
 /// committed — their `V(r_v)` evaluation becomes a claim on `target`.
 struct RangeBatchInputs<'a, B: CommitBackend> {
   target: RcTarget,
-  value_polys_fq: Vec<&'a [t256::Scalar]>,
+  value_polys_fq: Vec<&'a [B::Scalar]>,
   values: Vec<&'a [BigUint]>,
   /// Coefficients per polynomial (same for all; a power of two).
   n_values: usize,
@@ -3563,17 +3569,17 @@ impl BatchDims {
 /// `stride` (the padded per-value chunk count). Chunk slots at
 /// `c ≥ numchunks` carry zero weight, so the prover can't inflate a
 /// value past its bound regardless of those (still range-checked) slots.
-fn chunk_weight_vector(log_bound: usize, stride: usize) -> Vec<t256::Scalar> {
+fn chunk_weight_vector<F: ff::PrimeField>(log_bound: usize, stride: usize) -> Vec<F> {
   let numchunks = log_bound.div_ceil(CHUNK_BITS);
-  let base = t256::Scalar::from(1u64 << CHUNK_BITS);
+  let base = F::from(1u64 << CHUNK_BITS);
   let mut weight = Vec::with_capacity(stride);
-  let mut pow = t256::Scalar::ONE;
+  let mut pow = F::ONE;
   for c in 0..stride {
     if c < numchunks {
       weight.push(pow);
       pow *= base;
     } else {
-      weight.push(t256::Scalar::ZERO);
+      weight.push(F::ZERO);
     }
   }
   weight
@@ -3595,11 +3601,10 @@ fn spawn_shared_range_subtranscript<
   parent: &mut Keccak256Transcript<ME>,
   chunk_comms: impl Iterator<Item = &'a B::Comm>,
   mult_comm: &B::Comm,
-) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
+) -> Result<<B::SE as SumcheckEngine>::TE, SpartanError> {
   let seed = parent.squeeze_bytes(b"range_seed")?;
-  let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
-    T256HyraxEngine,
-  >>::new_with_params(b"range_check", ());
+  let mut sub =
+    <<B::SE as SumcheckEngine>::TE as TranscriptEngineTrait<B::SE>>::new(b"range_check");
   sub.absorb_bytes(b"seed", &seed);
   for cc in chunk_comms {
     sub.absorb_bytes(b"range_chunk_comm", &B::comm_transcript_bytes(cc));
@@ -3612,17 +3617,17 @@ fn spawn_shared_range_subtranscript<
 /// Each commitment's claims are absorbed (and its λ squeezed) inside
 /// [`prove_batched_open`] / [`verify_batched_open`].
 fn spawn_batch_subtranscript<
+  B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
     >,
 >(
   parent: &mut Keccak256Transcript<ME>,
-) -> Result<Keccak256Transcript<T256HyraxEngine>, SpartanError> {
+) -> Result<<B::SE as SumcheckEngine>::TE, SpartanError> {
   let seed = parent.squeeze_bytes(b"batch_seed")?;
-  let mut sub = <Keccak256Transcript<T256HyraxEngine> as TranscriptEngineTrait<
-    T256HyraxEngine,
-  >>::new_with_params(b"batched_opens", ());
+  let mut sub =
+    <<B::SE as SumcheckEngine>::TE as TranscriptEngineTrait<B::SE>>::new(b"batched_opens");
   sub.absorb_bytes(b"seed", &seed);
   Ok(sub)
 }
@@ -3985,21 +3990,21 @@ fn batch_weight<F: ff::PrimeField>(
 /// per-batch chunk polynomials + blinds + claims, and the multiplicity
 /// table's polynomial + blind + claim.
 struct RcProverArtifacts<B: CommitBackend> {
-  value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)>,
-  chunk_data: Vec<(Vec<t256::Scalar>, B::Blind, OpenClaims)>,
-  mult_fq: Vec<t256::Scalar>,
+  value_claims: Vec<(RcTarget, Vec<B::Scalar>, B::Scalar)>,
+  chunk_data: Vec<(Vec<B::Scalar>, B::Blind, OpenClaims<B::Scalar>)>,
+  mult_fq: Vec<B::Scalar>,
   mult_blind: B::Blind,
   /// Retained opening data for the multiplicity commitment.
   mult_data: B::Data,
-  mult_claims: OpenClaims,
+  mult_claims: OpenClaims<B::Scalar>,
 }
 
 /// Claims the verifier of the shared range check hands back for the
 /// batched-open verification.
-struct RcVerifyClaims {
-  value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)>,
-  chunk_claims: Vec<OpenClaims>,
-  mult_claims: OpenClaims,
+struct RcVerifyClaims<F = t256::Scalar> {
+  value_claims: Vec<(RcTarget, Vec<F>, F)>,
+  chunk_claims: Vec<OpenClaims<F>>,
+  mult_claims: OpenClaims<F>,
 }
 
 /// Prover side of the shared LogUp-GKR range check covering all batches
@@ -4012,7 +4017,7 @@ struct RcVerifyClaims {
 /// final chunk evaluations) are returned as CLAIMS to be discharged by
 /// the caller's batched opens — this function performs no Hyrax opens.
 fn prove_shared_range_check<
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -4037,7 +4042,7 @@ fn prove_shared_range_check<
   //    the chunk values for the GKR but make no fresh commitment.
   let (_rcc_span, rcc_t) = start_span!("rc_chunk_commit");
   let mut chunk_vals_all: Vec<Vec<u64>> = Vec::with_capacity(batches.len());
-  let mut chunk_fq_all: Vec<Vec<t256::Scalar>> = Vec::with_capacity(batches.len());
+  let mut chunk_fq_all: Vec<Vec<B::Scalar>> = Vec::with_capacity(batches.len());
   let mut chunk_blinds: Vec<B::Blind> = Vec::with_capacity(batches.len());
   // `Some` for batches that committed a fresh chunk polynomial here
   // (these land in `SharedRangeCheck::batches`); `None` for
@@ -4058,9 +4063,9 @@ fn prove_shared_range_check<
     );
     let chunk_vals = build_chunk_poly(&b.values, b.n_values, b.log_bound);
     debug_assert_eq!(chunk_vals.len(), d.n_chunks);
-    let chunk_fq: Vec<t256::Scalar> = chunk_vals
+    let chunk_fq: Vec<B::Scalar> = chunk_vals
       .par_iter()
-      .map(|&c| scalar_from_chunk(c))
+      .map(|&c| scalar_from_chunk::<B::Scalar>(c))
       .collect();
     if let Some((_, blind)) = b.precommitted {
       chunk_blinds.push((*blind).clone());
@@ -4142,11 +4147,9 @@ fn prove_shared_range_check<
     .chain(top_vals_all.iter().map(|(_, v)| v.as_slice()))
     .collect();
   let (_rcm_span, rcm_t) = start_span!("rc_mult_commit");
-  let mult = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::multiplicities(
-    CHUNK_BITS,
-    &witness_refs,
-  )?;
-  let mult_fq: Vec<t256::Scalar> = mult.iter().map(|&m| t256::Scalar::from(m)).collect();
+  let mult =
+    crate::logup_gkr::LogUpMultiRangeProof::<B::SE>::multiplicities(CHUNK_BITS, &witness_refs)?;
+  let mult_fq: Vec<B::Scalar> = mult.iter().map(|&m| B::Scalar::from(m)).collect();
   let mult_blind = B::blind(backend_ck, mult_fq.len());
   let (mult_comm, mult_data) = B::commit(backend_ck, &mult_fq, &mult_blind, true)?;
   info!(elapsed_ms = %rcm_t.elapsed().as_millis(), "rc_mult_commit");
@@ -4162,13 +4165,11 @@ fn prove_shared_range_check<
   // 5. ONE multi-witness LogUp-GKR: every entry of every ACTIVE tree is in
   //    [0, 2^16). Its reduced claims become batched-open claims.
   let (_rcl_span, rcl_t) = start_span!("rc_logup_gkr");
-  let (logup, claims) = crate::logup_gkr::LogUpMultiRangeProof::<T256HyraxEngine>::prove(
-    CHUNK_BITS,
-    &witness_refs,
-    &mut sub,
-  )?;
+  let (logup, claims) =
+    crate::logup_gkr::LogUpMultiRangeProof::<B::SE>::prove(CHUNK_BITS, &witness_refs, &mut sub)?;
   info!(elapsed_ms = %rcl_t.elapsed().as_millis(), "rc_logup_gkr");
-  let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); batches.len()];
+  let mut chunk_claims: Vec<OpenClaims<B::Scalar>> =
+    vec![OpenClaims::<B::Scalar>::default(); batches.len()];
   let mut wc = claims.wit_claims.iter();
   for (bi, act) in active_blocks.iter().enumerate() {
     let n_chunk_vars = ceil_log2(chunk_vals_all[bi].len().max(1));
@@ -4178,7 +4179,7 @@ fn prove_shared_range_check<
         continue;
       }
       let (point, eval) = wc.next().expect("one claim per active block");
-      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+      let full: Vec<B::Scalar> = bool_point_of_index::<B::Scalar>(blk, n_chunk_vars - block_log)
         .into_iter()
         .chain(point.iter().copied())
         .collect();
@@ -4188,12 +4189,15 @@ fn prove_shared_range_check<
   for (bi, _) in top_vals_all.iter() {
     let d = &dims[*bi];
     let (point, eval) = wc.next().expect("one claim per top tree");
-    let ext: Vec<t256::Scalar> = point
+    let ext: Vec<B::Scalar> = point
       .iter()
       .copied()
-      .chain(bool_point_of_index(d.numchunks - 1, d.log_stride))
+      .chain(bool_point_of_index::<B::Scalar>(
+        d.numchunks - 1,
+        d.log_stride,
+      ))
       .collect();
-    chunk_claims[*bi].push(ext, *eval - t256::Scalar::from(d.top_shift()));
+    chunk_claims[*bi].push(ext, *eval - B::Scalar::from(d.top_shift()));
   }
   // Inactive blocks: pin each to zero with a fresh random-point claim.
   for (bi, act) in active_blocks.iter().enumerate() {
@@ -4203,17 +4207,17 @@ fn prove_shared_range_check<
       if a {
         continue;
       }
-      let r_blk: Vec<t256::Scalar> = (0..block_log)
+      let r_blk: Vec<B::Scalar> = (0..block_log)
         .map(|_| sub.squeeze(b"range_zblk"))
         .collect::<Result<Vec<_>, _>>()?;
-      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+      let full: Vec<B::Scalar> = bool_point_of_index::<B::Scalar>(blk, n_chunk_vars - block_log)
         .into_iter()
         .chain(r_blk)
         .collect();
-      chunk_claims[bi].push(full, t256::Scalar::ZERO);
+      chunk_claims[bi].push(full, B::Scalar::ZERO);
     }
   }
-  let mut mult_claims = OpenClaims::default();
+  let mut mult_claims = OpenClaims::<B::Scalar>::default();
   mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
 
   // 6. Per non-precommitted batch: value-reconstruction sumcheck tying
@@ -4225,7 +4229,7 @@ fn prove_shared_range_check<
   //    IS the committed representation, so the chunk→value relation is
   //    definitional (`chunk_fold_point`) — nothing to tie.
   let (_rcr_span, rcr_t) = start_span!("rc_reconstr");
-  let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
+  let mut value_claims: Vec<(RcTarget, Vec<B::Scalar>, B::Scalar)> =
     Vec::with_capacity(batches.len());
   let mut batch_data: Vec<RangeCheckBatchData<B>> = Vec::with_capacity(batches.len());
   for (bi, (b, d)) in batches.iter().zip(dims.iter()).enumerate() {
@@ -4236,30 +4240,30 @@ fn prove_shared_range_check<
       // (Schwartz–Zippel: a nonzero multilinear restriction survives a
       // random evaluation with negligible probability).
       if d.stride > d.numchunks {
-        let r_pad: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
+        let r_pad: Vec<B::Scalar> = (0..(d.log_np + d.log_nv))
           .map(|_| sub.squeeze(b"range_zpad"))
           .collect::<Result<Vec<_>, _>>()?;
         for c in d.numchunks..d.stride {
-          let pt: Vec<t256::Scalar> = r_pad
+          let pt: Vec<B::Scalar> = r_pad
             .iter()
             .copied()
-            .chain(bool_point_of_index(c, d.log_stride))
+            .chain(bool_point_of_index::<B::Scalar>(c, d.log_stride))
             .collect();
-          chunk_claims[bi].push(pt, t256::Scalar::ZERO);
+          chunk_claims[bi].push(pt, B::Scalar::ZERO);
         }
       }
       continue;
     }
     let num_polys = b.value_polys_fq.len();
-    let r_v: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
+    let r_v: Vec<B::Scalar> = (0..(d.log_np + d.log_nv))
       .map(|_| sub.squeeze(b"range_rv"))
       .collect::<Result<Vec<_>, _>>()?;
     let r_v_poly = &r_v[..d.log_np];
     let r_v_within = &r_v[d.log_np..];
 
-    let eq_weights = EqPolynomial::<t256::Scalar>::new(r_v_poly.to_vec()).evals();
+    let eq_weights = EqPolynomial::<B::Scalar>::new(r_v_poly.to_vec()).evals();
     let w = &eq_weights[..num_polys];
-    let mut combined_poly = vec![t256::Scalar::ZERO; b.n_values];
+    let mut combined_poly = vec![B::Scalar::ZERO; b.n_values];
     for (p, poly) in b.value_polys_fq.iter().enumerate() {
       for (o, &v) in combined_poly.iter_mut().zip(poly.iter()) {
         *o += w[p] * v;
@@ -4275,14 +4279,14 @@ fn prove_shared_range_check<
     for r in &r_v {
       chunk_mle.bind_poly_var_top(r);
     }
-    let chunk_at_rv: Vec<t256::Scalar> = chunk_mle.into_vec();
+    let chunk_at_rv: Vec<B::Scalar> = chunk_mle.into_vec();
     debug_assert_eq!(chunk_at_rv.len(), d.stride);
 
-    let weight = chunk_weight_vector(b.log_bound, d.stride);
+    let weight = chunk_weight_vector::<B::Scalar>(b.log_bound, d.stride);
     let mut poly_w = crate::polys::multilinear::MultilinearPolynomial::new(weight);
     let mut poly_c = crate::polys::multilinear::MultilinearPolynomial::new(chunk_at_rv);
     let (value_reconstr_sumcheck, r_b, sc_claims) =
-      crate::sumcheck::SumcheckProof::<T256HyraxEngine>::prove_quad(
+      crate::sumcheck::SumcheckProof::<B::SE>::prove_quad(
         &value_eval,
         d.log_stride,
         &mut poly_w,
@@ -4291,7 +4295,7 @@ fn prove_shared_range_check<
       )?;
     let reconstr_eval = sc_claims[1];
     sub.absorb_bytes(b"rc_reconstr_ev", reconstr_eval.to_repr().as_ref());
-    let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
+    let combined: Vec<B::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
     chunk_claims[bi].push(combined, reconstr_eval);
 
     batch_data.push(RangeCheckBatchData {
@@ -4306,7 +4310,7 @@ fn prove_shared_range_check<
 
   info!(elapsed_ms = %rcr_t.elapsed().as_millis(), "rc_reconstr");
 
-  let chunk_data: Vec<(Vec<t256::Scalar>, B::Blind, OpenClaims)> = chunk_fq_all
+  let chunk_data: Vec<(Vec<B::Scalar>, B::Blind, OpenClaims<B::Scalar>)> = chunk_fq_all
     .into_iter()
     .zip(chunk_blinds)
     .zip(chunk_claims)
@@ -4337,7 +4341,7 @@ fn prove_shared_range_check<
 /// reconstruction sumcheck against the claimed evaluations, and returns
 /// the claims for the batched-open verification.
 fn verify_shared_range_check<
-  B: CommitBackend<Scalar = t256::Scalar>,
+  B: CommitBackend<Scalar: crate::big_num::MontgomeryLimbs>,
   ME: crate::traits::mod_engine::ModEngine<
       Scalar = crate::dyn_prime::DynPrime<2>,
       TE = Keccak256Transcript<ME>,
@@ -4346,7 +4350,7 @@ fn verify_shared_range_check<
   metas: &[RangeBatchMeta<'_, B>],
   arg: &SharedRangeCheck<B>,
   parent: &mut Keccak256Transcript<ME>,
-) -> Result<RcVerifyClaims, SpartanError> {
+) -> Result<RcVerifyClaims<B::Scalar>, SpartanError> {
   // The proof carries per-batch data only for batches that committed a
   // fresh chunk polynomial; precommitted batches (F) contribute their
   // target's own commitment and skip reconstruction.
@@ -4416,7 +4420,8 @@ fn verify_shared_range_check<
   // 2. Multi-witness LogUp membership: every chunk (and shifted top) in
   //    [0, 2^16). Its reduced claims become batched-open claims.
   let claims = arg.logup.verify(CHUNK_BITS, &expected_depths, &mut sub)?;
-  let mut chunk_claims: Vec<OpenClaims> = vec![OpenClaims::default(); metas.len()];
+  let mut chunk_claims: Vec<OpenClaims<B::Scalar>> =
+    vec![OpenClaims::<B::Scalar>::default(); metas.len()];
   let mut wc = claims.wit_claims.iter();
   for (bi, (d, act)) in dims.iter().zip(active_blocks.iter()).enumerate() {
     let n_chunk_vars = ceil_log2(d.n_chunks.max(1));
@@ -4426,7 +4431,7 @@ fn verify_shared_range_check<
         continue;
       }
       let (point, eval) = wc.next().ok_or(SpartanError::InvalidSumcheckProof)?;
-      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+      let full: Vec<B::Scalar> = bool_point_of_index::<B::Scalar>(blk, n_chunk_vars - block_log)
         .into_iter()
         .chain(point.iter().copied())
         .collect();
@@ -4436,12 +4441,15 @@ fn verify_shared_range_check<
   for &bi in top_batches.iter() {
     let d = &dims[bi];
     let (point, eval) = wc.next().ok_or(SpartanError::InvalidSumcheckProof)?;
-    let ext: Vec<t256::Scalar> = point
+    let ext: Vec<B::Scalar> = point
       .iter()
       .copied()
-      .chain(bool_point_of_index(d.numchunks - 1, d.log_stride))
+      .chain(bool_point_of_index::<B::Scalar>(
+        d.numchunks - 1,
+        d.log_stride,
+      ))
       .collect();
-    chunk_claims[bi].push(ext, *eval - t256::Scalar::from(d.top_shift()));
+    chunk_claims[bi].push(ext, *eval - B::Scalar::from(d.top_shift()));
   }
   // Inactive blocks: same fresh random-point zero claims as the prover.
   for (bi, (d, act)) in dims.iter().zip(active_blocks.iter()).enumerate() {
@@ -4451,17 +4459,17 @@ fn verify_shared_range_check<
       if a {
         continue;
       }
-      let r_blk: Vec<t256::Scalar> = (0..block_log)
+      let r_blk: Vec<B::Scalar> = (0..block_log)
         .map(|_| sub.squeeze(b"range_zblk"))
         .collect::<Result<Vec<_>, _>>()?;
-      let full: Vec<t256::Scalar> = bool_point_of_index(blk, n_chunk_vars - block_log)
+      let full: Vec<B::Scalar> = bool_point_of_index::<B::Scalar>(blk, n_chunk_vars - block_log)
         .into_iter()
         .chain(r_blk)
         .collect();
-      chunk_claims[bi].push(full, t256::Scalar::ZERO);
+      chunk_claims[bi].push(full, B::Scalar::ZERO);
     }
   }
-  let mut mult_claims = OpenClaims::default();
+  let mut mult_claims = OpenClaims::<B::Scalar>::default();
   mult_claims.push(claims.mult_point.clone(), claims.mult_eval);
 
   // 3. Per non-precommitted batch: r_v squeeze, claimed `V(r_v)`
@@ -4471,7 +4479,7 @@ fn verify_shared_range_check<
   //    claimed chunk evaluation (itself a claim on the chunk
   //    commitment). Precommitted batches (F) skip reconstruction — the
   //    chunk→value relation is definitional via `chunk_fold_point`.
-  let mut value_claims: Vec<(RcTarget, Vec<t256::Scalar>, t256::Scalar)> =
+  let mut value_claims: Vec<(RcTarget, Vec<B::Scalar>, B::Scalar)> =
     Vec::with_capacity(metas.len());
   let mut fresh_i = 0usize;
   for (bi, (m, d)) in metas.iter().zip(dims.iter()).enumerate() {
@@ -4479,23 +4487,23 @@ fn verify_shared_range_check<
       // Mirror of the prover's zero-pad claims (see
       // `prove_shared_range_check`).
       if d.stride > d.numchunks {
-        let r_pad: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
+        let r_pad: Vec<B::Scalar> = (0..(d.log_np + d.log_nv))
           .map(|_| sub.squeeze(b"range_zpad"))
           .collect::<Result<Vec<_>, _>>()?;
         for c in d.numchunks..d.stride {
-          let pt: Vec<t256::Scalar> = r_pad
+          let pt: Vec<B::Scalar> = r_pad
             .iter()
             .copied()
-            .chain(bool_point_of_index(c, d.log_stride))
+            .chain(bool_point_of_index::<B::Scalar>(c, d.log_stride))
             .collect();
-          chunk_claims[bi].push(pt, t256::Scalar::ZERO);
+          chunk_claims[bi].push(pt, B::Scalar::ZERO);
         }
       }
       continue;
     }
     let b = &arg.batches[fresh_i];
     fresh_i += 1;
-    let r_v: Vec<t256::Scalar> = (0..(d.log_np + d.log_nv))
+    let r_v: Vec<B::Scalar> = (0..(d.log_np + d.log_nv))
       .map(|_| sub.squeeze(b"range_rv"))
       .collect::<Result<Vec<_>, _>>()?;
     sub.absorb_bytes(b"rc_value_ev", b.value_eval.to_repr().as_ref());
@@ -4518,7 +4526,7 @@ fn verify_shared_range_check<
       return Err(SpartanError::InvalidSumcheckProof);
     }
 
-    let combined: Vec<t256::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
+    let combined: Vec<B::Scalar> = r_v.iter().chain(r_b.iter()).copied().collect();
     chunk_claims[bi].push(combined, b.reconstr_eval);
   }
 

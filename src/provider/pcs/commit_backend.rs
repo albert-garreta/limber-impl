@@ -116,7 +116,18 @@ pub trait CommitBackend: Sized + Send + Sync + 'static {
   /// field). Today both backends set this to `t256::Scalar`; making it
   /// an associated type is what lets the same protocol instantiate
   /// over a smaller field (e.g. M127) without touching protocol code.
-  type Scalar: PrimeFieldExt + Serialize + DeserializeOwned + Send + Sync + 'static;
+  type Scalar: PrimeFieldExt
+    + crate::traits::transcript::TranscriptReprTrait
+    + Serialize
+    + DeserializeOwned
+    + Send
+    + Sync
+    + 'static;
+  /// A curve-free engine naming this backend's (Scalar, transcript)
+  /// pair, for the sub-protocols (LogUp-GKR) that are generic over
+  /// `SumcheckEngine`. Full `Engine`s satisfy this via the blanket
+  /// impl; a small-field backend mints a ~20-line struct.
+  type SE: crate::traits::mod_engine::SumcheckEngine<Scalar = Self::Scalar>;
   type Ck: Send + Sync + Clone;
   type Vk: Send + Sync + Clone;
   type Comm: Clone + core::fmt::Debug + PartialEq + Serialize + DeserializeOwned + Send + Sync;
@@ -180,6 +191,7 @@ pub struct BdBackend;
 
 impl CommitBackend for BdBackend {
   type Scalar = t256::Scalar;
+  type SE = crate::provider::T256HyraxEngine;
   type Ck = ();
   type Vk = ();
   type Comm = [u8; 32];

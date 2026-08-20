@@ -26,6 +26,7 @@ use crate::{
   start_span,
   traits::{
     Engine,
+    mod_engine::SumcheckEngine,
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
   zk::{NeutronNovaVerifierCircuit, SpartanVerifierCircuit},
@@ -41,11 +42,18 @@ use tracing::info;
 /// the prover's messages in each round of the sum-check protocol.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct SumcheckProof<E: Engine> {
+pub struct SumcheckProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   compressed_polys: Vec<CompressedUniPoly<E::Scalar>>,
 }
 
-impl<E: Engine> SumcheckProof<E> {
+impl<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> SumcheckProof<E>
+where
+  E::Scalar: crate::big_num::MontgomeryLimbs,
+{
   /// Returns a new proof with `round0_poly` prepended to the existing rounds.
   pub fn prepend_round(self, round0_poly: UniPoly<E::Scalar>) -> Self {
     let mut polys = Vec::with_capacity(1 + self.compressed_polys.len());
@@ -658,7 +666,9 @@ impl<E: Engine> SumcheckProof<E> {
       vec![poly_A[0], poly_B[0], poly_C[0], poly_M[0], poly_Q[0]],
     ))
   }
+}
 
+impl<E: Engine> SumcheckProof<E> {
   /// Executes the **outer** cubic-with-additive-term sum-check in
   /// Zero-knowledge outer sum-check for the cubic-with-additive-term case.
   pub fn prove_cubic_with_additive_term_zk(
@@ -1014,13 +1024,15 @@ pub(crate) mod eq_sumcheck {
   //!
   //! The claim-derived evaluation points (computing only 2 N-scaling sums per round
   //! instead of 3) follow BDDT (eprint 2025/1117, Section 6.2).
-  use crate::{
-    big_num::DelayedReduction, polys::multilinear::MultilinearPolynomial, traits::Engine,
-  };
+  use crate::traits::mod_engine::SumcheckEngine;
+  use crate::{big_num::DelayedReduction, polys::multilinear::MultilinearPolynomial};
   use ff::{Field, PrimeField};
   use rayon::prelude::*;
+  use serde::Serialize;
 
-  pub struct EqSumCheckInstance<E: Engine> {
+  pub struct EqSumCheckInstance<
+    E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+  > {
     // number of variables at first
     init_num_vars: usize,
     first_half: usize,
@@ -1035,7 +1047,12 @@ pub(crate) mod eq_sumcheck {
     eq_tau_0_slope_m1: Vec<(E::Scalar, E::Scalar, E::Scalar)>,
   }
 
-  impl<E: Engine> EqSumCheckInstance<E> {
+  impl<
+    E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+  > EqSumCheckInstance<E>
+  where
+    E::Scalar: crate::big_num::MontgomeryLimbs,
+  {
     /// Creates a new EqSumCheckInstance for optimized sumcheck with equality polynomials.
     ///
     /// The algorithm splits the tau vector and precomputes equality polynomial evaluations

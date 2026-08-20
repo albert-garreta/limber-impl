@@ -42,7 +42,7 @@ use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
   traits::{
-    Engine,
+    mod_engine::SumcheckEngine,
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
@@ -124,7 +124,9 @@ fn idx_mle_eval<F: PrimeField>(point: &[F]) -> F {
 /// `(p(0,ρ'), p(1,ρ'), q(0,ρ'), q(1,ρ'))` at the sumcheck point.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct GkrLayerProof<E: Engine> {
+pub(crate) struct GkrLayerProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   round_polys: Vec<[E::Scalar; 4]>,
   p0: E::Scalar,
   p1: E::Scalar,
@@ -136,12 +138,16 @@ pub(crate) struct GkrLayerProof<E: Engine> {
 /// bottom (leaves).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct GkrProof<E: Engine> {
+pub(crate) struct GkrProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   layers: Vec<GkrLayerProof<E>>,
 }
 
 /// Prover output for one fraction tree.
-struct GkrOut<E: Engine> {
+struct GkrOut<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   proof: GkrProof<E>,
   root_p: E::Scalar,
   root_q: E::Scalar,
@@ -159,7 +165,9 @@ struct GkrOut<E: Engine> {
 /// checks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct GkrMultiLayerProof<E: Engine> {
+pub(crate) struct GkrMultiLayerProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   round_polys: Vec<[E::Scalar; 4]>,
   finals: Vec<[E::Scalar; 4]>,
 }
@@ -171,13 +179,17 @@ pub(crate) struct GkrMultiLayerProof<E: Engine> {
 /// elements while the per-tree finals stay `4·Σ_t d_t`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct GkrMultiProof<E: Engine> {
+pub(crate) struct GkrMultiProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   layers: Vec<GkrMultiLayerProof<E>>,
 }
 
 /// Per-tree prover output of a batched multi-tree walk (the shared
 /// transcript artifact lives in [`GkrMultiProof`]).
-struct GkrTreeOut<E: Engine> {
+struct GkrTreeOut<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   root_p: E::Scalar,
   root_q: E::Scalar,
   leaf_point: Vec<E::Scalar>,
@@ -188,7 +200,9 @@ struct GkrTreeOut<E: Engine> {
 /// Build all layers of the fraction tree from the leaves up to the root.
 /// `levels_p[k]` / `levels_q[k]` hold the `2^k`-entry layer; `[d]` is the
 /// leaves and `[0]` the single-entry root.
-fn build_levels<E: Engine>(
+fn build_levels<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   p_leaves: Vec<E::Scalar>,
   q_leaves: Vec<E::Scalar>,
   ones_numerator: bool,
@@ -251,7 +265,9 @@ fn build_levels<E: Engine>(
 /// numerators (`leaf_ones`) the `a`-tables are implicit. Shared by the
 /// single-tree and lockstep multi-tree provers.
 #[allow(clippy::too_many_arguments)]
-fn round_h_sums<E: Engine>(
+fn round_h_sums<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   a0: &[E::Scalar],
   a1: &[E::Scalar],
   b0: &[E::Scalar],
@@ -315,7 +331,9 @@ fn round_h_sums<E: Engine>(
 /// Direct evaluation of `h(1)` (the `t = 1` half of the round integrand)
 /// — the negligible-probability fallback when the Gruen prefix factor
 /// isn't invertible.
-fn round_h1_direct<E: Engine>(
+fn round_h1_direct<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   a0: &[E::Scalar],
   a1: &[E::Scalar],
   b0: &[E::Scalar],
@@ -338,7 +356,9 @@ fn round_h1_direct<E: Engine>(
 /// Prove that `(root_p, root_q)` is the sum of the leaf fractions
 /// `(p_leaves[i], q_leaves[i])`, reducing the root claim to a single
 /// evaluation claim on the leaf MLEs.
-fn gkr_prove<E: Engine>(
+fn gkr_prove<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   p_leaves: Vec<E::Scalar>,
   q_leaves: Vec<E::Scalar>,
   ones_numerator: bool,
@@ -536,7 +556,9 @@ fn gkr_prove<E: Engine>(
 /// Verify a fractional-sum GKR proof against the claimed root fraction and the
 /// expected number of layers `d`. Returns the reduced leaf claim
 /// `(point, p_leaf(point), q_leaf(point))`.
-fn gkr_verify<E: Engine>(
+fn gkr_verify<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   root_p: E::Scalar,
   root_q: E::Scalar,
   d: usize,
@@ -630,7 +652,9 @@ fn gkr_verify<E: Engine>(
 /// then-current shared point. Per-tree input-layer finals remain in the
 /// proof (they seed the next layer's claims), grouped per layer in
 /// [`GkrMultiLayerProof`].
-fn gkr_prove_multi<E: Engine>(
+fn gkr_prove_multi<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   inputs: Vec<(Vec<E::Scalar>, Vec<E::Scalar>, bool)>,
   transcript: &mut E::TE,
 ) -> Result<(GkrMultiProof<E>, Vec<GkrTreeOut<E>>), SpartanError> {
@@ -891,7 +915,9 @@ fn gkr_prove_multi<E: Engine>(
 /// per layer end it checks `eq · Σ_i γ^i gate_i` against the reduced
 /// combined claim, then advances each tree's claim from its own finals.
 /// Returns each tree's `(leaf point, p, q)` claims.
-fn gkr_verify_multi<E: Engine>(
+fn gkr_verify_multi<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
   roots: &[(E::Scalar, E::Scalar)],
   depths: &[usize],
   proof: &GkrMultiProof<E>,
@@ -996,7 +1022,9 @@ fn gkr_verify_multi<E: Engine>(
 /// Evaluation claims a [`LogUpRangeProof`] reduces to, for the caller to
 /// discharge with PCS openings.
 #[derive(Clone, Debug)]
-pub struct RangeClaims<E: Engine> {
+pub struct RangeClaims<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   /// The LogUp challenge `r`.
   pub r: E::Scalar,
   /// Point at which the witness MLE must be opened (`ρ_L`).
@@ -1012,7 +1040,9 @@ pub struct RangeClaims<E: Engine> {
 /// A LogUp-GKR proof that a witness vector is range-bounded by `[0, 2^bits)`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct LogUpRangeProof<E: Engine> {
+pub struct LogUpRangeProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   p_lhs_root: E::Scalar,
   q_lhs_root: E::Scalar,
   p_rhs_root: E::Scalar,
@@ -1021,7 +1051,10 @@ pub struct LogUpRangeProof<E: Engine> {
   rhs_gkr: GkrProof<E>,
 }
 
-impl<E: Engine> LogUpRangeProof<E> {
+impl<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> LogUpRangeProof<E>
+{
   /// Number of variables of the padded witness polynomial (`log2` of the
   /// witness leaf count). The witness commitment must be over this many
   /// variables, with the trailing slots padded with the value `0`.
@@ -1190,7 +1223,9 @@ impl<E: Engine> LogUpRangeProof<E> {
 /// `(point, eval)` pair per witness tree (in input order), plus the single
 /// multiplicity claim. Each must be discharged with a PCS opening.
 #[derive(Clone, Debug)]
-pub struct MultiRangeClaims<E: Engine> {
+pub struct MultiRangeClaims<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   /// The (shared) LogUp challenge `r`.
   pub r: E::Scalar,
   /// `(ρ_i, w_i(ρ_i))` per witness tree, in input order.
@@ -1216,7 +1251,9 @@ pub struct MultiRangeClaims<E: Engine> {
 /// of two long (committed polynomials are); the table counts them all.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct LogUpMultiRangeProof<E: Engine> {
+pub struct LogUpMultiRangeProof<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> {
   /// Per-witness-tree root fraction `(P_b, Q_b)`.
   wit_roots: Vec<(E::Scalar, E::Scalar)>,
   p_rhs_root: E::Scalar,
@@ -1227,7 +1264,10 @@ pub struct LogUpMultiRangeProof<E: Engine> {
   gkr: GkrMultiProof<E>,
 }
 
-impl<E: Engine> LogUpMultiRangeProof<E> {
+impl<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+> LogUpMultiRangeProof<E>
+{
   /// The shared multiplicity table over all witness vectors:
   /// `m_j = Σ_b #{i : w_b[i] = j}`. Each witness must be power-of-two
   /// long (no implicit padding — committed polys already are). Callers
@@ -1416,6 +1456,7 @@ impl<E: Engine> LogUpMultiRangeProof<E> {
 mod tests {
   use super::*;
   use crate::provider::{PallasHyraxEngine, T256HyraxEngine};
+  use crate::traits::Engine;
   use ff::Field;
   use rand::{Rng, SeedableRng, rngs::StdRng};
 
