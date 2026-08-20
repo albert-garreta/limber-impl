@@ -34,10 +34,13 @@ pub struct F127([u64; 2]);
 
 impl PrimeFieldExt for F127 {
   fn from_uniform(bytes: &[u8]) -> Self {
-    // Horner over 128-bit chunks; 2^128 ≡ 2 (mod 2^127 − 1), so each
-    // step is acc·2 + chunk.
+    // Interpret `bytes` as a little-endian integer and reduce: Horner
+    // over 128-bit chunks from the MOST significant down; each step is
+    // acc·2^128 + chunk, and 2^128 ≡ 2 (mod 2^127 − 1). (Walking the
+    // chunks low-first once scaled every wide value by 8 — caught by
+    // the M127 MultiSwap run's reconstruction sumcheck.)
     let mut acc = F127::ZERO;
-    for chunk in bytes.chunks(16) {
+    for chunk in bytes.chunks(16).rev() {
       let mut le = [0u8; 16];
       le[..chunk.len()].copy_from_slice(chunk);
       acc = acc.double() + F127::from_u128(u128::from_le_bytes(le));

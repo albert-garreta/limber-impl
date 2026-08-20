@@ -1418,3 +1418,30 @@ Next steps (in order):
 
 The toy roundtrip (imod_modp_m127_toy_roundtrip) stays green; this is
 exactly the class of bug the real-scale smoke run exists to catch.
+
+## CORRECTION + first M127 numbers (2026-08-20)
+
+The "chain-bound slack bug" section above is RETRACTED: the paper's
+b-side bound (||g|| < (q-P)/2, |b| < q/P — documented verbatim at
+shift_b()) and its k-aware derivation were correct all along. The
+MultiSwap failure had two implementation causes, both from this
+week's refactors: (1) the LOG_Q parameterization pass left shift_b()
+computing q/P from the t256 modulus (fixed: shift_b::<F> generic over
+the actual q-side field; the CHAIN_BITS instrumentation showed
+236-bit b values against a 108-bit budget = exactly the 256-bit q);
+(2) F127::from_uniform walked LE 128-bit chunks lowest-first with
+highest weight, embedding every >64-bit value as 8x itself (fixed:
+.rev(); caught by the reconstruction sumcheck at verify).
+
+First end-to-end M127/Brakedown MultiSwap 2^13 (single-thread,
+unoptimized): **commit+prove 9.46 s, verify 272.6 ms, proof
+51.2 MB** (per_poly 9.8 KB, range_check 374 KB, combined_open
+50.8 MB). vs Hyrax/t256: 1.32 s / 21 ms / 175 KB. Attribution of the
+gap, in order: (a) the unbatched per-target Brakedown openings — the
+wq_open span alone is ~8.0 of 9.46 s and combined_open is 99% of the
+proof; this is exactly what the phase-2 two-tree batched opening
+removes; (b) eager DelayedReduction on F127 (every product reduced;
+the WideLimbs<5> fast path pending); (c) 16-bit limbs quadruple the
+limb-slot count vs log_t=64. The range check at 374 KB (vs 89 KB on
+t256+Hyrax at coarser limbs) says the protocol core is healthy;
+the floor is real and the levers are known.

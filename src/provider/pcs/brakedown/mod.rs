@@ -39,7 +39,7 @@ mod field_ab_tests {
       // Horner over 128-bit chunks; 2^128 ≡ 2 (mod 2^127 − 1), so each
       // step is acc·2 + chunk.
       let mut acc = F127::ZERO;
-      for chunk in bytes.chunks(16) {
+      for chunk in bytes.chunks(16).rev() {
         let mut le = [0u8; 16];
         le[..chunk.len()].copy_from_slice(chunk);
         acc = acc.double() + F127::from_u128(u128::from_le_bytes(le));

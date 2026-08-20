@@ -1197,8 +1197,11 @@ fn shift_a(params: &IntEvalParams) -> BigUint {
 /// `|b_j| < (q-P)/(2 p_i) < q/(2·P/2) = q/P` (using `p_i ≥ P/2`).
 /// So shifting by `⌊q/P⌋` is sound. Like `shift_a`, this is a public
 /// per-`params` constant.
-fn shift_b(params: &IntEvalParams) -> BigUint {
-  &field_q::<t256::Scalar>() / (BigUint::one() << params.log_p)
+/// Generic over the q-side field: `q` here must be the modulus of the
+/// field the chain actually runs over (a LOG_Q-pass bug once pinned
+/// this to t256's q, blowing the b-side budget 2^128-fold at q=127).
+fn shift_b<F: ff::PrimeField>(params: &IntEvalParams) -> BigUint {
+  &field_q::<F>() / (BigUint::one() << params.log_p)
 }
 
 /// Integer partial-evaluation at the *last* `k` variables. Given a
@@ -2379,7 +2382,7 @@ fn prove_one_poly<
           0
         };
         let s_a = BigInt::from(shift_a(params));
-        let s_b = BigInt::from(shift_b(params));
+        let s_b = BigInt::from(shift_b::<B::Scalar>(params));
 
         let mut a_prev_int: Vec<BigInt> = Vec::new();
         let mut a_prev_i256: Vec<I256> = Vec::new();
@@ -2440,6 +2443,15 @@ fn prove_one_poly<
             .map(biguint_to_scalar::<B::Scalar>)
             .collect();
 
+          if std::env::var_os("CHAIN_BITS").is_some() {
+            let max_a = a_j_shifted.iter().map(|v| v.bits()).max().unwrap_or(0);
+            let max_b = b_j_shifted.iter().map(|v| v.bits()).max().unwrap_or(0);
+            eprintln!(
+              "CHAIN_BITS layer j={j}: max|a_shifted|={max_a} bits (budget {}), max|b_shifted|={max_b} bits (budget {})",
+              params.log_p + 1,
+              params.log_q - params.log_p + 1
+            );
+          }
           iters.push(IterationProverState {
             a_shifted: a_j_shifted,
             a_shifted_fq: a_j_shifted_fq,
@@ -2983,7 +2995,7 @@ fn verify_one_poly<
   };
 
   let shift_a_fq = biguint_to_scalar::<B::Scalar>(&shift_a(params));
-  let shift_b_fq = biguint_to_scalar::<B::Scalar>(&shift_b(params));
+  let shift_b_fq = biguint_to_scalar::<B::Scalar>(&shift_b::<B::Scalar>(params));
 
   let log_bound_a = params.log_p + 1;
   let log_bound_b = params.log_q - params.log_p + 1;
