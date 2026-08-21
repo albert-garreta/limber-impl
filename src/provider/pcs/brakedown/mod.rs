@@ -12,9 +12,14 @@ pub mod eval;
 pub mod merkle;
 
 pub use code::{DEFAULT_SPEC, SPECS};
-pub use commit::{BrakedownCommitData, BrakedownParams, commit as brakedown_commit};
+pub use commit::{
+  BrakedownCommitData, BrakedownParams, commit as brakedown_commit,
+  commit_plain as brakedown_commit_plain,
+};
 pub use eval::{
-  BrakedownEvalArg, open_with_data as brakedown_open_with_data,
+  BrakedownDirectOpen, BrakedownEvalArg, BrakedownGroupArg, open_direct as brakedown_open_direct,
+  open_group as brakedown_open_group, open_with_data as brakedown_open_with_data,
+  verify_direct as brakedown_verify_direct, verify_group as brakedown_verify_group,
   verify_open as brakedown_verify_open,
 };
 

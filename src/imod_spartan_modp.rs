@@ -159,11 +159,12 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
     &self.eval_arg
   }
 
-  /// The flat list of per-target Brakedown opening arguments, for
-  /// proof-size anatomy accounting.
+  /// The Brakedown batch-opening argument (column-opening groups plus
+  /// directly-shipped small polynomials), for proof-size anatomy
+  /// accounting.
   pub fn bd_open_args(
     &self,
-  ) -> &[crate::provider::pcs::brakedown::BrakedownEvalArg<crate::provider::pt256::t256::Scalar>]
+  ) -> &crate::provider::pcs::commit_backend::BdBatchOpenArg<crate::provider::pt256::t256::Scalar>
   {
     &self.eval_arg.combined_open.backend
   }

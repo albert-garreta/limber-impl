@@ -1571,3 +1571,92 @@ Three wire-format changes, no protocol or performance cost (1.39 s /
 zstd now 14.9 MB (raw and compressed converging - the structure is
 captured natively). Next size step remains stacking (~-4.5 MB ->
 ~12.5 raw), then the packing/PCS-swap fork.
+
+## Same-point row batching: 17.1 -> 10.5 MB raw, 9.8 MB zstd (2026-08-21)
+
+The compressed proof was ~81% w-vectors: every target shipped its own
+proximity row and evaluation row (14 dense rows, 12.1 MB,
+incompressible). But the interleaved claim reduction gives all
+same-length targets the SAME opening point (tail suffixes of the one
+shared challenge vector), so per point-group the rows collapse:
+
+- ONE proximity row per group, with the random combination spanning
+  every member tree's rows (seed expands to n_rows x group_size
+  scalars).
+- ONE gamma-combined evaluation row per group; gamma squeezed after
+  all roots + claims are transcript-bound (standard same-point RLC).
+- Columns + Merkle multiproofs stay per-tree; the verifier checks
+  enc(w_prox)[c] and enc(w_eval)[c] against the gamma/r-weighted
+  column combinations, and inner(w_eval, e_col) against the
+  gamma-combined claims.
+
+Groups on MultiSwap 2^13: {w,q}@2^20, three targets@2^18, two@2^16 ->
+14 rows -> 6. Measured (single-thread, BDPCS one-shot):
+
+- proof 17.07 -> 10.53 MB raw; zstd -19 14.88 -> 9.80 MB
+- verify 143 -> 83 ms (row-encode count 14 -> 6; encoding the
+  combined rows dominates verify)
+- prove 1.363 s total (unchanged within variance)
+
+Implementation: `open_group`/`verify_group` + `BrakedownGroupArg` in
+brakedown/eval.rs; BdBackend groups OpenTargets by point equality in
+canonical order (verifier reconstructs the grouping deterministically
+from its own target list). Single-target `open_with_data` path kept
+for standalone use/tests. Remaining anatomy: rows 5.5 MB, columns
+2.8 MB, auth 2.1 MB. Next size step remains stacking (fewer trees ->
+fewer column/auth sets AND shorter rows), then packing / WHIR-swap.
+
+## Global row pair + direct-ship: 10.5 -> 6.57 MB raw, 6.04 zstd (2026-08-21)
+
+Second wave, same day. Three changes, all backend-local (no protocol
+or proof-schedule change):
+
+1. UNIFORM ROW LENGTH (`new_with_row_len`; BDROWLEN knob, default
+   2^15): all tree layouts share (row_len, spec, seed) and hence the
+   code. Because every opening point is a TAIL of the one shared
+   claim-reduction challenge vector, all points agree on their last
+   log2(row_len) coordinates - the column part of the tensor. So the
+   suffix-generalized group opening combines rows across DIFFERENT
+   lengths: one proximity row spanning every tree's rows, one
+   gamma-combined evaluation row with per-tree row weights. The whole
+   proof now carries ONE row pair.
+2. DIRECT-SHIP SMALL TARGETS (BDDIRECT knob, default n <= 2^16): a
+   group's row pair alone is 2*row_len dense elements, so for small
+   chunk polynomials (2-3 B/entry compact) the plaintext is cheaper
+   than ANY opening argument. Small targets ship their compact
+   coefficients; partition is deterministic in the target list.
+3. PLAIN-HASH COMMITMENTS for direct-ship sizes (`commit_plain`): the
+   commitment to a directly-shipped polynomial is just a hash of its
+   canonical bytes - no encoding, no Merkle tree. Verifier re-hashes
+   (microseconds) instead of recommitting through the code (this had
+   briefly pushed verify to 196 ms); prover skips building those
+   trees entirely.
+
+Sweep: BDROWLEN 2^15 beat 2^16 on ALL of proof/prove/verify (6.57 MB
+/ 1288 ms / 52 ms vs 7.55 / 1463 / 69) - with only w,q + one large ab
+poly left in the group, the row-cost side of L* shrank. Default now
+2^15.
+
+Measured (single-thread, median of 5): commit 389 ms, prove 919 ms,
+TOTAL 1313 ms (curve mode: 1350 ms - the hash prover is now FASTER
+than curve), verify 53 ms, proof 6,569,490 B raw / 6.04 MB zstd -19.
+Anatomy: row pair 2.10 MB, columns 3.06 MB, auth 0.83 MB, direct
+ships ~0.35 MB, protocol ~0.2 MB.
+
+Floor analysis at these parameters (t=1570 column opens at lambda=117
+via the delta/3 bound, 33 B entries): sqrt-PCS proofs are bounded
+below by ~2*sqrt(t * n * 33B) ~ 4-5 MB for the ~2.4M grouped
+elements. Remaining headroom within Brakedown:
+- Drop the dedicated proximity row (Diamond-Posen 2023 tensor-combination
+  proximity gaps would let the evaluation row double as the test):
+  -1.05 MB -> ~5.0 MB zstd. Soundness relies on DP23 for our exact
+  batched/heterogeneous setting - needs a careful write-up before
+  defaulting; would go in flag-gated.
+- Aux stacking (one tree for ab+mult): now only ~-0.3 MB (auth sets),
+  no longer worth the protocol change on its own.
+- Tighter column-open analysis (delta/3 -> proximity-gap delta/2 or
+  better for the expander code): t 1570 -> ~1050 or lower, cutting
+  columns+auth proportionally (~-1.3 MB). Citation work.
+Below ~4 MB requires committing fewer elements (packing: values not
+chunks, ~n/16 -> ~1.5 MB class) or a log-proof PCS over a two-adic
+field (WHIR-class over bn254::Fr: ~0.1-0.3 MB, prover +20-55%).

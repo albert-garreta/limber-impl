@@ -29,8 +29,9 @@
 use crate::{
   errors::SpartanError,
   provider::pcs::brakedown::{
-    BrakedownCommitData, BrakedownEvalArg, BrakedownParams, brakedown_commit,
-    brakedown_open_with_data, brakedown_verify_open,
+    BrakedownCommitData, BrakedownDirectOpen, BrakedownGroupArg, BrakedownParams, brakedown_commit,
+    brakedown_commit_plain, brakedown_open_direct, brakedown_open_group, brakedown_verify_direct,
+    brakedown_verify_group,
   },
   traits::PrimeFieldExt,
   traits::transcript::ByteTranscript,
@@ -47,6 +48,36 @@ const BD_LAMBDA: usize = 117;
 /// Public seed for the deterministic expander-code matrices; both prover
 /// and verifier derive identical layouts from (length, spec, seed).
 const BD_SEED: &[u8] = b"imod-modpcs-brakedown-v1";
+/// Targets of at most this many coefficients ship their (compact)
+/// polynomial directly instead of a column-opening argument: below this
+/// size the plaintext is smaller than the argument, and the verifier
+/// just recommits and evaluates. BDDIRECT overrides (benching knob).
+const BD_DIRECT_MAX: usize = 1 << 16;
+
+fn bd_direct_max() -> usize {
+  std::env::var("BDDIRECT")
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    .unwrap_or(BD_DIRECT_MAX)
+}
+
+/// The Brakedown backend's batch-opening argument: column-opening
+/// groups for the large targets (in group order) and directly-shipped
+/// polynomials for the small ones (in canonical target order). The
+/// partition and grouping are deterministic functions of the target
+/// list, so the verifier reconstructs them without transport.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+  serialize = "F: serde::Serialize + ff::PrimeField",
+  deserialize = "F: serde::de::DeserializeOwned + ff::PrimeField"
+))]
+pub struct BdBatchOpenArg<F> {
+  /// Grouped column-opening arguments for targets above the direct-ship
+  /// threshold.
+  pub groups: Vec<BrakedownGroupArg<F>>,
+  /// Directly-shipped small polynomials.
+  pub direct: Vec<BrakedownDirectOpen<F>>,
+}
 
 /// Per-length Brakedown layout cache (code sampling is deterministic in
 /// the public seed, so prover and verifier agree without transport).
@@ -74,8 +105,22 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
     // specs (932 ms / 133 ms on MultiSwap 2^13 single-thread) at
     // 22.5 MB proof vs spec1's 28 MB. See docs/imod_followups.md.
     .unwrap_or(crate::provider::pcs::brakedown::SPECS[3]);
-  let params: &'static BrakedownParams<F> =
-    Box::leak(Box::new(BrakedownParams::new(n, spec, BD_LAMBDA, BD_SEED)));
+  // Uniform row length across all lengths (BDROWLEN override, benching
+  // knob). Trees sharing (row_len, spec, seed) share the code, so the
+  // batch opening combines every tree's proximity/evaluation rows into
+  // ONE global pair — the per-tree layout optimum is worse than a
+  // shared-row global layout once rows are amortized across trees. The
+  // default 2^15 sits at the global optimum L* ≈ √(t·Σn/2) for the
+  // MultiSwap-scale target set and won the 2026-08-21 sweep against
+  // 2^16 on proof size, prover, AND verify (see docs/imod_followups.md).
+  let row_len = std::env::var("BDROWLEN")
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    .unwrap_or(1 << 15)
+    .min(n);
+  let params: &'static BrakedownParams<F> = Box::leak(Box::new(BrakedownParams::new_with_row_len(
+    n, spec, BD_LAMBDA, BD_SEED, row_len,
+  )));
   guard.insert(key, params as &'static (dyn Any + Send + Sync));
   params
 }
@@ -231,7 +276,7 @@ where
   type Comm = [u8; 32];
   type Blind = ();
   type Data = BrakedownCommitData<SE::Scalar>;
-  type BatchOpenArg = Vec<BrakedownEvalArg<SE::Scalar>>;
+  type BatchOpenArg = BdBatchOpenArg<SE::Scalar>;
 
   fn blind(_ck: &Self::Ck, _n: usize) -> Self::Blind {}
 
@@ -254,7 +299,14 @@ where
       padded.resize(params.poly_len(), Self::Scalar::from(0u64));
       &padded[..]
     };
-    let (root, data) = brakedown_commit(params, poly);
+    // Below the direct-ship threshold the opening ships the polynomial
+    // itself, so the commitment is just a plain hash of its canonical
+    // bytes — no encoding, no Merkle tree (see `open_targets`).
+    let (root, data) = if poly.len() <= bd_direct_max() {
+      brakedown_commit_plain(poly)
+    } else {
+      brakedown_commit(params, poly)
+    };
     bd_data_cache_put(root, data.clone());
     Ok((root, data))
   }
@@ -283,14 +335,61 @@ where
     targets: &[OpenTarget<'_, Self>],
     sub: &mut impl ByteTranscript,
   ) -> Result<Self::BatchOpenArg, SpartanError> {
-    let mut args = Vec::with_capacity(targets.len());
-    for t in targets {
-      let params = bd_params(t.poly.len().next_power_of_two());
-      let (eval, arg) = brakedown_open_with_data(params, t.comm, t.data, &t.point, sub)?;
-      debug_assert_eq!(eval, t.eval, "claim reduction / opening eval mismatch");
+    // Small targets ship their polynomial directly. The rest: targets
+    // whose layouts share a code (uniform row length) and whose points
+    // share their column suffix form ONE group with ONE proximity row
+    // and ONE gamma-combined evaluation row (per-target rows dominated
+    // the proof); with the uniform-row-length policy and the claim
+    // reduction's shared challenge tail, that is normally every large
+    // target. Both the partition and the grouping are by first
+    // appearance in the canonical target order, so the verifier
+    // reconstructs them deterministically.
+    let direct_max = bd_direct_max();
+    let mut direct = Vec::new();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (i, t) in targets.iter().enumerate() {
+      if 1usize << t.point.len() <= direct_max {
+        direct.push(brakedown_open_direct(t.poly));
+        continue;
+      }
+      let params = bd_params::<SE::Scalar>(1usize << t.point.len());
+      let lc = params.row_len.trailing_zeros() as usize;
+      match groups.iter_mut().find(|(rep, _)| {
+        let rp = &targets[*rep].point;
+        bd_params::<SE::Scalar>(1usize << rp.len()).row_len == params.row_len
+          && rp[rp.len() - lc..] == t.point[t.point.len() - lc..]
+      }) {
+        Some((_, members)) => members.push(i),
+        None => groups.push((i, vec![i])),
+      }
+    }
+    let mut args = Vec::with_capacity(groups.len());
+    for (rep, members) in &groups {
+      let params = bd_params(1usize << targets[*rep].point.len());
+      let items: Vec<(&[u8; 32], &BrakedownCommitData<SE::Scalar>, &[SE::Scalar])> = members
+        .iter()
+        .map(|&i| {
+          (
+            targets[i].comm,
+            targets[i].data,
+            targets[i].point.as_slice(),
+          )
+        })
+        .collect();
+      let (evals, arg) = brakedown_open_group(params, &items, sub)?;
+      for (k, &i) in members.iter().enumerate() {
+        debug_assert_eq!(
+          evals[k], targets[i].eval,
+          "claim reduction / opening eval mismatch"
+        );
+        let _ = (k, i);
+      }
       args.push(arg);
     }
-    Ok(args)
+    Ok(BdBatchOpenArg {
+      groups: args,
+      direct,
+    })
   }
 
   fn verify_targets(
@@ -299,14 +398,47 @@ where
     arg: &Self::BatchOpenArg,
     sub: &mut impl ByteTranscript,
   ) -> Result<(), SpartanError> {
-    if arg.len() != targets.len() {
+    // Reconstruct the prover's direct/grouped partition and grouping
+    // (shared code + shared column suffix) from the canonical target
+    // order.
+    let direct_max = bd_direct_max();
+    let mut n_direct = 0usize;
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (i, (comm, point, eval)) in targets.iter().enumerate() {
+      if 1usize << point.len() <= direct_max {
+        let a = arg
+          .direct
+          .get(n_direct)
+          .ok_or_else(|| SpartanError::ProofVerifyError {
+            reason: "brakedown backend: missing direct opening".to_string(),
+          })?;
+        brakedown_verify_direct(comm, point, *eval, a)?;
+        n_direct += 1;
+        continue;
+      }
+      let params = bd_params::<SE::Scalar>(1usize << point.len());
+      let lc = params.row_len.trailing_zeros() as usize;
+      match groups.iter_mut().find(|(rep, _)| {
+        let rp = &targets[*rep].1;
+        bd_params::<SE::Scalar>(1usize << rp.len()).row_len == params.row_len
+          && rp[rp.len() - lc..] == point[point.len() - lc..]
+      }) {
+        Some((_, members)) => members.push(i),
+        None => groups.push((i, vec![i])),
+      }
+    }
+    if arg.groups.len() != groups.len() || arg.direct.len() != n_direct {
       return Err(SpartanError::ProofVerifyError {
         reason: "brakedown backend: wrong number of opening arguments".to_string(),
       });
     }
-    for ((comm, point, eval), a) in targets.iter().zip(arg.iter()) {
-      let params = bd_params(1usize << point.len());
-      brakedown_verify_open(params, comm, point, *eval, a, sub)?;
+    for ((rep, members), a) in groups.iter().zip(arg.groups.iter()) {
+      let params = bd_params(1usize << targets[*rep].1.len());
+      let items: Vec<(&[u8; 32], &[SE::Scalar], SE::Scalar)> = members
+        .iter()
+        .map(|&i| (targets[i].0, targets[i].1.as_slice(), targets[i].2))
+        .collect();
+      brakedown_verify_group(params, &items, a, sub)?;
     }
     Ok(())
   }

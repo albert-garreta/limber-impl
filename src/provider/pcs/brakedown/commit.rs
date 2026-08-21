@@ -42,13 +42,31 @@ impl<F: PrimeFieldExt> BrakedownParams<F> {
     let t = num_column_opens(&spec, lambda);
     let target_rows = (spec.r * n as f64 / t.max(1) as f64).sqrt();
     let log_rows = (target_rows.log2().round() as i64).clamp(0, log_n as i64) as usize;
-    let n_rows = 1usize << log_rows;
-    let row_len = n >> log_rows;
+    Self::new_with_row_len(n, spec, lambda, seed, n >> log_rows)
+  }
+
+  /// Choose a layout with an explicit `row_len` (power of two dividing
+  /// `n`). Layouts sharing `(row_len, spec, seed)` share the code — the
+  /// prerequisite for combining opening rows across commitments of
+  /// different lengths.
+  pub fn new_with_row_len(
+    n: usize,
+    spec: CodeSpec,
+    lambda: usize,
+    seed: &[u8],
+    row_len: usize,
+  ) -> Self {
+    assert!(n.is_power_of_two(), "poly length must be a power of two");
+    assert!(
+      row_len.is_power_of_two() && row_len <= n,
+      "row length must be a power of two dividing the poly length"
+    );
+    let t = num_column_opens(&spec, lambda);
     let code = BrakedownCode::new(row_len, spec, seed);
     let n_cols = code.codeword_len();
     Self {
       code,
-      n_rows,
+      n_rows: n / row_len,
       row_len,
       n_cols,
       n_col_opens: t.min(n_cols),
@@ -88,6 +106,24 @@ pub(crate) fn column_to_bytes<F: PrimeField>(col: &[F]) -> Vec<u8> {
     buf.extend_from_slice(&bytes[..len]);
   }
   buf
+}
+
+/// Commit to a small polynomial as a plain hash of its canonical byte
+/// encoding — no code, no Merkle tree. Used for polynomials below the
+/// backend's direct-ship threshold, whose openings ship the polynomial
+/// itself: the verifier re-hashes the shipped bytes and evaluates the
+/// claim directly, so an encoded matrix would never be used. Binding
+/// follows from collision resistance of the hash on the injective
+/// encoding; the scheme is not hiding (as documented for this backend).
+pub fn commit_plain<F: PrimeFieldExt>(poly: &[F]) -> (Hash, BrakedownCommitData<F>) {
+  let root = hash_leaf(&column_to_bytes(poly));
+  (
+    root,
+    BrakedownCommitData {
+      encoded: Vec::new(),
+      tree: MerkleTree::from_leaves(vec![root]),
+    },
+  )
 }
 
 /// Commit to `poly` (length `params.poly_len()`): returns the Merkle root and

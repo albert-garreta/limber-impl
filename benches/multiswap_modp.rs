@@ -751,9 +751,13 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       println!("  dumped eval_arg ({} bytes) to {:?}", bytes.len(), path);
     }
     if std::env::var_os("BDANATOMY").is_some() {
-      for (t, a) in proof.bd_open_args().iter().enumerate() {
-        let (wp, we, cols, auth) = a.component_sizes();
-        println!("  target {t}: w_prox {wp} B, w_eval {we} B, columns {cols} B, auth {auth} B");
+      let open_args = proof.bd_open_args();
+      for (g, a) in open_args.groups.iter().enumerate() {
+        let (rows, cols, auth) = a.component_sizes();
+        println!("  group {g}: combined rows {rows} B, columns {cols} B, auth {auth} B");
+      }
+      for (d, a) in open_args.direct.iter().enumerate() {
+        println!("  direct {d}: {} B", a.size());
       }
     }
     println!(

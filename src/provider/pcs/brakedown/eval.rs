@@ -180,8 +180,347 @@ pub fn open<F: PrimeFieldExt>(
   open_with_data(params, &root, &data, point, transcript)
 }
 
-/// Like [`open`], but against an already-committed polynomial's retained
-/// [`BrakedownCommitData`] — skips the re-encode + re-hash `open` pays.
+/// A batch opening group: several commitments sharing one code layout
+/// (`row_len`, spec, seed) and opened at points with a common suffix —
+/// the last `log2(row_len)` coordinates, which determine the column
+/// weights — ship ONE proximity row and ONE gamma-combined evaluation
+/// row (the per-target rows were 80% of the compressed proof), plus
+/// per-tree columns and authentication. Member polynomials may have
+/// DIFFERENT lengths: each tree contributes its own rows and its own
+/// row-weight vector; only the column side of the tensor point must
+/// agree. Soundness is standard RLC batching: the proximity
+/// combination spans every tree's rows, and gamma is squeezed after
+/// all roots and claims are transcript-bound.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+  serialize = "F: serde::Serialize + ff::PrimeField",
+  deserialize = "F: serde::de::DeserializeOwned + ff::PrimeField"
+))]
+pub struct BrakedownGroupArg<F> {
+  w_prox: Vec<F>,
+  w_eval: Vec<F>,
+  /// Per tree, in group order: opened columns (sorted-unique challenge
+  /// order, compact encoding) and the Merkle multiproof.
+  trees: Vec<TreeOpening<F>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+  serialize = "F: serde::Serialize + ff::PrimeField",
+  deserialize = "F: serde::de::DeserializeOwned + ff::PrimeField"
+))]
+/// One tree's share of a [`BrakedownGroupArg`]: its opened columns and
+/// Merkle multiproof.
+pub struct TreeOpening<F> {
+  #[serde(with = "compact_columns")]
+  columns: Vec<Vec<F>>,
+  auth: Vec<Hash>,
+}
+
+impl<F: serde::Serialize + ff::PrimeField> BrakedownGroupArg<F> {
+  /// `(rows, columns, auth)` serialized bytes, for anatomy accounting.
+  pub fn component_sizes(&self) -> (usize, usize, usize) {
+    let rows = bincode::serialized_size(&self.w_prox).unwrap_or(0)
+      + bincode::serialized_size(&self.w_eval).unwrap_or(0);
+    let mut cols = 0u64;
+    let mut auth = 0u64;
+    for t in &self.trees {
+      cols += {
+        // compact encoding size via a probe serialize of the wrapper
+        bincode::serialized_size(t).unwrap_or(0) - bincode::serialized_size(&t.auth).unwrap_or(0)
+      };
+      auth += bincode::serialized_size(&t.auth).unwrap_or(0);
+    }
+    (rows as usize, cols as usize, auth as usize)
+  }
+}
+
+/// A directly-shipped small polynomial. For tiny non-hiding
+/// commitments the compact polynomial itself is smaller than any
+/// column-opening argument (a group's row pair alone is `2·row_len`
+/// dense field elements), so the verifier just recommits the shipped
+/// coefficients, checks the root, and evaluates the claim directly.
+/// No transcript interaction is involved.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+  serialize = "F: serde::Serialize + ff::PrimeField",
+  deserialize = "F: serde::de::DeserializeOwned + ff::PrimeField"
+))]
+pub struct BrakedownDirectOpen<F> {
+  /// The polynomial's coefficients (compact encoding; single entry).
+  #[serde(with = "compact_columns")]
+  poly: Vec<Vec<F>>,
+}
+
+impl<F: serde::Serialize + ff::PrimeField> BrakedownDirectOpen<F> {
+  /// Serialized (compact wire-format) size in bytes, for anatomy
+  /// accounting.
+  pub fn size(&self) -> usize {
+    bincode::serialized_size(self).unwrap_or(0) as usize
+  }
+}
+
+/// Package a small polynomial for direct shipping.
+pub fn open_direct<F: PrimeFieldExt>(poly: &[F]) -> BrakedownDirectOpen<F> {
+  BrakedownDirectOpen {
+    poly: vec![poly.to_vec()],
+  }
+}
+
+/// Verify a directly-shipped polynomial: re-hash the shipped bytes
+/// against the plain-hash commitment (see
+/// [`commit_plain`](super::commit_plain)) and evaluate the multilinear
+/// claim directly.
+pub fn verify_direct<F: PrimeFieldExt>(
+  root: &Hash,
+  point: &[F],
+  eval: F,
+  arg: &BrakedownDirectOpen<F>,
+) -> Result<(), SpartanError> {
+  if arg.poly.len() != 1 {
+    return Err(verr("direct: malformed argument"));
+  }
+  let poly = &arg.poly[0];
+  let n = 1usize << point.len();
+  if poly.len() > n {
+    return Err(verr("direct: polynomial length mismatch"));
+  }
+  let mut padded;
+  let full = if poly.len() == n {
+    poly.as_slice()
+  } else {
+    padded = poly.clone();
+    padded.resize(n, F::ZERO);
+    padded.as_slice()
+  };
+  if hash_leaf(&column_to_bytes(full)) != *root {
+    return Err(verr("direct: commitment mismatch"));
+  }
+  if inner(&eq_evals(point), full) != eval {
+    return Err(verr("direct: claimed evaluation does not match"));
+  }
+  Ok(())
+}
+
+/// The number of matrix rows a point of this length implies under
+/// `params`' shared row length.
+fn group_rows<F: PrimeFieldExt>(params: &BrakedownParams<F>, point_len: usize) -> usize {
+  let log_cols = params.row_len.trailing_zeros() as usize;
+  1usize << point_len.saturating_sub(log_cols)
+}
+
+/// Open a group of commitments sharing `params`' code at points with a
+/// common suffix. `items` are `(root, data, full point)` in canonical
+/// order; every `data` must use `params`' `row_len` (heights may
+/// differ). Returns the per-item evaluations and the argument.
+pub fn open_group<F: PrimeFieldExt>(
+  params: &BrakedownParams<F>,
+  items: &[(&Hash, &BrakedownCommitData<F>, &[F])],
+  transcript: &mut impl ByteTranscript,
+) -> Result<(Vec<F>, BrakedownGroupArg<F>), SpartanError> {
+  let log_cols = params.row_len.trailing_zeros() as usize;
+  for (root, data, point) in items {
+    debug_assert!(
+      point.len() >= log_cols,
+      "point shorter than the column part"
+    );
+    debug_assert_eq!(
+      data.encoded.len(),
+      group_rows(params, point.len()),
+      "commit data height does not match the point length"
+    );
+    debug_assert_eq!(
+      &point[point.len() - log_cols..],
+      &items[0].2[items[0].2.len() - log_cols..],
+      "grouped points must share their column suffix"
+    );
+    transcript.absorb_bytes(b"bd_root", *root);
+  }
+  let suffix = &items[0].2[items[0].2.len() - log_cols..];
+  let e_col = eq_evals(suffix);
+  let total_rows: usize = items
+    .iter()
+    .map(|(_, _, p)| group_rows(params, p.len()))
+    .sum();
+
+  // ONE proximity combination spanning every tree's rows.
+  let seed_rc = transcript.squeeze_bytes(b"bd_rcomb")?;
+  let r_all = expand_scalars::<F>(&seed_rc, total_rows);
+  let mut w_prox = vec![F::ZERO; params.row_len];
+  let mut off = 0usize;
+  for (_, data, point) in items {
+    let rows = group_rows(params, point.len());
+    let part = combine_message_rows(&data.encoded, &r_all[off..off + rows], params.row_len);
+    for (o, v) in w_prox.iter_mut().zip(part) {
+      *o += v;
+    }
+    off += rows;
+  }
+
+  // Per-item evaluation rows (each with its OWN row weights, from the
+  // prefix of its point), gamma-combined AFTER the claims are implied
+  // (gamma depends on the transcript state binding the roots).
+  let gamma = F::from_uniform(&transcript.squeeze_bytes(b"bd_gamma")?);
+  let mut w_eval = vec![F::ZERO; params.row_len];
+  let mut evals = Vec::with_capacity(items.len());
+  let mut g = F::ONE;
+  for (_, data, point) in items {
+    let e_row = eq_evals(&point[..point.len() - log_cols]);
+    let part = combine_message_rows(&data.encoded, &e_row, params.row_len);
+    evals.push(inner(&part, &e_col));
+    for (o, v) in w_eval.iter_mut().zip(part) {
+      *o += g * v;
+    }
+    g *= gamma;
+  }
+  transcript.absorb_bytes(b"bd_wprox", &column_to_bytes(&w_prox));
+  transcript.absorb_bytes(b"bd_weval", &column_to_bytes(&w_eval));
+
+  let seed_cols = transcript.squeeze_bytes(b"bd_cols")?;
+  let idxs = expand_indices(&seed_cols, params.n_col_opens, params.n_cols);
+  let mut unique = idxs;
+  unique.sort_unstable();
+  unique.dedup();
+  let trees = items
+    .iter()
+    .map(|(_, data, _)| TreeOpening {
+      columns: unique
+        .iter()
+        .map(|&c| data.encoded.iter().map(|row| row[c]).collect())
+        .collect(),
+      auth: data.tree.batch_path(&unique),
+    })
+    .collect();
+
+  Ok((
+    evals,
+    BrakedownGroupArg {
+      w_prox,
+      w_eval,
+      trees,
+    },
+  ))
+}
+
+/// Verifier mirror of [`open_group`]: `items` are `(root, full point,
+/// claimed eval)` in the same canonical order.
+pub fn verify_group<F: PrimeFieldExt>(
+  params: &BrakedownParams<F>,
+  items: &[(&Hash, &[F], F)],
+  arg: &BrakedownGroupArg<F>,
+  transcript: &mut impl ByteTranscript,
+) -> Result<(), SpartanError> {
+  if arg.trees.len() != items.len() {
+    return Err(verr("group: wrong number of tree openings"));
+  }
+  let log_cols = params.row_len.trailing_zeros() as usize;
+  for (root, point, _) in items {
+    if point.len() < log_cols
+      || point[point.len() - log_cols..] != items[0].1[items[0].1.len() - log_cols..]
+    {
+      return Err(verr("group: points do not share a column suffix"));
+    }
+    transcript.absorb_bytes(b"bd_root", *root);
+  }
+  let suffix = &items[0].1[items[0].1.len() - log_cols..];
+  let e_col = eq_evals(suffix);
+  let total_rows: usize = items
+    .iter()
+    .map(|(_, p, _)| group_rows(params, p.len()))
+    .sum();
+
+  let seed_rc = transcript.squeeze_bytes(b"bd_rcomb")?;
+  let r_all = expand_scalars::<F>(&seed_rc, total_rows);
+  let gamma = F::from_uniform(&transcript.squeeze_bytes(b"bd_gamma")?);
+  if arg.w_prox.len() != params.row_len || arg.w_eval.len() != params.row_len {
+    return Err(verr("group: bad combined-row length"));
+  }
+  transcript.absorb_bytes(b"bd_wprox", &column_to_bytes(&arg.w_prox));
+  transcript.absorb_bytes(b"bd_weval", &column_to_bytes(&arg.w_eval));
+
+  let seed_cols = transcript.squeeze_bytes(b"bd_cols")?;
+  let idxs = expand_indices(&seed_cols, params.n_col_opens, params.n_cols);
+  let mut unique = idxs.clone();
+  unique.sort_unstable();
+  unique.dedup();
+
+  let height = params.n_cols.next_power_of_two().trailing_zeros() as usize;
+  for ((root, point, _), tree) in items.iter().zip(&arg.trees) {
+    let rows = group_rows(params, point.len());
+    if tree.columns.len() != unique.len() {
+      return Err(verr("group: wrong number of opened columns"));
+    }
+    for col in &tree.columns {
+      if col.len() != rows {
+        return Err(verr("group: opened column has wrong height"));
+      }
+    }
+    let leaves: Vec<(usize, Hash)> = unique
+      .iter()
+      .zip(&tree.columns)
+      .map(|(&i, entries)| (i, hash_leaf(&column_to_bytes(entries))))
+      .collect();
+    if !verify_batch_path(root, height, &leaves, &tree.auth) {
+      return Err(verr("group: Merkle multiproof check failed"));
+    }
+  }
+
+  let enc_prox = params.code.encode(&arg.w_prox);
+  let enc_eval = params.code.encode(&arg.w_eval);
+  let pos: std::collections::HashMap<usize, usize> =
+    unique.iter().enumerate().map(|(k, &c)| (c, k)).collect();
+  let gammas: Vec<F> = {
+    let mut v = Vec::with_capacity(items.len());
+    let mut g = F::ONE;
+    for _ in items {
+      v.push(g);
+      g *= gamma;
+    }
+    v
+  };
+  let e_rows: Vec<Vec<F>> = items
+    .iter()
+    .map(|(_, point, _)| eq_evals(&point[..point.len() - log_cols]))
+    .collect();
+  let offsets: Vec<usize> = {
+    let mut v = Vec::with_capacity(items.len());
+    let mut off = 0;
+    for (_, point, _) in items {
+      v.push(off);
+      off += group_rows(params, point.len());
+    }
+    v
+  };
+  for &c in &idxs {
+    let k = *pos.get(&c).ok_or_else(|| verr("group: missing column"))?;
+    let mut prox = F::ZERO;
+    let mut ev = F::ZERO;
+    for (t, tree) in arg.trees.iter().enumerate() {
+      let col = &tree.columns[k];
+      prox += inner(&r_all[offsets[t]..offsets[t] + col.len()], col);
+      ev += gammas[t] * inner(&e_rows[t], col);
+    }
+    if prox != enc_prox[c] {
+      return Err(verr("group: proximity check failed"));
+    }
+    if ev != enc_eval[c] {
+      return Err(verr("group: eval-consistency check failed"));
+    }
+  }
+
+  // The gamma-combined row must open to the gamma-combined claims.
+  let combined_claim = items
+    .iter()
+    .zip(&gammas)
+    .fold(F::ZERO, |acc, ((_, _, e), g)| acc + *g * *e);
+  if inner(&arg.w_eval, &e_col) != combined_claim {
+    return Err(verr("group: claimed evaluations do not match"));
+  }
+  Ok(())
+}
+
+/// Open a single commitment at `point` (ungrouped path; grouped
+/// same-point openings should prefer [`open_group`]).
 pub fn open_with_data<F: PrimeFieldExt>(
   params: &BrakedownParams<F>,
   root: &Hash,
