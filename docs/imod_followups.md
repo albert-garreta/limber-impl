@@ -1556,3 +1556,18 @@ a THIRD Pareto point (balanced curve-free), not a dominator. Next
 de-risk: harness-bench the WHIR reference implementation
 (arkworks-based) at our sizes over bn254 before building - the
 Garuda-dig methodology.
+
+## Proof-size easy wins: 22.5 -> 17.1 MB raw (2026-08-21)
+
+Three wire-format changes, no protocol or performance cost (1.39 s /
+143 ms unchanged within variance):
+1. Compact length-prefixed encoding for shipped column entries
+   (mirrors the hashing encoding; deserializer enforces minimality,
+   so no malleability) - the native version of the zstd win.
+2. Column indices dropped from the wire: the verifier re-derives them
+   from the transcript and was only checking the shipped ones.
+3. BD_LAMBDA 128 -> 117, aligned with the accepted system floor
+   (same argument as LAMBDA_BOUND2): ~9% fewer opened columns.
+zstd now 14.9 MB (raw and compressed converging - the structure is
+captured natively). Next size step remains stacking (~-4.5 MB ->
+~12.5 raw), then the packing/PCS-swap fork.

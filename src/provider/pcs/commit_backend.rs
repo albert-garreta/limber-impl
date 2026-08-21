@@ -40,7 +40,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Security level for Brakedown layouts (column-open count derivation).
-const BD_LAMBDA: usize = 128;
+/// Aligned with the accepted system floor (~114-117 bits: the 2^-114
+/// fingerprint term and LAMBDA_BOUND2 = 117) rather than over-securing
+/// this one term to 128 - the same argument as the challenge bound.
+const BD_LAMBDA: usize = 117;
 /// Public seed for the deterministic expander-code matrices; both prover
 /// and verifier derive identical layouts from (length, spec, seed).
 const BD_SEED: &[u8] = b"imod-modpcs-brakedown-v1";

@@ -29,14 +29,81 @@ use std::collections::HashMap;
 /// covering all of them.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(
-  serialize = "F: serde::Serialize",
-  deserialize = "F: serde::de::DeserializeOwned"
+  serialize = "F: serde::Serialize + ff::PrimeField",
+  deserialize = "F: serde::de::DeserializeOwned + ff::PrimeField"
 ))]
 pub struct BrakedownEvalArg<F> {
   w_prox: Vec<F>,
   w_eval: Vec<F>,
-  columns: Vec<(usize, Vec<F>)>,
+  /// Opened columns in sorted-unique challenge order. The indices are
+  /// NOT shipped: the verifier re-derives them from the transcript, so
+  /// they were pure wire redundancy. Entries use the compact
+  /// length-prefixed encoding (committed chunk data is mostly small).
+  #[serde(with = "compact_columns")]
+  columns: Vec<Vec<F>>,
   auth: Vec<Hash>,
+}
+
+/// Length-prefixed field-element wire encoding for opened columns:
+/// each entry is `len (1 byte) || minimal little-endian repr bytes`.
+/// Bijective with canonical field elements, so the Merkle/consistency
+/// checks are unaffected; on chunk-granularity committed data this
+/// shrinks the dominant proof component ~2x versus 32-byte reprs.
+mod compact_columns {
+  use ff::PrimeField;
+  use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+
+  pub fn serialize<F: PrimeField, S: Serializer>(
+    cols: &[Vec<F>],
+    ser: S,
+  ) -> Result<S::Ok, S::Error> {
+    let encoded: Vec<Vec<u8>> = cols
+      .iter()
+      .map(|col| {
+        let mut buf = Vec::with_capacity(col.len() * 8);
+        for x in col {
+          let repr = x.to_repr();
+          let bytes = repr.as_ref();
+          let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+          buf.push(len as u8);
+          buf.extend_from_slice(&bytes[..len]);
+        }
+        buf
+      })
+      .collect();
+    encoded.serialize(ser)
+  }
+
+  pub fn deserialize<'de, F: PrimeField, D: Deserializer<'de>>(
+    de: D,
+  ) -> Result<Vec<Vec<F>>, D::Error> {
+    let encoded: Vec<Vec<u8>> = Vec::deserialize(de)?;
+    encoded
+      .into_iter()
+      .map(|buf| {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < buf.len() {
+          let len = buf[i] as usize;
+          i += 1;
+          let mut repr = F::Repr::default();
+          let dst = repr.as_mut();
+          if len > dst.len() || i + len > buf.len() {
+            return Err(D::Error::custom("bad column entry length"));
+          }
+          dst[..len].copy_from_slice(&buf[i..i + len]);
+          if len > 0 && dst[len - 1] == 0 {
+            return Err(D::Error::custom("non-minimal column entry"));
+          }
+          i += len;
+          let f =
+            Option::<F>::from(F::from_repr(repr)).ok_or_else(|| D::Error::custom("bad entry"))?;
+          out.push(f);
+        }
+        Ok(out)
+      })
+      .collect()
+  }
 }
 
 impl<F: serde::Serialize> BrakedownEvalArg<F> {
@@ -140,9 +207,9 @@ pub fn open_with_data<F: PrimeFieldExt>(
   let mut unique = idxs;
   unique.sort_unstable();
   unique.dedup();
-  let columns: Vec<(usize, Vec<F>)> = unique
+  let columns: Vec<Vec<F>> = unique
     .iter()
-    .map(|&c| (c, data.encoded.iter().map(|row| row[c]).collect()))
+    .map(|&c| data.encoded.iter().map(|row| row[c]).collect())
     .collect();
   let auth = data.tree.batch_path(&unique);
   Ok((
@@ -184,25 +251,23 @@ pub fn verify_open<F: PrimeFieldExt>(
   unique.sort_unstable();
   unique.dedup();
 
-  // The opened columns must be exactly the unique challenged indices, sorted.
+  // The columns arrive in sorted-unique challenge order (indices are
+  // re-derived, not shipped).
   if arg.columns.len() != unique.len() {
     return Err(verr("wrong number of opened columns"));
   }
-  for (col, &u) in arg.columns.iter().zip(&unique) {
-    if col.0 != u {
-      return Err(verr("opened column index does not match challenge"));
-    }
-    if col.1.len() != params.n_rows {
+  for col in &arg.columns {
+    if col.len() != params.n_rows {
       return Err(verr("opened column has wrong height"));
     }
   }
 
   // One batched Merkle multiproof over all opened columns.
   let height = params.n_cols.next_power_of_two().trailing_zeros() as usize;
-  let leaves: Vec<(usize, Hash)> = arg
-    .columns
+  let leaves: Vec<(usize, Hash)> = unique
     .iter()
-    .map(|(i, entries)| (*i, hash_leaf(&column_to_bytes(entries))))
+    .zip(&arg.columns)
+    .map(|(&i, entries)| (i, hash_leaf(&column_to_bytes(entries))))
     .collect();
   if !verify_batch_path(root, height, &leaves, &arg.auth) {
     return Err(verr("Merkle multiproof check failed"));
@@ -213,10 +278,10 @@ pub fn verify_open<F: PrimeFieldExt>(
   let enc_eval = params.code.encode(&arg.w_eval);
 
   // Per-challenge checks (a duplicate challenge index reuses its column).
-  let lookup: HashMap<usize, &[F]> = arg
-    .columns
+  let lookup: HashMap<usize, &[F]> = unique
     .iter()
-    .map(|(i, e)| (*i, e.as_slice()))
+    .zip(&arg.columns)
+    .map(|(&i, e)| (i, e.as_slice()))
     .collect();
   for &c in &idxs {
     let entries = lookup
@@ -303,7 +368,7 @@ mod tests {
 
     // tampered opened column entry
     let mut bad = arg.clone();
-    bad.columns[0].1[0] += F::ONE;
+    bad.columns[0][0] += F::ONE;
     let mut vt = Keccak256Transcript::<E>::new(b"bd");
     assert!(verify_open(&params, &root, &point, eval, &bad, &mut vt).is_err());
 
@@ -344,7 +409,7 @@ mod tests {
 
       let fb = 32usize; // bytes per field element / hash
       let rows_b = (arg.w_prox.len() + arg.w_eval.len()) * fb;
-      let col_b: usize = arg.columns.iter().map(|(_, e)| e.len() * fb).sum();
+      let col_b: usize = arg.columns.iter().map(|e| e.len() * fb).sum();
       let auth_b = arg.auth.len() * 32;
       let kb = (rows_b + col_b + auth_b) as f64 / 1024.0;
       println!(
