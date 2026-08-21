@@ -396,6 +396,61 @@ mod tests {
     );
   }
 
+  /// NTT-encode cost gate for the RS-code PCS direction (WHIR/Basefold
+  /// over an FFT-friendly q-side field). Radix-2 in-place NTT over
+  /// bn254::Fr (two-adicity 28, already a dependency) at Brakedown-
+  /// comparable sizes; compare against the measured expander encode
+  /// (~130 ms at 2^20 with rate 1.64).
+  /// Run: cargo test --release ntt_encode_gate -- --ignored --nocapture
+  #[test]
+  #[ignore]
+  fn ntt_encode_gate() {
+    use ff::{Field, PrimeField};
+    use halo2curves::bn256::Fr;
+    use rand_core::OsRng;
+    use std::time::Instant;
+
+    fn ntt(a: &mut [Fr], omega: Fr) {
+      let n = a.len();
+      let log_n = n.trailing_zeros();
+      // bit-reversal permutation
+      for i in 0..n {
+        let j = (i as u32).reverse_bits() >> (32 - log_n);
+        if (j as usize) > i {
+          a.swap(i, j as usize);
+        }
+      }
+      let mut len = 2;
+      while len <= n {
+        let w_len = omega.pow_vartime([(n / len) as u64]);
+        for start in (0..n).step_by(len) {
+          let mut w = Fr::ONE;
+          for k in 0..len / 2 {
+            let u = a[start + k];
+            let v = a[start + k + len / 2] * w;
+            a[start + k] = u + v;
+            a[start + k + len / 2] = u - v;
+            w *= w_len;
+          }
+        }
+        len <<= 1;
+      }
+    }
+
+    for log_n in [20usize, 21] {
+      let n = 1usize << log_n;
+      // 2^log_n-th root of unity: g^{(q-1)/2^log_n} for generator-derived g
+      let omega = Fr::ROOT_OF_UNITY.pow_vartime([1u64 << (Fr::S - log_n as u32)]);
+      assert_eq!(omega.pow_vartime([n as u64]), Fr::ONE);
+      let mut a: Vec<Fr> = (0..n).map(|_| Fr::random(OsRng)).collect();
+      let t = Instant::now();
+      ntt(&mut a, omega);
+      let ms = t.elapsed().as_secs_f64() * 1e3;
+      std::hint::black_box(&a);
+      println!("NTT bn254::Fr 2^{log_n}: {ms:.1} ms single-thread");
+    }
+  }
+
   // Small Mersenne prime 2^61 - 1, easy to verify against u128 arithmetic.
   fn test_params() -> FixedMontyParams<4> {
     let modulus: U256 = U256::from(0x1fff_ffff_ffff_ffff_u64);

@@ -1539,3 +1539,20 @@ multiplicity counts). Skip ell in {3,4,5} of the 16 leaf rounds,
 proof grows ~3*2^ell*32 B per layer (KB-scale). Projected: GKR
 301 -> ~200-230 ms, total ~1.30-1.33 s vs curve 1.35 - clearing the
 bar narrowly; combined with remaining opening trims, margin grows.
+
+## RS-code PCS direction: field swap unlocked, NTT gated (2026-08-21)
+
+t256's q-side field has two-adicity 1 - WHIR/STIR/FRI-family PCS are
+structurally unavailable over it. BUT the phase-1 genericization
+makes the q-side field a declaration, and bn254::Fr (two-adicity 28,
+PrimeFieldExt already impl'd in-tree) satisfies the same norm bounds
+at 254 bits. Gate measurement (ntt_encode_gate, dyn_prime.rs): naive
+radix-2 NTT over bn254::Fr = 277 ms at 2^20 / 587 ms at 2^21
+single-thread vs ~130 ms expander encode; optimized NTT plausibly at
+parity, but RS rate blowup (x2-4) and the LOSS of the input-sparsity
+guard (NTTs are dense) are real. Projection: WHIR-class swap =
+proofs ~100-300 KB (/70), verify fast, prover +20-55% (~1.7-2.2 s) -
+a THIRD Pareto point (balanced curve-free), not a dominator. Next
+de-risk: harness-bench the WHIR reference implementation
+(arkworks-based) at our sizes over bn254 before building - the
+Garuda-dig methodology.
