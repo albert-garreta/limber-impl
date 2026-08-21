@@ -965,7 +965,7 @@ mod tests {
     let mut accs = [acc; 8];
     let t0 = Instant::now();
     for _ in 0..reps {
-      for ch in affs.chunks_exact(8) {
+      for ch in affs.as_chunks::<8>().0 {
         for (a, ac) in ch.iter().zip(accs.iter_mut()) {
           *ac += *a;
         }
