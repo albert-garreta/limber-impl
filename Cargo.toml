@@ -67,10 +67,6 @@ name = "sha256_spartan"
 harness = false
 
 [[bench]]
-name = "sha256_neutronnova"
-harness = false
-
-[[bench]]
 name = "imod_spartan"
 harness = false
 

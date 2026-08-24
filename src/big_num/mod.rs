@@ -11,7 +11,6 @@ pub(crate) mod delayed_reduction;
 pub(crate) mod field_reduction_constants;
 pub(crate) mod macros;
 pub(crate) mod montgomery;
-pub(crate) mod small_value;
 
 mod limbs;
 

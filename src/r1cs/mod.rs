@@ -23,7 +23,6 @@ use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-mod folds;
 mod sparse;
 pub(crate) use sparse::FilteredSpmv;
 pub(crate) use sparse::PrecomputedSparseMatrix;
@@ -1241,32 +1240,6 @@ impl<E: Engine> SplitR1CSShape<E> {
     let num_extra = 1 + self.num_public + self.num_challenges;
     let out_len = num_vars + num_extra;
     self.bind_and_prepare_poly_ABC_inner(rx, r, out_len)
-  }
-
-  /// Full-size variant: output length = 2*num_vars (zero-padded).
-  /// Used by NeutronNova which passes poly_ABC directly to batched sumcheck.
-  /// Returns (poly_vec, lo_eff, hi_eff) where lo_eff/hi_eff are the non-zero
-  /// prefix lengths of the lo and hi halves respectively.
-  pub(crate) fn bind_and_prepare_poly_ABC_full(
-    &self,
-    rx: &[E::Scalar],
-    r: &E::Scalar,
-  ) -> (Vec<E::Scalar>, usize, usize) {
-    let num_vars = self.num_shared + self.num_precommitted + self.num_rest;
-    let vec = self.bind_and_prepare_poly_ABC_inner(rx, r, num_vars * 2);
-    // Variable layout in z: [shared|precommitted|rest|u|X|zeros]
-    // Sections start at padded boundaries: shared at 0, precommitted at num_shared,
-    // rest at num_shared+num_precommitted. Only unpadded vars within each section
-    // appear in constraints.
-    let lo_eff = if self.num_rest_unpadded > 0 {
-      self.num_shared + self.num_precommitted + self.num_rest_unpadded
-    } else if self.num_precommitted_unpadded > 0 {
-      self.num_shared + self.num_precommitted_unpadded
-    } else {
-      self.num_shared_unpadded
-    };
-    let hi_eff = 1 + self.num_public + self.num_challenges; // u + public inputs + challenges
-    (vec, lo_eff, hi_eff)
   }
 
   fn bind_and_prepare_poly_ABC_inner(

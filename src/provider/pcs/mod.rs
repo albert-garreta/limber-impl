@@ -14,7 +14,6 @@ pub mod brakedown;
 pub(crate) mod commit_backend;
 pub mod hyrax_pc;
 pub mod integer_modpcs;
-pub mod kzh_pc;
 
 /// Pre-build the deterministic Brakedown layout for a given polynomial
 /// length (public code matrices; conceptually setup work). Returns the

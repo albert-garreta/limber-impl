@@ -67,12 +67,6 @@ impl<Scalar: PrimeField> MultilinearPolynomial<Scalar> {
     }
   }
 
-  /// Creates a new polynomial with known non-zero prefix lengths for each half.
-  /// For a polynomial of size 2n: Z[i]=0 for lo_eff <= i < n, Z[n+i]=0 for hi_eff <= i < n.
-  pub fn new_with_halves(Z: Vec<Scalar>, lo_eff: usize, hi_eff: usize) -> Self {
-    MultilinearPolynomial { Z, lo_eff, hi_eff }
-  }
-
   /// Returns the effective number of pairs to iterate in bind/eval: max(lo, hi) clamped to n.
   #[inline(always)]
   pub fn eff_pairs(&self) -> usize {

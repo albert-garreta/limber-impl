@@ -76,6 +76,4 @@ mod big_num_tests {
   crate::test_field_reduction_constants!(t256_frc, crate::provider::pt256::t256::Scalar);
   crate::test_montgomery!(t256_mont, crate::provider::pt256::t256::Scalar);
   crate::test_delayed_reduction!(t256_dr, crate::provider::pt256::t256::Scalar);
-  crate::test_small_value!(t256_sv, crate::provider::pt256::t256::Scalar);
-  crate::test_small_value!(p256_sv, crate::provider::pt256::p256::Scalar);
 }
