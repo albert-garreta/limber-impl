@@ -4,7 +4,7 @@
 //! `⌈R·n⌉`, with sparse random matrices `A` (precode) and `B` (postcode) sampled
 //! deterministically from a public seed. Parameters and density formulas are
 //! ported from the Brakedown authors' reference impl `conroi/lcpc`
-//! (`lcpc-brakedown-pc`); see `docs/brakedown_design.md` for the full citation.
+//! (`lcpc-brakedown-pc`), per the paper (eprint 2021/1043).
 //!
 //! Soundness of the PCS built on this code rests on the code's relative minimum
 //! distance `δ = β/R`; the IOPP opens `num_column_opens(spec, λ)` columns.

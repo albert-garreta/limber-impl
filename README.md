@@ -98,13 +98,39 @@ RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multisw
 ```
 
 Set `PSIZE=1` to print serialized proof sizes and `KSWEEP=1` to sweep
-the reduction parameter `k` (see the bench's module docs for what is
-wired faithfully vs modeled by operation count). The Arkworks/Garuda
-baseline row comes from an external harness.
+the reduction parameter `k`. The bench's default config is the paper's
+statement — 4 Wesolowski exponentiations with 352-bit exponents mod an
+RSA-2048 modulus, swept over the swap batch size `k`; see the bench's
+module docs for what is wired faithfully vs modeled by operation
+count.
+
+**Arkworks/Garuda baseline row**: measured with an external harness,
+[`bbuenz/rsa-exp-snark`](https://github.com/bbuenz/rsa-exp-snark)
+(GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic;
+Garuda/Pari from
+[`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari),
+BLS12-381), patched to print `proof.serialized_size()` after verify.
+The paper's `(352, 4)` schoolbook statement synthesizes to ~25.2M
+constraints; reproducing the full-size row needs ~14 GB of RAM
+(single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof
+7,168 B compressed).
 
 **Zinc+ comparison**: our side is the `multiswap_modp` run above at
-2^13 rows; the Zinc+ side requires pinning specific revisions of
-their repo to build at all.
+2^13 rows. Their side needs revision pinning to build: check out
+[`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus)
+at `7eadc16` (the release the paper figures came from) and pin its
+`crypto-primitives` git dependency to rev `2cf39db8` (the revision
+that May code was written against — later revs change the
+`PrimeField` API and nothing compiles); then
+
+```bash
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
+  cargo bench --bench e2e --features "parallel simd unchecked iprs-rate-1-8"
+```
+
+Zinc+ ships no big-integer benchmark, so the 2048-bit workload is a
+small custom UAIR — one `a·b ≡ c (mod N)` per row via
+`assert_zero(a·b − c − k·N)` — written against their framework.
 
 ## References
 

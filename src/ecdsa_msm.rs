@@ -4,8 +4,8 @@
 //! relation `A·z ∘ B·z = C·z + m∘q` (per-row modulus `m = p`, the secp256k1
 //! base prime). EC coordinates are affine; divisions use prover-advice (one
 //! row). Subtractions use **difference witnesses** to stay non-negative (a
-//! `(p−1)`-coefficient negation would produce negative quotients — unsound here;
-//! see `docs/ecdsa_benchmark_plan.md`). All witness/quotient values are `< p`.
+//! `(p−1)`-coefficient negation would produce negative quotients — unsound
+//! here). All witness/quotient values are `< p`.
 //!
 //! This is the gadget layer; the full Shamir MSM loop and bench build on it.
 

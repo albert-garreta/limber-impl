@@ -11,7 +11,7 @@
 //! stack is sumcheck- and expander-code-based and never runs an FFT.
 //! Curve-based commitments cannot use this field (a ~2^127 group has
 //! only ~63-bit discrete-log security); it is only sound with the
-//! hash-based (Brakedown) backend, per `docs/imod_followups.md`.
+//! hash-based (Brakedown) backend.
 //! Challenges are drawn from the base field under the accepted
 //! `LAMBDA_BOUND2 = 117` target.
 

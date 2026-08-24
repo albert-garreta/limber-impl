@@ -20,7 +20,7 @@
 //! representation is a single imod row here. This bench measures exactly
 //! that collapse.
 //!
-//! Fidelity (see docs/multiswap_modp_bench_plan.md): the 4 group
+//! Fidelity: the 4 group
 //! exponentiations are **real wired square-and-multiply chains** with
 //! witness exponents, bit decomposition, and reconstruction constraints.
 //! The bases are fixed constants baked into matrix coefficients (avoiding

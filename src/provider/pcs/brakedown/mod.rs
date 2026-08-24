@@ -1,10 +1,11 @@
 //! Brakedown polynomial commitment scheme — group-free, based on a linear-time
 //! expander code + Merkle column commitments (no curve / MSM).
 //!
-//! See `docs/brakedown_design.md` for the construction, parameters, and the
-//! commit/open/verify (tensor IOPP) plan. Built standalone first (Milestone 1);
-//! the Mod-PCS integration is deferred (it needs commitment homomorphism a
-//! Merkle commitment lacks).
+//! Construction, parameters, and the commit/open/verify (tensor IOPP) shape
+//! follow *Brakedown: Linear-time and field-agnostic SNARKs for R1CS*
+//! (Golovnev, Lee, Setty, Thaler, Wahby — eprint 2021/1043). Built
+//! standalone; the Mod-PCS integration is deferred (it needs commitment
+//! homomorphism a Merkle commitment lacks).
 
 pub mod code;
 pub mod commit;

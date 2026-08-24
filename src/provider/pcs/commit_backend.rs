@@ -103,7 +103,7 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
     // dominant point of the 2026-08-20 sweep on the sparsity-guarded
     // encoder at k=11: prover and verify within noise of the lighter
     // specs (932 ms / 133 ms on MultiSwap 2^13 single-thread) at
-    // 22.5 MB proof vs spec1's 28 MB. See docs/imod_followups.md.
+    // 22.5 MB proof vs spec1's 28 MB.
     .unwrap_or(crate::provider::pcs::brakedown::SPECS[3]);
   // Uniform row length across all lengths (BDROWLEN override, benching
   // knob). Trees sharing (row_len, spec, seed) share the code, so the
@@ -112,7 +112,7 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
   // shared-row global layout once rows are amortized across trees. The
   // default 2^15 sits at the global optimum L* ≈ √(t·Σn/2) for the
   // MultiSwap-scale target set and won the 2026-08-21 sweep against
-  // 2^16 on proof size, prover, AND verify (see docs/imod_followups.md).
+  // 2^16 on proof size, prover, AND verify.
   let row_len = std::env::var("BDROWLEN")
     .ok()
     .and_then(|v| v.parse::<usize>().ok())
