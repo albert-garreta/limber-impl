@@ -284,6 +284,10 @@ macro_rules! impl_traits_no_dlog_ext {
         debug_assert!(c < (1u64 << 16));
         table[c as usize]
       }
+
+      fn mul_u64_scaled(&self, v: u64) -> Self {
+        $crate::big_num::montgomery::mul_u64_scaled(self, v)
+      }
     }
 
     impl TranscriptReprTrait for $name::Scalar {

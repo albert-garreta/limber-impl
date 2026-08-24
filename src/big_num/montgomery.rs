@@ -29,10 +29,8 @@ pub trait MontgomeryLimbs: FieldReductionConstants {
 /// 8 limb-mults vs ~32 for a full field multiplication.
 ///
 /// This is the scalar primitive version of what `msm_small` does
-/// internally; the GKR univariate skip accumulates with it.
-// Staged: consumed by the GKR univariate-skip prover (gkr_uniskip_plan
-// steps 2-5); until then only tests exercise it.
-#[allow(dead_code)]
+/// internally; the GKR leaf-skip round accumulates with it (via the
+/// `PrimeFieldExt::mul_u64_scaled` override).
 #[inline]
 pub fn mul_u64_scaled<F: MontgomeryLimbs + Copy>(a: &F, b: u64) -> F {
   let al = a.to_limbs();

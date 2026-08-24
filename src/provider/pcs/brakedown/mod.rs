@@ -40,6 +40,25 @@ mod field_ab_tests {
   #[PrimeFieldReprEndianness = "little"]
   struct F127([u64; 2]);
 
+  /// Eager accumulator so the test field satisfies the
+  /// `DelayedReduction` supertrait of `PrimeFieldExt`.
+  #[derive(Clone, Copy, Default)]
+  struct F127Acc(F127);
+  impl core::ops::AddAssign for F127Acc {
+    fn add_assign(&mut self, rhs: Self) {
+      self.0 += rhs.0;
+    }
+  }
+  impl crate::traits::DelayedReduction<F127> for F127 {
+    type Accumulator = F127Acc;
+    fn unreduced_multiply_accumulate(acc: &mut F127Acc, field: &Self, value: &F127) {
+      acc.0 += *field * *value;
+    }
+    fn reduce(acc: &F127Acc) -> Self {
+      acc.0
+    }
+  }
+
   impl PrimeFieldExt for F127 {
     fn from_uniform(bytes: &[u8]) -> Self {
       // Horner over 128-bit chunks; 2^128 ≡ 2 (mod 2^127 − 1), so each

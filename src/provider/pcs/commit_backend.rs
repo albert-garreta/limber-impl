@@ -99,12 +99,12 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
     .ok()
     .and_then(|v| v.parse::<usize>().ok())
     .map(|i| crate::provider::pcs::brakedown::SPECS[i])
-    // Default for the Mod-PCS backend: spec3 (beta=0.082, R=1.64) — the
-    // dominant point of the 2026-08-20 sweep on the sparsity-guarded
-    // encoder at k=11: prover and verify within noise of the lighter
-    // specs (932 ms / 133 ms on MultiSwap 2^13 single-thread) at
-    // 22.5 MB proof vs spec1's 28 MB.
-    .unwrap_or(crate::provider::pcs::brakedown::SPECS[3]);
+    // Default for the Mod-PCS backend: spec4 — after the 2026-08-24
+    // delayed-reduction encoder win the prover margin comfortably
+    // absorbs the denser code (~+35 ms for -0.7 MB proof vs spec3;
+    // spec5 buys only -0.15 MB more for another ~+80 ms). Sweep in
+    // docs/imod_followups.md.
+    .unwrap_or(crate::provider::pcs::brakedown::SPECS[4]);
   // Uniform row length across all lengths (BDROWLEN override, benching
   // knob). Trees sharing (row_len, spec, seed) share the code, so the
   // batch opening combines every tree's proximity/evaluation rows into

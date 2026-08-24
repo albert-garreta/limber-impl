@@ -3906,6 +3906,7 @@ fn prove_combined_batch_open<B: CommitBackend>(
   // 1. Per commitment: bind claims, squeeze λ, build W and the combined
   //    running claim.
   let (_bw_span, bw_t) = start_span!("bo_w_build");
+  let mut eq_cache = EqTableCache::new();
   let mut fs = Vec::with_capacity(m);
   let mut ws = Vec::with_capacity(m);
   let mut run = Vec::with_capacity(m);
@@ -3914,7 +3915,13 @@ fn prove_combined_batch_open<B: CommitBackend>(
     debug_assert!(!claims.points.is_empty());
     absorb_batch_claims::<B>(sub, comm, claims);
     let lambda = B::Scalar::from_uniform(&sub.squeeze_bytes(b"bo_lambda")?);
-    let (w, c) = batch_weight(&claims.points, &claims.evals, lambda, poly.len());
+    let (w, c) = batch_weight(
+      &claims.points,
+      &claims.evals,
+      lambda,
+      poly.len(),
+      &mut eq_cache,
+    );
     fs.push(crate::polys::multilinear::MultilinearPolynomial::new(
       poly.to_vec(),
     ));
@@ -3923,7 +3930,7 @@ fn prove_combined_batch_open<B: CommitBackend>(
     nv.push(poly.len().trailing_zeros() as usize);
   }
   let n_max = *nv.iter().max().expect("non-empty targets");
-  info!(elapsed_ms = %bw_t.elapsed().as_millis(), m = %m, "bo_w_build");
+  info!(elapsed_ms = %bw_t.elapsed().as_millis(), m = %m, eq_builds = %eq_cache.entries.len(), eq_hits = %eq_cache.hits, "bo_w_build");
   let (_bs_span, bs_t) = start_span!("bo_interleaved_sc");
 
   // 2. Interleaved, tail-aligned sumcheck rounds: per global round, all
@@ -4130,11 +4137,41 @@ fn verify_combined_batch_open<B: CommitBackend>(
 /// The output is bit-identical to the naive construction (the structure
 /// only changes how the same table is assembled), so the transcript and
 /// verifier are unaffected.
+/// Memo for eq-evaluation tables keyed by their (tail) point. The
+/// batched-open claims repeat a handful of distinct points many times —
+/// every same-depth range-check claim tails off with the SAME shared
+/// GKR leaf point, across lanes — so a linear-scan cache turns most
+/// `2^k`-multiplication table builds into lookups.
+struct EqTableCache<F> {
+  entries: Vec<(Vec<F>, std::sync::Arc<Vec<F>>)>,
+  hits: usize,
+}
+
+impl<F: ff::PrimeField> EqTableCache<F> {
+  fn new() -> Self {
+    Self {
+      entries: Vec::new(),
+      hits: 0,
+    }
+  }
+
+  fn get(&mut self, point: &[F]) -> std::sync::Arc<Vec<F>> {
+    if let Some((_, tbl)) = self.entries.iter().find(|(p, _)| p.as_slice() == point) {
+      self.hits += 1;
+      return tbl.clone();
+    }
+    let tbl = std::sync::Arc::new(EqPolynomial::<F>::evals_from_points(point));
+    self.entries.push((point.to_vec(), tbl.clone()));
+    tbl
+  }
+}
+
 fn batch_weight<F: ff::PrimeField>(
   points: &[Vec<F>],
   evals: &[F],
   lambda: F,
   n: usize,
+  cache: &mut EqTableCache<F>,
 ) -> (Vec<F>, F) {
   let n_vars = n.trailing_zeros() as usize;
   debug_assert_eq!(1usize << n_vars, n);
@@ -4163,7 +4200,7 @@ fn batch_weight<F: ff::PrimeField>(
       for c in &z[..h] {
         block = (block << 1) | usize::from(*c == F::ONE);
       }
-      let tail = EqPolynomial::<F>::evals_from_points(&z[h..]);
+      let tail = cache.get(&z[h..]);
       let bs = tail.len();
       let lam = lam_pow;
       w[block * bs..(block + 1) * bs]
@@ -4191,7 +4228,7 @@ fn batch_weight<F: ff::PrimeField>(
       let mut small = vec![F::ZERO; tail_len];
       for c in i..j {
         debug_assert_eq!(&points[c][..p], &z[..p]);
-        let tail = EqPolynomial::<F>::evals_from_points(&points[c][p..]);
+        let tail = cache.get(&points[c][p..]);
         let lam = lam_pow;
         for (sj, e) in small.iter_mut().zip(tail.iter()) {
           *sj += lam * e;
@@ -4212,7 +4249,7 @@ fn batch_weight<F: ff::PrimeField>(
     }
 
     // Singleton: one full-size accumulate.
-    let eq_c = EqPolynomial::<F>::evals_from_points(z);
+    let eq_c = cache.get(z);
     let lam = lam_pow;
     w.par_iter_mut()
       .zip(eq_c.par_iter())
@@ -4441,20 +4478,29 @@ where
       .collect();
     chunk_claims[*bi].push(ext, *eval - B::Scalar::from(d.top_shift()));
   }
-  // Inactive blocks: pin each to zero with a fresh random-point claim.
+  // Inactive blocks: pin each to zero at ONE shared random point per
+  // batch (distinct boolean block prefixes keep the claims independent;
+  // per-block Schwartz–Zippel is unaffected by sharing the challenge).
+  // Sharing lets the batch-open eq-table cache serve every inactive
+  // block of a batch from one build.
   for (bi, act) in active_blocks.iter().enumerate() {
     let n_chunk_vars = ceil_log2(chunk_vals_all[bi].len().max(1));
     let (block_log, _) = rc_block_split(chunk_vals_all[bi].len());
+    let mut r_blk: Option<Vec<B::Scalar>> = None;
     for (blk, &a) in act.iter().enumerate() {
       if a {
         continue;
       }
-      let r_blk: Vec<B::Scalar> = (0..block_log)
-        .map(|_| sub.squeeze(b"range_zblk"))
-        .collect::<Result<Vec<_>, _>>()?;
+      if r_blk.is_none() {
+        r_blk = Some(
+          (0..block_log)
+            .map(|_| sub.squeeze(b"range_zblk"))
+            .collect::<Result<Vec<_>, _>>()?,
+        );
+      }
       let full: Vec<B::Scalar> = bool_point_of_index::<B::Scalar>(blk, n_chunk_vars - block_log)
         .into_iter()
-        .chain(r_blk)
+        .chain(r_blk.as_ref().expect("just set").iter().copied())
         .collect();
       chunk_claims[bi].push(full, B::Scalar::ZERO);
     }
@@ -4696,20 +4742,26 @@ where
       .collect();
     chunk_claims[bi].push(ext, *eval - B::Scalar::from(d.top_shift()));
   }
-  // Inactive blocks: same fresh random-point zero claims as the prover.
+  // Inactive blocks: same shared-per-batch random-point zero claims as
+  // the prover.
   for (bi, (d, act)) in dims.iter().zip(active_blocks.iter()).enumerate() {
     let n_chunk_vars = ceil_log2(d.n_chunks.max(1));
     let (block_log, _) = rc_block_split(d.n_chunks);
+    let mut r_blk: Option<Vec<B::Scalar>> = None;
     for (blk, &a) in act.iter().enumerate() {
       if a {
         continue;
       }
-      let r_blk: Vec<B::Scalar> = (0..block_log)
-        .map(|_| sub.squeeze(b"range_zblk"))
-        .collect::<Result<Vec<_>, _>>()?;
+      if r_blk.is_none() {
+        r_blk = Some(
+          (0..block_log)
+            .map(|_| sub.squeeze(b"range_zblk"))
+            .collect::<Result<Vec<_>, _>>()?,
+        );
+      }
       let full: Vec<B::Scalar> = bool_point_of_index::<B::Scalar>(blk, n_chunk_vars - block_log)
         .into_iter()
-        .chain(r_blk)
+        .chain(r_blk.as_ref().expect("just set").iter().copied())
         .collect();
       chunk_claims[bi].push(full, B::Scalar::ZERO);
     }
@@ -5234,7 +5286,7 @@ mod tests {
     let evals: Vec<t256::Scalar> = (0..points.len() as u64).map(|i| rnd(70 + i)).collect();
     let lambda = rnd(31337);
 
-    let (w, claim) = batch_weight(&points, &evals, lambda, n);
+    let (w, claim) = batch_weight(&points, &evals, lambda, n, &mut EqTableCache::new());
 
     let mut w_naive = vec![t256::Scalar::ZERO; n];
     let mut claim_naive = t256::Scalar::ZERO;

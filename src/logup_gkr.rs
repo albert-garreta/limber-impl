@@ -42,6 +42,7 @@ use crate::{
   errors::SpartanError,
   polys::eq::EqPolynomial,
   traits::{
+    PrimeFieldExt,
     mod_engine::SumcheckEngine,
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
@@ -168,6 +169,12 @@ struct GkrOut<
 pub(crate) struct GkrMultiLayerProof<
   E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
 > {
+  /// When the layer skips its first two rounds (see [`skip_at_layer`]):
+  /// the γ-combined bivariate restriction of the first two sumcheck
+  /// variables, as 16 evaluations on the `{0,1,2,3}²` grid (row-major,
+  /// `grid[t1·4 + t2]`, eq factors included). Replaces the first two
+  /// entries of `round_polys`.
+  skip: Option<Vec<E::Scalar>>,
   round_polys: Vec<[E::Scalar; 4]>,
   finals: Vec<[E::Scalar; 4]>,
 }
@@ -197,6 +204,50 @@ struct GkrTreeOut<
   leaf_q: E::Scalar,
 }
 
+/// Whether layer `k` of the lockstep walk replaces its first two
+/// sumcheck rounds with one bivariate skip round: every active tree
+/// must be at its leaf layer (`depth == k+1`), where the tables are
+/// still structured input data, and there must be at least two
+/// variables to skip. Depths are known to both sides, so the predicate
+/// is transcript-deterministic. `GKRSKIP=0` disables (benching knob;
+/// prover and verifier share the process).
+fn skip_at_layer(k: usize, active_depths: &[usize]) -> bool {
+  k >= 2
+    && !active_depths.is_empty()
+    && active_depths.iter().all(|&d| d == k + 1)
+    && std::env::var("GKRSKIP").map_or(true, |v| v != "0")
+}
+
+/// Evaluate the bivariate on the `{0,1,2,3}²` grid (row-major) at
+/// `(u1, u2)` by two nested Lagrange interpolations.
+fn eval_grid16<F: PrimeField>(cc: &CubicConsts<F>, grid: &[F], u1: F, u2: F) -> F {
+  debug_assert_eq!(grid.len(), 16);
+  let rows: [F; 4] = core::array::from_fn(|i| {
+    eval_cubic_with(
+      cc,
+      &[
+        grid[i * 4],
+        grid[i * 4 + 1],
+        grid[i * 4 + 2],
+        grid[i * 4 + 3],
+      ],
+      u2,
+    )
+  });
+  eval_cubic_with(cc, &rows, u1)
+}
+
+/// `eq(i; c) = (1-c)(1-i) + c·i` at the small integer node `i`.
+fn eq_at_node<F: PrimeField>(c: F, i: usize) -> F {
+  let fi = F::from(i as u64);
+  (F::ONE - c) * (F::ONE - fi) + c * fi
+}
+
+/// The 2×4 extension coefficients of one boolean variable to the nodes
+/// `{0,1,2,3}`: `ext[i] = (1-i, i)` as small signed integers. A table
+/// value extends to node `i` as `(1-i)·T(0,·) + i·T(1,·)`.
+const EXT2: [[i64; 2]; 4] = [[1, 0], [0, 1], [-1, 2], [-2, 3]];
+
 /// Build all layers of the fraction tree from the leaves up to the root.
 /// `levels_p[k]` / `levels_q[k]` hold the `2^k`-entry layer; `[d]` is the
 /// leaves and `[0]` the single-entry root.
@@ -206,6 +257,7 @@ fn build_levels<
   p_leaves: Vec<E::Scalar>,
   q_leaves: Vec<E::Scalar>,
   ones_numerator: bool,
+  hint: LeafHint<'_, E::Scalar>,
 ) -> (Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>) {
   // With all-ones numerators the leaf `p` table is never read (the leaf
   // combine uses `q` only, and the leaf layer's sumcheck treats the
@@ -222,6 +274,69 @@ fn build_levels<
     let half = 1usize << k;
     let mut op = vec![E::Scalar::ZERO; half];
     let mut oq = vec![E::Scalar::ZERO; half];
+    // Structured leaf combine: with q = offset + v elementwise,
+    // q0·q1 = offset² + offset·(v0+v1) + v0·v1 costs two one-fold
+    // scaled multiplies instead of a full field multiplication (and the
+    // table tree's numerator combine collapses the same way).
+    if k + 1 == d
+      && let Some(()) = {
+        let off_sq_of = |r: E::Scalar| (r * r, r.scale_shift64(), E::Scalar::ONE.scale_shift64());
+        match hint {
+          LeafHint::OnesAffine { offset, raw } => {
+            let (off2, off_s, one_s) = off_sq_of(offset);
+            let in_q = &levels_q[d];
+            let combine = |i: usize, q: &mut E::Scalar, p: &mut E::Scalar| {
+              let (v0, v1) = (raw[i], raw[i + half]);
+              *q = off2 + off_s.mul_u64_scaled(v0 + v1) + one_s.mul_u64_scaled(v0 * v1);
+              *p = in_q[i] + in_q[i + half];
+            };
+            if half >= PAR_THRESHOLD {
+              op.par_iter_mut()
+                .zip(oq.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (p, q))| combine(i, q, p));
+            } else {
+              for i in 0..half {
+                let (mut q, mut p) = (E::Scalar::ZERO, E::Scalar::ZERO);
+                combine(i, &mut q, &mut p);
+                oq[i] = q;
+                op[i] = p;
+              }
+            }
+            Some(())
+          }
+          LeafHint::TableAffine { offset, mult } => {
+            let (off2, off_s, one_s) = off_sq_of(offset);
+            let combine = |i: usize, q: &mut E::Scalar, p: &mut E::Scalar| {
+              let (j0, j1) = (i as u64, (i + half) as u64);
+              let (m0, m1) = (mult[i], mult[i + half]);
+              *q = off2 + off_s.mul_u64_scaled(j0 + j1) + one_s.mul_u64_scaled(j0 * j1);
+              // m0·(offset+j1) + m1·(offset+j0)
+              *p = off_s.mul_u64_scaled(m0 + m1) + one_s.mul_u64_scaled(m0 * j1 + m1 * j0);
+            };
+            if half >= PAR_THRESHOLD {
+              op.par_iter_mut()
+                .zip(oq.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (p, q))| combine(i, q, p));
+            } else {
+              for i in 0..half {
+                let (mut q, mut p) = (E::Scalar::ZERO, E::Scalar::ZERO);
+                combine(i, &mut q, &mut p);
+                oq[i] = q;
+                op[i] = p;
+              }
+            }
+            Some(())
+          }
+          LeafHint::None => None,
+        }
+      }
+    {
+      levels_p[k] = op;
+      levels_q[k] = oq;
+      continue;
+    }
     {
       let in_p = &levels_p[k + 1];
       let in_q = &levels_q[k + 1];
@@ -367,7 +482,7 @@ fn gkr_prove<
   let n = p_leaves.len();
   assert!(n.is_power_of_two() && n == q_leaves.len() && n >= 1);
   let d = n.trailing_zeros() as usize;
-  let (levels_p, levels_q) = build_levels::<E>(p_leaves, q_leaves, ones_numerator);
+  let (levels_p, levels_q) = build_levels::<E>(p_leaves, q_leaves, ones_numerator, LeafHint::None);
   let cubic = CubicConsts::<E::Scalar>::new();
 
   let root_p = levels_p[0][0];
@@ -652,20 +767,375 @@ fn gkr_verify<
 /// then-current shared point. Per-tree input-layer finals remain in the
 /// proof (they seed the next layer's claims), grouped per layer in
 /// [`GkrMultiLayerProof`].
+/// Structured-leaf hint for the leaf-skip integer fast path. A
+/// prover-side hint only — it never affects the transcript, and the
+/// skip falls back to field arithmetic without it.
+#[derive(Clone, Copy)]
+pub(crate) enum LeafHint<'a, F> {
+  /// No structure exposed.
+  None,
+  /// All-ones numerators and affine denominators `q[i] = offset + raw[i]`
+  /// with small `raw` (the witness trees). The i64/u64 basis
+  /// accumulators need `raw < 2^24`.
+  OnesAffine { offset: F, raw: &'a [u64] },
+  /// The table tree: numerators are the (small) multiplicities and
+  /// denominators are index-affine, `q[i] = offset + i`.
+  TableAffine { offset: F, mult: &'a [u64] },
+}
+
+/// Per-active-tree working state for one lockstep layer.
+struct Ls<'a, F> {
+  t: usize,
+  a0: Vec<F>,
+  a1: Vec<F>,
+  b0: Vec<F>,
+  b1: Vec<F>,
+  leaf_ones: bool,
+  /// Leaf structure, present only at the tree's leaf layer.
+  raw: LeafHint<'a, F>,
+  claim: F,
+}
+
+/// One tree's 16 evaluations for the leaf-skip round:
+/// `grid[t1·4+t2] = eq((t1,t2); c01) · Σ_z eq(z; c_z) · g(T̂(t1,t2,z))`,
+/// where `T̂` extends each table multilinearly in the two top index bits
+/// to the integer nodes `{0,1,2,3}` and `g` is the layer integrand.
+/// `wz` is the eq table over the remaining point coordinates (sums
+/// to 1) and `wz_scaled` its `2^64`-scaled image, so the structured
+/// fast path can accumulate small-integer data with one-fold scaled
+/// multiplies. Falls back to plain field arithmetic when the leaf
+/// structure is unavailable.
+fn skip_grid_for_tree<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
+  s: &Ls<'_, E::Scalar>,
+  lambda: E::Scalar,
+  wz: &[E::Scalar],
+  wz_scaled: &[E::Scalar],
+  q4: usize,
+  e01: &[E::Scalar; 16],
+) -> [E::Scalar; 16] {
+  if s.leaf_ones
+    && let LeafHint::OnesAffine { offset: r, raw } = s.raw
+  {
+    // Integer fast path: b = r + w elementwise, so with Σ_z eq_z = 1
+    //   Σ_z eq_z·g = (2r + λr²) + (1 + λr)·Σ_z eq_z·(ŵ0+ŵ1) + λ·Σ_z eq_z·ŵ0ŵ1.
+    // The bivariate restrictions of the two data sums are determined by
+    // 4 bilinear and 9 symmetrized-quadratic BASIS sums, so the hot
+    // loop accumulates only those (13 unsigned one-fold multiplies per
+    // index — the small-integer extrapolation happens once at the end,
+    // not per index):
+    //   lin[y]     = Σ_z eq_z·(w0+w1)[y·q4+z]
+    //   quad[a][b] = Σ_z eq_z·Σ_{y1+y1'=a, y2+y2'=b} w0[y1y2]·w1[y1'y2']
+    // u64 bounds: w < 2^24 (caller-guaranteed) ⇒ products < 2^48, the
+    // widest basis sum (a=b=1, four products) < 2^50.
+    let h = raw.len() / 2;
+    debug_assert_eq!(h, 4 * q4);
+    let (w0, w1) = raw.split_at(h);
+    let c0 = r + r + lambda * r * r;
+    let a1c = E::Scalar::ONE + lambda * r;
+    let mut lin = [E::Scalar::ZERO; 4];
+    let mut quad = [[E::Scalar::ZERO; 3]; 3];
+    for z in 0..q4 {
+      let wsc = wz_scaled[z];
+      let v0: [u64; 4] = core::array::from_fn(|y| w0[y * q4 + z]);
+      let v1: [u64; 4] = core::array::from_fn(|y| w1[y * q4 + z]);
+      for y in 0..4 {
+        lin[y] += wsc.mul_u64_scaled(v0[y] + v1[y]);
+      }
+      quad[0][0] += wsc.mul_u64_scaled(v0[0] * v1[0]);
+      quad[0][1] += wsc.mul_u64_scaled(v0[0] * v1[1] + v0[1] * v1[0]);
+      quad[0][2] += wsc.mul_u64_scaled(v0[1] * v1[1]);
+      quad[1][0] += wsc.mul_u64_scaled(v0[0] * v1[2] + v0[2] * v1[0]);
+      quad[1][1] +=
+        wsc.mul_u64_scaled(v0[0] * v1[3] + v0[1] * v1[2] + v0[2] * v1[1] + v0[3] * v1[0]);
+      quad[1][2] += wsc.mul_u64_scaled(v0[1] * v1[3] + v0[3] * v1[1]);
+      quad[2][0] += wsc.mul_u64_scaled(v0[2] * v1[2]);
+      quad[2][1] += wsc.mul_u64_scaled(v0[2] * v1[3] + v0[3] * v1[2]);
+      quad[2][2] += wsc.mul_u64_scaled(v0[3] * v1[3]);
+    }
+    // Assemble the 16 grid values from the 13 basis sums. Per-variable
+    // factors at the integer nodes t ∈ {0,1,2,3}: linear eqbit values
+    // (EXT2) and symmetrized quadratics ((1-t)², t(1-t), t²).
+    const Q2: [[i64; 3]; 4] = [[1, 0, 0], [0, 0, 1], [1, -2, 4], [4, -6, 9]];
+    let mul_small = |x: E::Scalar, k: i64| -> E::Scalar {
+      let m = x * E::Scalar::from(k.unsigned_abs());
+      if k < 0 { -m } else { m }
+    };
+    return core::array::from_fn(|g| {
+      let (i1, i2) = (g / 4, g % 4);
+      let mut s1 = E::Scalar::ZERO;
+      for y1 in 0..2 {
+        for y2 in 0..2 {
+          s1 += mul_small(lin[y1 * 2 + y2], EXT2[i1][y1] * EXT2[i2][y2]);
+        }
+      }
+      let mut s2 = E::Scalar::ZERO;
+      for a in 0..3 {
+        for b in 0..3 {
+          s2 += mul_small(quad[a][b], Q2[i1][a] * Q2[i2][b]);
+        }
+      }
+      e01[g] * (c0 + a1c * s1 + lambda * s2)
+    });
+  }
+
+  if !s.leaf_ones
+    && let LeafHint::TableAffine { offset: r, mult } = s.raw
+  {
+    // Table-tree fast path: a = m (small) and b = r + j with j the leaf
+    // index, whose bit-multilinear extension is LINEAR in the skip
+    // nodes: for the b0 half, b̂(t1,t2)[z] = r + z + J with
+    // J = t1·2^{k-1} + t2·2^{k-2}; the b1 half adds 2^k. Expanding the
+    // integrand in r leaves the basis sums
+    //   Mj_y = Σ_z eq_z·mj[y·q4+z],  MZj_y = Σ_z eq_z·mj[y·q4+z]·z,
+    //   Z1 = Σ_z eq_z·z,  Z2 = Σ_z eq_z·z²
+    // (18 one-fold multiplies per index).
+    let h = mult.len() / 2;
+    debug_assert_eq!(h, 4 * q4);
+    let (m0, m1) = mult.split_at(h);
+    let mut mm = [[E::Scalar::ZERO; 4]; 2];
+    let mut mz = [[E::Scalar::ZERO; 4]; 2];
+    let mut z1 = E::Scalar::ZERO;
+    let mut z2 = E::Scalar::ZERO;
+    for z in 0..q4 {
+      let wsc = wz_scaled[z];
+      let zu = z as u64;
+      z1 += wsc.mul_u64_scaled(zu);
+      z2 += wsc.mul_u64_scaled(zu * zu);
+      for y in 0..4 {
+        let (a, b) = (m0[y * q4 + z], m1[y * q4 + z]);
+        mm[0][y] += wsc.mul_u64_scaled(a);
+        mm[1][y] += wsc.mul_u64_scaled(b);
+        mz[0][y] += wsc.mul_u64_scaled(a * zu);
+        mz[1][y] += wsc.mul_u64_scaled(b * zu);
+      }
+    }
+    let mul_small = |x: E::Scalar, k: i64| -> E::Scalar {
+      let m = x * E::Scalar::from(k.unsigned_abs());
+      if k < 0 { -m } else { m }
+    };
+    let half_k = (4 * q4) as u64;
+    return core::array::from_fn(|g| {
+      let (i1, i2) = (g / 4, g % 4);
+      let comb = |t: &[E::Scalar; 4]| -> E::Scalar {
+        let mut acc = E::Scalar::ZERO;
+        for y1 in 0..2 {
+          for y2 in 0..2 {
+            acc += mul_small(t[y1 * 2 + y2], EXT2[i1][y1] * EXT2[i2][y2]);
+          }
+        }
+        acc
+      };
+      let (mh0, mh1) = (comb(&mm[0]), comb(&mm[1]));
+      let (mzh0, mzh1) = (comb(&mz[0]), comb(&mz[1]));
+      let j0 = (i1 as u64) * (half_k / 2) + (i2 as u64) * (half_k / 4);
+      let j1 = j0 + half_k;
+      // m̂0·b̂1 + m̂1·b̂0 sums to r·(M̂0+M̂1) + MẐ0 + J1·M̂0 + MẐ1 + J0·M̂1;
+      // λ·b̂0·b̂1 sums to λ·(r² + r·(2Z1 + J0+J1) + Z2 + (J0+J1)Z1 + J0J1).
+      let lin =
+        mzh0 + E::Scalar::from(j1) * mh0 + mzh1 + E::Scalar::from(j0) * mh1 + r * (mh0 + mh1);
+      let quad = z2
+        + E::Scalar::from(j0 + j1) * z1
+        + E::Scalar::from(j0 * j1)
+        + r * (z1 + z1 + E::Scalar::from(j0 + j1))
+        + r * r;
+      e01[g] * (lin + lambda * quad)
+    });
+  }
+
+  // Generic field-arithmetic path (any tree shape; correctness only —
+  // configs that reach it are off the structured hot path).
+  let ext_f: [[E::Scalar; 2]; 4] = core::array::from_fn(|i| {
+    core::array::from_fn(|y| {
+      let v = EXT2[i][y];
+      let f = E::Scalar::from(v.unsigned_abs());
+      if v < 0 { -f } else { f }
+    })
+  });
+  let mut acc = [E::Scalar::ZERO; 16];
+  for z in 0..q4 {
+    let wv = wz[z];
+    let load = |t: &[E::Scalar]| -> [E::Scalar; 4] { core::array::from_fn(|y| t[y * q4 + z]) };
+    let b0v = load(&s.b0);
+    let b1v = load(&s.b1);
+    let (a0v, a1v) = if s.leaf_ones {
+      ([E::Scalar::ONE; 4], [E::Scalar::ONE; 4])
+    } else {
+      (load(&s.a0), load(&s.a1))
+    };
+    let ext2d = |t: &[E::Scalar; 4], i1: usize, i2: usize| -> E::Scalar {
+      ext_f[i1][0] * (ext_f[i2][0] * t[0] + ext_f[i2][1] * t[1])
+        + ext_f[i1][1] * (ext_f[i2][0] * t[2] + ext_f[i2][1] * t[3])
+    };
+    for i1 in 0..4 {
+      for i2 in 0..4 {
+        let bh0 = ext2d(&b0v, i1, i2);
+        let bh1 = ext2d(&b1v, i1, i2);
+        let gval = if s.leaf_ones {
+          bh0 + bh1 + lambda * (bh0 * bh1)
+        } else {
+          ext2d(&a0v, i1, i2) * bh1 + ext2d(&a1v, i1, i2) * bh0 + lambda * (bh0 * bh1)
+        };
+        acc[i1 * 4 + i2] += wv * gval;
+      }
+    }
+  }
+  core::array::from_fn(|g| e01[g] * acc[g])
+}
+
+/// Bind the two skip variables at once: tensor fold with
+/// `κ_y = eqbit(y1; u1)·eqbit(y2; u2)`. The structured path rebuilds
+/// the tables from the raw integers with one-fold scaled multiplies;
+/// otherwise two sequential top binds.
+fn skip_fold_tree<
+  E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
+>(
+  s: &mut Ls<'_, E::Scalar>,
+  u1: E::Scalar,
+  u2: E::Scalar,
+  q4: usize,
+) {
+  if s.leaf_ones
+    && let LeafHint::OnesAffine { offset: r, raw } = s.raw
+  {
+    let h = raw.len() / 2;
+    let (w0, w1) = raw.split_at(h);
+    let one = E::Scalar::ONE;
+    let kap: [E::Scalar; 4] = [
+      (one - u1) * (one - u2),
+      (one - u1) * u2,
+      u1 * (one - u2),
+      u1 * u2,
+    ];
+    let kap_s = kap.map(|x| x.scale_shift64());
+    let fold = |w: &[u64]| -> Vec<E::Scalar> {
+      (0..q4)
+        .map(|z| {
+          // Σ_y κ_y = 1, so the offsets contribute exactly one `r`.
+          r + kap_s[0].mul_u64_scaled(w[z])
+            + kap_s[1].mul_u64_scaled(w[q4 + z])
+            + kap_s[2].mul_u64_scaled(w[2 * q4 + z])
+            + kap_s[3].mul_u64_scaled(w[3 * q4 + z])
+        })
+        .collect()
+    };
+    s.b0 = fold(w0);
+    s.b1 = fold(w1);
+    return;
+  }
+  if !s.leaf_ones
+    && let LeafHint::TableAffine { offset: r, mult } = s.raw
+  {
+    let h = mult.len() / 2;
+    let (m0, m1) = mult.split_at(h);
+    let one = E::Scalar::ONE;
+    let kap: [E::Scalar; 4] = [
+      (one - u1) * (one - u2),
+      (one - u1) * u2,
+      u1 * (one - u2),
+      u1 * u2,
+    ];
+    let kap_s = kap.map(|x| x.scale_shift64());
+    let fold_m = |m: &[u64]| -> Vec<E::Scalar> {
+      (0..q4)
+        .map(|z| {
+          kap_s[0].mul_u64_scaled(m[z])
+            + kap_s[1].mul_u64_scaled(m[q4 + z])
+            + kap_s[2].mul_u64_scaled(m[2 * q4 + z])
+            + kap_s[3].mul_u64_scaled(m[3 * q4 + z])
+        })
+        .collect()
+    };
+    s.a0 = fold_m(m0);
+    s.a1 = fold_m(m1);
+    // b̂[z] = r + z + J(u1,u2) is affine in z: two multiplies, then adds.
+    let base = r + u1 * E::Scalar::from((2 * q4) as u64) + u2 * E::Scalar::from(q4 as u64);
+    let mut acc0 = base;
+    s.b0 = (0..q4)
+      .map(|_| {
+        let v = acc0;
+        acc0 += one;
+        v
+      })
+      .collect();
+    let mut acc1 = base + E::Scalar::from((4 * q4) as u64);
+    s.b1 = (0..q4)
+      .map(|_| {
+        let v = acc1;
+        acc1 += one;
+        v
+      })
+      .collect();
+    return;
+  }
+  if !s.leaf_ones {
+    bind_top(&mut s.a0, u1);
+    bind_top(&mut s.a0, u2);
+    bind_top(&mut s.a1, u1);
+    bind_top(&mut s.a1, u2);
+  }
+  bind_top(&mut s.b0, u1);
+  bind_top(&mut s.b0, u2);
+  bind_top(&mut s.b1, u1);
+  bind_top(&mut s.b1, u2);
+}
+
+/// One tree's input to [`gkr_prove_multi`]. `raw` optionally exposes
+/// the leaf denominators' structure `q[i] = offset + raw[i]` (small
+/// integers), which the leaf-skip round exploits to accumulate in
+/// integer space; it is a prover-side hint only and never affects the
+/// transcript.
+pub(crate) struct GkrTreeInput<'a, F> {
+  pub p: Vec<F>,
+  pub q: Vec<F>,
+  pub ones: bool,
+  pub raw: LeafHint<'a, F>,
+}
+
 fn gkr_prove_multi<
   E: SumcheckEngine<Scalar: crate::traits::PrimeFieldExt + Serialize + serde::de::DeserializeOwned>,
 >(
-  inputs: Vec<(Vec<E::Scalar>, Vec<E::Scalar>, bool)>,
+  inputs: Vec<GkrTreeInput<'_, E::Scalar>>,
   transcript: &mut E::TE,
 ) -> Result<(GkrMultiProof<E>, Vec<GkrTreeOut<E>>), SpartanError> {
   let nt = inputs.len();
+  let raws: Vec<LeafHint<'_, E::Scalar>> = inputs.iter().map(|i| i.raw).collect();
   // Build every tree's levels — pure computation, parallel over trees.
   let (_bl_span, bl_t) = crate::start_span!("gkr_build_levels");
   let mut built: Vec<(Vec<Vec<E::Scalar>>, Vec<Vec<E::Scalar>>, bool)> = inputs
     .into_par_iter()
-    .map(|(p, q, ones)| {
+    .map(|inp| {
+      let (p, q, ones) = (inp.p, inp.q, inp.ones);
       assert!(q.len().is_power_of_two() && !q.is_empty());
-      let (lp, lq) = build_levels::<E>(p, q, ones);
+      #[cfg(debug_assertions)]
+      match inp.raw {
+        LeafHint::None => {}
+        LeafHint::OnesAffine { offset, raw } => {
+          assert!(inp.ones && raw.len() == q.len());
+          assert!(
+            raw
+              .iter()
+              .zip(&q)
+              .all(|(&w, qv)| offset + E::Scalar::from(w) == *qv),
+            "ones-affine hint disagrees with the field leaves"
+          );
+        }
+        LeafHint::TableAffine { offset, mult } => {
+          assert!(!inp.ones && mult.len() == q.len() && mult.len() == p.len());
+          assert!(
+            q.iter()
+              .enumerate()
+              .all(|(j, qv)| offset + E::Scalar::from(j as u64) == *qv)
+              && mult
+                .iter()
+                .zip(&p)
+                .all(|(&m, pv)| E::Scalar::from(m) == *pv),
+            "table-affine hint disagrees with the field leaves"
+          );
+        }
+      }
+      let (lp, lq) = build_levels::<E>(p, q, ones, inp.raw);
       (lp, lq, ones)
     })
     .collect();
@@ -699,22 +1169,11 @@ fn gkr_prove_multi<
   let mut leaf_points: Vec<Vec<E::Scalar>> = vec![Vec::new(); nt];
   let mut point: Vec<E::Scalar> = Vec::new();
 
-  /// Per-active-tree working state for one layer.
-  struct Ls<F> {
-    t: usize,
-    a0: Vec<F>,
-    a1: Vec<F>,
-    b0: Vec<F>,
-    b1: Vec<F>,
-    leaf_ones: bool,
-    claim: F,
-  }
-
   for k in 0..max_d {
     let lambda = transcript.squeeze(b"gkr_lambda")?;
     let gamma = transcript.squeeze(b"gkr_gamma")?;
     let half = 1usize << k;
-    let mut st: Vec<Ls<E::Scalar>> = Vec::new();
+    let mut st: Vec<Ls<'_, E::Scalar>> = Vec::new();
     for t in 0..nt {
       if k >= depths[t] {
         continue;
@@ -740,6 +1199,11 @@ fn gkr_prove_multi<
         b0: qv,
         b1,
         leaf_ones,
+        raw: if k + 1 == depths[t] {
+          raws[t]
+        } else {
+          LeafHint::None
+        },
         claim: claim_p[t] + lambda * claim_q[t],
       });
     }
@@ -759,7 +1223,50 @@ fn gkr_prove_multi<
     let mut e_pref = E::Scalar::ONE;
     let mut challenges: Vec<E::Scalar> = Vec::with_capacity(k);
 
-    for round in 0..k {
+    // Leaf-layer bivariate skip: when every active tree is at its leaf
+    // (tables still structured input data), replace rounds 0 and 1 with
+    // ONE message — the γ-combined degree-(3,3) restriction of the
+    // first two variables on the {0,1,2,3}² grid — then bind both
+    // variables at once. See docs/gkr_uniskip_plan.md.
+    let active_depths: Vec<usize> = st.iter().map(|s| depths[s.t]).collect();
+    let mut skip_grid: Option<Vec<E::Scalar>> = None;
+    let mut skip_rounds = 0usize;
+    if skip_at_layer(k, &active_depths) {
+      let q4 = 1usize << (k - 2);
+      let wz = EqPolynomial::<E::Scalar>::evals_from_points(&point[2..k]);
+      let wz_scaled: Vec<E::Scalar> = wz.iter().map(|w| w.scale_shift64()).collect();
+      let e01: [E::Scalar; 16] =
+        core::array::from_fn(|g| eq_at_node(point[0], g / 4) * eq_at_node(point[1], g % 4));
+      let grids: Vec<[E::Scalar; 16]> = st
+        .par_iter()
+        .map(|s| skip_grid_for_tree::<E>(s, lambda, &wz, &wz_scaled, q4, &e01))
+        .collect();
+      let mut comb = [E::Scalar::ZERO; 16];
+      let mut g = E::Scalar::ONE;
+      for gr in &grids {
+        for (c, v) in comb.iter_mut().zip(gr.iter()) {
+          *c += g * *v;
+        }
+        g *= gamma;
+      }
+      for v in &comb {
+        transcript.absorb(b"gkr_skip", v);
+      }
+      let u1 = transcript.squeeze(b"gkr_chal")?;
+      let u2 = transcript.squeeze(b"gkr_chal")?;
+      st.par_iter_mut().zip(grids.par_iter()).for_each(|(s, gr)| {
+        skip_fold_tree::<E>(s, u1, u2, q4);
+        s.claim = eval_grid16(&cubic, gr, u1, u2);
+      });
+      e_pref *= ((E::Scalar::ONE - point[0]) * (E::Scalar::ONE - u1) + point[0] * u1)
+        * ((E::Scalar::ONE - point[1]) * (E::Scalar::ONE - u2) + point[1] * u2);
+      challenges.push(u1);
+      challenges.push(u2);
+      skip_grid = Some(comb.to_vec());
+      skip_rounds = 2;
+    }
+
+    for round in skip_rounds..k {
       let c = point[round];
       let (hi_tbl, blk_len) = if round + 1 < m {
         (
@@ -885,6 +1392,7 @@ fn gkr_prove_multi<
       }
     }
     shared_layers.push(GkrMultiLayerProof {
+      skip: skip_grid,
       round_polys: layer_round_polys,
       finals: finals
         .into_iter()
@@ -950,7 +1458,13 @@ fn gkr_verify_multi<
     let lambda = transcript.squeeze(b"gkr_lambda")?;
     let gamma = transcript.squeeze(b"gkr_gamma")?;
     let active: Vec<usize> = (0..nt).filter(|&t| k < depths[t]).collect();
-    if layer.round_polys.len() != k || layer.finals.len() != active.len() {
+    let active_depths: Vec<usize> = active.iter().map(|&t| depths[t]).collect();
+    let skip_here = skip_at_layer(k, &active_depths);
+    let expected_rounds = if skip_here { k - 2 } else { k };
+    if layer.round_polys.len() != expected_rounds
+      || layer.finals.len() != active.len()
+      || layer.skip.is_some() != skip_here
+    {
       return Err(SpartanError::ProofVerifyError {
         reason: "logup-gkr: layer shape mismatch".to_string(),
       });
@@ -964,6 +1478,29 @@ fn gkr_verify_multi<
       g *= gamma;
     }
     let mut challenges: Vec<E::Scalar> = Vec::with_capacity(k);
+
+    if let Some(grid) = &layer.skip {
+      // The bivariate skip round: its boolean-image values must sum to
+      // the layer claim; two challenges bind both variables at once.
+      if grid.len() != 16 {
+        return Err(SpartanError::ProofVerifyError {
+          reason: "logup-gkr: malformed skip round".to_string(),
+        });
+      }
+      if grid[0] + grid[1] + grid[4] + grid[5] != claim {
+        return Err(SpartanError::ProofVerifyError {
+          reason: "logup-gkr: skip round mismatch".to_string(),
+        });
+      }
+      for v in grid {
+        transcript.absorb(b"gkr_skip", v);
+      }
+      let u1 = transcript.squeeze(b"gkr_chal")?;
+      let u2 = transcript.squeeze(b"gkr_chal")?;
+      claim = eval_grid16(&cubic, grid, u1, u2);
+      challenges.push(u1);
+      challenges.push(u2);
+    }
 
     for s in &layer.round_polys {
       if s[0] + s[1] != claim {
@@ -1332,8 +1869,7 @@ impl<
     // challenges (see `gkr_prove_multi`; this is what lets the
     // per-round work parallelize across trees instead of running one
     // serial GKR per witness).
-    let mut inputs: Vec<(Vec<E::Scalar>, Vec<E::Scalar>, bool)> =
-      Vec::with_capacity(witnesses.len() + 1);
+    let mut inputs: Vec<GkrTreeInput<'_, E::Scalar>> = Vec::with_capacity(witnesses.len() + 1);
     for witness in witnesses {
       let p = if witness.len() > 1 {
         Vec::new()
@@ -1341,11 +1877,37 @@ impl<
         vec![E::Scalar::ONE]
       };
       let q: Vec<E::Scalar> = witness.iter().map(|&w| r_plus[w as usize]).collect();
-      inputs.push((p, q, true));
+      inputs.push(GkrTreeInput {
+        p,
+        q,
+        ones: true,
+        // Structured-leaf hint for the leaf-skip fast path (its u64
+        // basis accumulators need witness values < 2^24).
+        raw: if bits <= 24 {
+          LeafHint::OnesAffine {
+            offset: r,
+            raw: witness,
+          }
+        } else {
+          LeafHint::None
+        },
+      });
     }
     let p_rhs: Vec<E::Scalar> = mult.iter().map(|&m| E::Scalar::from(m)).collect();
     let q_rhs = r_plus;
-    inputs.push((p_rhs, q_rhs, false));
+    inputs.push(GkrTreeInput {
+      p: p_rhs,
+      q: q_rhs,
+      ones: false,
+      raw: if bits <= 24 {
+        LeafHint::TableAffine {
+          offset: r,
+          mult: &mult,
+        }
+      } else {
+        LeafHint::None
+      },
+    });
 
     let (gkr, mut outs) = gkr_prove_multi::<E>(inputs, transcript)?;
     let rhs = outs.pop().expect("table tree present");
@@ -1600,6 +2162,59 @@ mod tests {
     let mult = LogUpMultiRangeProof::<E>::multiplicities(4, &witnesses).unwrap();
     let m_tbl: Vec<F> = mult.iter().map(|&m| F::from(m)).collect();
     assert_eq!(claims_v.mult_eval, mle_eval(&m_tbl, &claims_v.mult_point));
+  }
+
+  /// Deep witness trees over a shallow table (the MultiSwap shape):
+  /// layers `bits..depth-1` have only the witness trees active, so the
+  /// leaf layer takes the bivariate skip round on the integer fast
+  /// path. The reduced claims must still match the true MLEs.
+  #[test]
+  fn multi_range_skip_layer_roundtrips() {
+    type E = T256HyraxEngine;
+    type F = <E as Engine>::Scalar;
+    let n = 1usize << 10;
+    let w0: Vec<u64> = (0..n as u64).map(|i| (i * 37 + 11) % 256).collect();
+    let w1: Vec<u64> = (0..n as u64).map(|i| (i * i + 3) % 256).collect();
+    let witnesses: Vec<&[u64]> = vec![&w0, &w1];
+
+    let mut tp = <E as Engine>::TE::new(b"logup_multi_skip");
+    let (proof, _) = LogUpMultiRangeProof::<E>::prove(8, &witnesses, &mut tp).unwrap();
+    // The leaf layer of the deep trees must actually have taken the
+    // skip round (this is what this test exists to pin).
+    let leaf_layer = proof.gkr.layers.last().unwrap();
+    assert!(leaf_layer.skip.is_some(), "skip round did not fire");
+    assert_eq!(leaf_layer.round_polys.len(), 9 - 2);
+
+    let mut tv = <E as Engine>::TE::new(b"logup_multi_skip");
+    let claims = proof.verify(8, &[10, 10], &mut tv).unwrap();
+    for (b, witness) in witnesses.iter().enumerate() {
+      let tbl: Vec<F> = witness.iter().map(|&w| F::from(w)).collect();
+      let (point, eval) = &claims.wit_claims[b];
+      assert_eq!(*eval, mle_eval(&tbl, point), "witness {b} claim mismatch");
+    }
+    let mult = LogUpMultiRangeProof::<E>::multiplicities(8, &witnesses).unwrap();
+    let m_tbl: Vec<F> = mult.iter().map(|&m| F::from(m)).collect();
+    assert_eq!(claims.mult_eval, mle_eval(&m_tbl, &claims.mult_point));
+
+    // Tampering with the skip grid is rejected: the boolean-image sum
+    // check catches boolean-node edits, and off-boolean edits corrupt
+    // the reduced claim so a later check fails.
+    for idx in [0usize, 2, 7, 15] {
+      let mut bad = proof.clone();
+      let last = bad.gkr.layers.len() - 1;
+      bad.gkr.layers[last].skip.as_mut().unwrap()[idx] += F::ONE;
+      let mut tv = <E as Engine>::TE::new(b"logup_multi_skip");
+      assert!(
+        bad.verify(8, &[10, 10], &mut tv).is_err(),
+        "tampered skip grid entry {idx} accepted"
+      );
+    }
+    // A proof missing its skip round (shape mismatch) is rejected.
+    let mut bad = proof.clone();
+    let last = bad.gkr.layers.len() - 1;
+    bad.gkr.layers[last].skip = None;
+    let mut tv = <E as Engine>::TE::new(b"logup_multi_skip");
+    assert!(bad.verify(8, &[10, 10], &mut tv).is_err());
   }
 
   /// Multi-witness: out-of-range value rejected at prove; tampered roots

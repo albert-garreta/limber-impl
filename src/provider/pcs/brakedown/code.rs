@@ -153,7 +153,12 @@ impl<F: PrimeFieldExt> SparseMat<F> {
 
   fn mul_vec(&self, x: &[F]) -> Vec<F> {
     debug_assert_eq!(x.len(), self.rows.len());
-    let mut y = vec![F::ZERO; self.cols];
+    // Delayed reduction: scatter UNREDUCED products into wide per-output
+    // accumulators and pay one Montgomery reduction per output instead
+    // of one per term (~density/rate ≈ 6 terms land on each output, so
+    // the per-term modular reduction dominates the plain version).
+    let mut acc =
+      vec![<F as crate::traits::DelayedReduction<F>>::Accumulator::default(); self.cols];
     for (i, row) in self.rows.iter().enumerate() {
       let xi = x[i];
       // Input-sparsity guard: zero inputs contribute nothing, and the
@@ -164,10 +169,10 @@ impl<F: PrimeFieldExt> SparseMat<F> {
         continue;
       }
       for (c, v) in row {
-        y[*c] += xi * *v;
+        F::unreduced_multiply_accumulate(&mut acc[*c], &xi, v);
       }
     }
-    y
+    acc.iter().map(F::reduce).collect()
   }
 }
 
