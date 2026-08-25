@@ -1227,7 +1227,7 @@ fn gkr_prove_multi<
     // (tables still structured input data), replace rounds 0 and 1 with
     // ONE message — the γ-combined degree-(3,3) restriction of the
     // first two variables on the {0,1,2,3}² grid — then bind both
-    // variables at once. See docs/gkr_uniskip_plan.md.
+    // variables at once.
     let active_depths: Vec<usize> = st.iter().map(|s| depths[s.t]).collect();
     let mut skip_grid: Option<Vec<E::Scalar>> = None;
     let mut skip_rounds = 0usize;

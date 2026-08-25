@@ -102,8 +102,7 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
     // Default for the Mod-PCS backend: spec4 — after the 2026-08-24
     // delayed-reduction encoder win the prover margin comfortably
     // absorbs the denser code (~+35 ms for -0.7 MB proof vs spec3;
-    // spec5 buys only -0.15 MB more for another ~+80 ms). Sweep in
-    // docs/imod_followups.md.
+    // spec5 buys only -0.15 MB more for another ~+80 ms).
     .unwrap_or(crate::provider::pcs::brakedown::SPECS[4]);
   // Uniform row length across all lengths (BDROWLEN override, benching
   // knob). Trees sharing (row_len, spec, seed) share the code, so the
