@@ -26,18 +26,28 @@ We call this a **integer mod-PCS**.
 
 Limber is a compiler from **almost any** field PCS to an integer mod-PCS with $o(1)$ multiplicative commitment overhead.
 The only requirement on the underlying field is $q = \Omega(\lambda^2 \mu^2)$ for a $\mu$-variable polynomial, so it works over small fields, and the compiled scheme inherits the assumptions and performance of whatever PCS it wraps.
-It has three pieces:
+It has two algorithms:
 
 - **Commit.** An integer polynomial $f$ with hypercube evaluations bounded by $T_f$ is limb-split into a polynomial $f_{\mathsf{limb}}$ whose entries are bounded by a base bound $T$ (we use $T = 2^{64}$), cast into $\mathbb{F}_q$, and committed with the underlying PCS.
   A batched range check (LogUp-GKR) proves every limb is below $T$.
 
 - **Evaluate mod $p$.** To open $f$ at a point $\vec r \in \mathbb{Z}_p^{\mu}$, a sumcheck reduces the claim to one about $f_{\mathsf{limb}}$, the prover sends the *integer* evaluation $y \in \mathbb{Z}$, and the verifier checks $y \equiv y' \pmod p$.
   What remains is proving $y = f_{\mathsf{limb}}(\vec{r'})$ over the integers, which is handled by our IntEval protocol.
-
-- **IntEval.** The verifier samples $s$ small primes $p_i$ and the prover opens $f_{\mathsf{limb}}$ at $\vec r \bmod p_i$ for each.
+  - **IntEval.** The verifier samples $s$ small primes $p_i$ and the prover opens $f_{\mathsf{limb}}$ at $\vec r \bmod p_i$ for each.
   IntEval partially evaluates $k$ variables at a time to avoid overflow: the partially evaluated polynomial is decomposed as $a + p_i \cdot b$, the prover commits $a$ and $b$ (each $2^{-k}$ the size of the previous layer), and the protocol recurses on $a$.
 
-Parameters used throughout the benchmarks (paper Table `tab:impl-params`): $q \approx 2^{256}$, $T = 2^{64}$, $k = 9$, $s = 15$ CRT primes, giving a commitment overhead of about $0.13\times$ the witness (lower for larger $k$).
+### Parameters
+
+All benchmarks below use the following parameters (Table 4 of the paper):
+
+| Parameter | Value | Meaning |
+| --- | ---: | --- |
+| $q$ | $\approx 2^{256}$ | Field characteristic of the underlying PCS (Tom-256 scalar field) |
+| $T$ | $2^{64}$ | Limb base bound; every limb of $f_{\mathsf{limb}}$ is range-checked to $[0, T)$ |
+| $k$ | $9$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{-k}$ |
+| $s$ | $15$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
+
+With these settings the commitment overhead is about $0.13\times$ the witness size (lower for larger $k$).
 
 **In this repo.** The compiler is `src/provider/pcs/integer_modpcs.rs` (IntEval and the mod-PCS commit/eval protocol) behind a PCS-agnostic backend seam, `src/provider/pcs/commit_backend.rs`.
 We currently provide two PCS instantiations: Hyrax (`src/provider/pcs/hyrax_pc.rs`) over the Tom-256 curve and Brakedown (`src/provider/pcs/brakedown/`) over the Tom-256 scalar field.
@@ -70,7 +80,7 @@ BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spar
 
 All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 Pro, 24 GB RAM, 14 cores); all baselines were re-run on the same machine.
 
-**MultiSwap statement** (paper Table `tab:multiswap-bench`): two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation, the benchmark of [OWWB20](https://eprint.iacr.org/2019/1494).
+**MultiSwap statement** (Table 1 of the paper): two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation, the benchmark of [OWWB20](https://eprint.iacr.org/2019/1494).
 Constraint counts for Zinc+ and Limber are integer Mod-R1CS rows; the others are ordinary R1CS constraints over a prime field.
 
 | System | Constraints | Prove | Verify | Proof size |
@@ -100,7 +110,7 @@ Prover time includes witness generation and commitment on both sides.
 All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) with native codegen (`RUSTFLAGS="-C target-cpu=native"`).
 Multi-threaded runs are not comparable across configurations (thermal throttling and rayon spin-up confound the ratios), so always pin the thread count when reproducing.
 
-**Native-overhead figure (`fig:nativeoverhead`) and the msshape plots/table** (`docs/plots/msshape_*`):
+**Native-overhead figure (Figure 3 of the paper) and the msshape plots/table** (`docs/plots/msshape_*`):
 
 ```bash
 RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
@@ -109,7 +119,7 @@ RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 This runs the shape-matched pair of sweeps (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`; see the script header for knobs.
 Expected ballpark (Apple Silicon, 2026-08): 5.9–8.1× prover overhead over plain Spartan at 2^10–2^14 constraints, verify under 30 ms vs 15–17 ms, proof 135–149 KB vs ~68 KB.
 
-**MultiSwap table (`tab:multiswap-bench`), our rows**:
+**MultiSwap table (Table 1 of the paper), our rows**:
 
 ```bash
 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
