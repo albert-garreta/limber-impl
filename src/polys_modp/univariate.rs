@@ -16,6 +16,7 @@ use crate::{
 /// in Lagrange interpolation) takes `params` as an argument.
 #[derive(Clone, Debug)]
 pub struct UniPoly<F: SumcheckField> {
+  /// Coefficients, lowest degree first.
   pub coeffs: Vec<F>,
 }
 
@@ -24,6 +25,7 @@ pub struct UniPoly<F: SumcheckField> {
 /// `p(0) + p(1) = claim`.
 #[derive(Clone, Debug)]
 pub struct CompressedUniPoly<F: SumcheckField> {
+  /// `coeffs` with index 1 removed.
   pub coeffs_except_linear_term: Vec<F>,
 }
 

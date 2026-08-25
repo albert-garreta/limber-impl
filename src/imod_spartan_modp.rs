@@ -1,4 +1,4 @@
-//! Phase-2 Integer Mod-R1CS SNARK driver, generic over `M: ModEngine`.
+//! Dual-field Integer Mod-R1CS SNARK driver, generic over `M: ModEngine`.
 //!
 //! Mirrors `crate::imod_spartan` but the shape, witness, and matrix
 //! entries are integer-valued (`BigUint`), the prime `p` over which the
@@ -7,7 +7,8 @@
 //! verifies the IntMod-R1CS relation `Az ∘ Bz = Cz + m ∘ q` mod that
 //! sampled `p`. The Mod-PCS commits integer polynomials and opens at
 //! `Z_p` points returning `Z_p` evals — the `p ≠ q` reconciliation is
-//! the Mod-PCS's responsibility (Phase-3 IntEval); the Phase-2 driver
+//! the Mod-PCS's responsibility (the IntEval protocol in
+//! `provider::pcs::integer_modpcs`); this driver
 //! treats it as a black-box contract.
 //!
 //! Flow:
@@ -102,7 +103,7 @@ impl<M: ModEngine> IntModSpartanModpVerifierKey<M> {
   }
 }
 
-/// Phase-2 IntMod-R1CS SNARK proof. Serialization is deferred — the
+/// IntMod-R1CS SNARK proof over a `ModEngine`. Serialization is deferred — the
 /// dynamic-prime types (`M::Scalar`, `Params`) aren't `Serialize` yet.
 #[derive(Clone, Debug)]
 pub struct IntModSpartanModpSNARK<M: ModEngine> {
@@ -1140,11 +1141,11 @@ mod tests {
   /// so swapping vks deterministically derives different `p` and the
   /// rest of the proof becomes incoherent under the wrong vk.
   ///
-  /// (Phase-2 gap: today, verifying a proof under the wrong vk
+  /// (Known gap: today, verifying a proof under the wrong vk
   /// *panics* inside `crypto-bigint`'s `FixedMontyForm` op when the
   /// proof's `DynPrime` values carry params from the original `p` while
   /// the verifier reduces shape2 data with the freshly sampled `p`.
-  /// The panic IS a form of rejection, but it's ungraceful — Phase 3
+  /// The panic IS a form of rejection, but it's ungraceful — a followup
   /// should convert the param mismatch into a clean `SpartanError`.
   /// For now this test asserts only the digest distinction.)
   #[test]

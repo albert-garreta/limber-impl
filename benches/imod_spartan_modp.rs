@@ -1,8 +1,8 @@
 //! benches/imod_spartan_modp.rs
-//! Criterion benchmarks for Phase-2 IntModSpartanModpSNARK {setup, prove,
+//! Criterion benchmarks for IntModSpartanModpSNARK {setup, prove,
 //! verify} on synthetic Integer-Mod-R1CS instances of varying size.
 //!
-//! Mirror of `benches/imod_spartan.rs` but parameterized over the Phase-2
+//! Mirror of `benches/imod_spartan.rs` but parameterized over the dual-field
 //! driver (T256DynPrimeEngine + IntegerModPCS). Each constraint is one
 //! independent modular multiplication `a · b = c + N · q`.
 //!

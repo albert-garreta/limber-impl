@@ -1,7 +1,3 @@
-// TODO Phase 2 step 4: remove `allow(dead_code)` once `sumcheck_modp.rs` lands
-// and starts consuming these types.
-#![allow(dead_code)]
-
 //! Polynomial types for IntMod-Spartan, generic over `SumcheckField`.
 //!
 //! Parallel to `src/polys/` — same protocol math, but bounded on
@@ -10,7 +6,7 @@
 //! `DynPrime`.
 //!
 //! Deliberately minimal: only the methods that `sumcheck_modp.rs` and
-//! `imod_spartan` need. Optimizations from `src/polys/` (zero-skip
+//! `imod_spartan_modp` need. Optimizations from `src/polys/` (zero-skip
 //! prefixes, delayed-reduction accumulators, fast bind paths) are
 //! omitted — they're either static-modulus-specific or can be added
 //! back later if benchmarks demand.

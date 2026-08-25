@@ -38,9 +38,9 @@ use crate::big_num::{
   montgomery::{MontgomeryLimbs, montgomery_reduce_9},
 };
 
-/// DelayedReduction<F> for field × field products using wide integers.
+/// `DelayedReduction<F>` for field × field products using wide integers.
 ///
-/// Uses WideLimbs<9> (576 bits) as accumulator, supporting up to 2^64 products.
+/// Uses `WideLimbs<9>` (576 bits) as accumulator, supporting up to 2^64 products.
 ///
 /// # Capacity Invariant
 ///

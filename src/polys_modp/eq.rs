@@ -6,6 +6,7 @@ use crate::traits::mod_engine::SumcheckField;
 /// modulus context so that constructors like `F::one(&params)` can be
 /// called without an external context argument.
 pub struct EqPolynomial<F: SumcheckField> {
+  /// The point `r` the polynomial is parameterized by.
   pub r: Vec<F>,
   pub(crate) params: F::Params,
 }

@@ -164,7 +164,7 @@ pub trait PCSEngineTrait<E: Engine>: Clone + Send + Sync {
   }
 
   /// Build commitment from precomputed raw MSMs plus a delta vector.
-  /// For each row: final = raw[i] + MSM(delta[row_i], gens) + blind[i] * H
+  /// For each row: `final = raw[i] + MSM(delta[row_i], gens) + blind[i] * H`
   /// Default: not supported. Override for schemes that support this.
   fn commit_incremental(
     _ck: &Self::CommitmentKey,

@@ -1,25 +1,12 @@
-// TODO Phase 3: this file is the in-progress sound Mod-PCS for
-// `T256DynPrimeEngine`. Implements the IntEval protocol (Section 4 of
-// the SNARKs-for-Integers paper) over Hyrax-T256 as the underlying F PCS.
-// "No limb-splitting" simplification: the witness is assumed bounded by
-// `T_f` and cast directly to F (range check on commit is a followup);
-// `f_limb = f` so the Mod-PCS eval's reduction sumcheck is trivial.
-//
-// Landing in stages:
-//   - step A (this commit): skeleton, params, setup, commit (cast +
-//     Hyrax::commit, range check TODO), open (Hyrax delegate).
-//   - step B: small-prime transcript sampling + n ≤ k IntEval (no
-//     partial-evaluation iteration).
-//   - step C: partial-evaluation iteration for n > k.
-//   - step D: batch range check.
-#![allow(dead_code)]
-
-//! `IntegerModPCS`: sound Mod-PCS for `T256DynPrimeEngine`, wrapping
-//! Hyrax-over-T256 as the underlying F PCS. Implements the paper's
-//! IntEval protocol for integer polynomial evaluation at `Z_p` points.
+//! `IntegerModPCS`: the integer Mod-PCS (the paper's IntEval protocol)
+//! for the dual-field engines, wrapping a field PCS as the underlying
+//! F PCS — Hyrax-over-T256 in curve mode, Brakedown in hash mode (see
+//! `commit_backend`). Commits integer-valued polynomials (limb-split
+//! into `T`-bounded chunks and range-checked with the shared LogUp-GKR
+//! argument) and opens them at `Z_p` points.
 //!
-//! Compared to the trivial stub it replaces, this PCS soundly bridges
-//! `F_q` arithmetic to `Z_p` evaluations via small-prime fingerprinting:
+//! The PCS soundly bridges `F_q` arithmetic to `Z_p` evaluations via
+//! small-prime fingerprinting:
 //! the verifier samples `s` random primes `p_i ≈ 2^{log P}` and opens
 //! the F-committed polynomial at `r mod p_i` for each. Because each
 //! reduced point is small (`< P`), the F arithmetic stays below `q`
@@ -68,8 +55,8 @@ type Hyrax = HyraxPCS<T256HyraxEngine>;
 /// `\newcommand{\Bound}[1][]{\mathsf{T}_{#1}}`. The `compute_params.py`
 /// script uses the same `T` / `log_T` convention.)
 ///
-/// In no-limb-split mode (Phase-3 step B), the polynomial is committed
-/// as a single limb, so `T = T_f`. Once limb-splitting lands, `T` is
+/// In no-limb-split mode, the polynomial is committed
+/// as a single limb, so `T = T_f`. With limb-splitting, `T` is
 /// chosen smaller than `T_f` (typically `~32` bits) so each limb fits
 /// inside F's characteristic with room for IntEval's intermediate
 /// products.
@@ -208,7 +195,7 @@ impl IntEvalParams {
   }
 
   /// No-limb-split convenience: derive params with `log T = log T_f`
-  /// (single-limb regime, Phase-3 step B).
+  /// (single-limb regime).
   pub fn derive_no_limb_split(
     log_t_f: usize,
     k: usize,
@@ -542,7 +529,7 @@ pub struct IntegerModVerifierKey {
 /// `chunk_stride(log_t)` 16-bit slots — the same layout the range
 /// check's F batch consumes, so no separate chunk commitment is ever
 /// made). Limb evaluations fold to chunk evaluations at the public
-/// [`chunk_fold_point`]. The IntEval protocol runs entirely at eval
+/// `chunk_fold_point`. The IntEval protocol runs entirely at eval
 /// time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegerModCommitment {
@@ -577,8 +564,8 @@ pub struct SmallPrimeOpening {
 
 /// One iteration's identity-check evaluation claims. The commitments
 /// live in the per-layer, per-role chunk polynomials
-/// ([`IntEvalArgument::ab_comms`]); every claim here folds through
-/// [`chunk_fold_point`] and is discharged by the final batched opens.
+/// (`IntEvalArgument::ab_comms`); every claim here folds through
+/// `chunk_fold_point` and is discharged by the final batched opens.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "F: Serialize + serde::de::DeserializeOwned")]
 pub struct IterationOracles<F = t256::Scalar> {
@@ -607,7 +594,7 @@ pub struct ChainData<F = t256::Scalar> {
 }
 
 /// Evaluation argument: the prover-sent integer evaluation `int_v'`,
-/// the reduction-sumcheck round polynomials (Phase-3 step D3), and one
+/// the reduction-sumcheck round polynomials, and one
 /// per-prime chain.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -805,9 +792,9 @@ pub struct SharedRangeCheck<B: CommitBackend> {
 }
 
 /// `BigUint → t256::Scalar` via 64-byte wide reduction. Value-preserving
-/// for inputs below the scalar field, otherwise reduces uniformly. Phase 3
-/// step D will add the range check that turns this into a *sound*
-/// commitment to a bounded integer.
+/// for inputs below the scalar field, otherwise reduces uniformly. The
+/// shared range check run at open time is what turns the resulting
+/// commitment into a *sound* commitment to a bounded integer.
 fn biguint_to_scalar<F: PrimeFieldExt>(v: &BigUint) -> F {
   // Fast path: values that fit one u64 digit (e.g. every limb at
   // T ≤ 2^64) skip the 512-bit uniform-reduction path.
@@ -1117,7 +1104,7 @@ fn extract_bit_window(bytes: &[u8], start: usize, len: usize) -> BigUint {
 /// Build the public limb-weight polynomial `limb` as a `DynPrime<2>`
 /// MLE of size `2^numlimb_var`: `limb[k] = T^k` for `k < numlimb`, else
 /// `0` (padding when `numlimb` isn't a power of two). Used by the
-/// Phase-3 step D3 reduction sumcheck integrand
+/// reduction sumcheck integrand
 /// `sum_k limb(k) · f_limb(int_r, k)`.
 fn build_limb_weight_dynprime(
   params: &IntEvalParams,
@@ -1169,19 +1156,6 @@ fn limb_split_polynomial(poly: &[BigUint], log_t: usize, log_t_f: usize) -> Vec<
       limbs.into_iter()
     })
     .collect()
-}
-
-/// Truncated (toward-zero) divmod. Returns `(q, r)` with `q · d + r = g`
-/// and `sign(r) = sign(g)` (or `r = 0`); `|r| < d`. Used by IntEval's
-/// partial-evaluation decomposition for *symmetric* remainder/quotient,
-/// matching the user-preferred convention (deviates from the paper's
-/// floor-division `⌊·/p_i⌋`). The integer identity `a + p · b = g`
-/// holds the same for both, so soundness is unchanged.
-fn truncated_divmod(g: &BigInt, d: &BigUint) -> (BigInt, BigInt) {
-  let d_big = BigInt::from(d.clone());
-  let q = g / &d_big;
-  let r = g - &q * &d_big;
-  (q, r)
 }
 
 /// Public shift bound for an `a_j` polynomial: under truncated divmod
@@ -1921,7 +1895,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 
 /// The Brakedown-backed integer Mod-PCS: the same IntEval protocol as
 /// [`IntegerModPCS`], with commitments and final openings going through
-/// [`BdBackend`] (hash-based, non-hiding — this instantiation is NOT
+/// `BdBackend` (hash-based, non-hiding — this instantiation is NOT
 /// zero-knowledge). Used for the code-commitment comparison
 /// instantiation: no elliptic-curve operations anywhere in the prover,
 /// at the cost of megabyte-scale proofs and slower verification.
@@ -2307,7 +2281,7 @@ fn prove_one_poly_phase1<
   let f_limb = limb_split_polynomial(poly, params.log_t, params.log_t_f);
   info!(elapsed_ms = %ls_t.elapsed().as_millis(), "imod_pcs_red_limb_split");
 
-  // 1. Reduction sumcheck (Phase-3 step D3): reduce the eval claim
+  // 1. Reduction sumcheck: reduce the eval claim
   //    `f(int_r) ≡_p eval` to a claim about `f_limb` at a combined
   //    point `(int_r, r_k)` where `r_k` are the sumcheck challenges.
   let (_dc_span, dc_t) = start_span!("imod_pcs_red_to_dynprime");
@@ -2518,7 +2492,6 @@ fn prove_one_poly_phase1<
       }
 
       Ok(ChainProverState {
-        p_i: p_i.clone(),
         r_i_int,
         iters,
       })
@@ -3465,7 +3438,6 @@ struct IterationProverState<F = t256::Scalar> {
 /// Prover-side per-chain state collected in phase 1 and consumed in
 /// phase 2.
 struct ChainProverState<F = t256::Scalar> {
-  p_i: BigUint,
   r_i_int: Vec<BigUint>,
   iters: Vec<IterationProverState<F>>,
 }
@@ -3698,8 +3670,11 @@ fn hyrax_verify_open<T: ByteTranscript>(
   )
 }
 
-/// Which commitment a range-check batch's value claim targets.
+/// Which commitment a range-check batch's value claim targets. Routing
+/// keys off the variant only; the payload identifies the batch in
+/// `Debug` output and diagnostics.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 enum RcTarget {
   /// The input polynomial `f` of batch member `poly` (its `f_limb` batch).
   F { poly: usize },
@@ -5386,25 +5361,6 @@ mod tests {
     assert_eq!(out[1], BigUint::from(0xafu32));
     assert_eq!(out[2], BigUint::from(0x00u32)); // top limb (within numlimb)
     assert_eq!(out[3], BigUint::from(0u32)); // padding slot
-  }
-
-  /// Truncated divmod gives symmetric `(q, r)`: `divmod(-g) = (-q, -r)`.
-  #[test]
-  fn truncated_divmod_is_symmetric() {
-    for (g, d, eq, er) in [
-      (7i64, 2u64, 3i64, 1i64),
-      (-7, 2, -3, -1),
-      (8, 2, 4, 0),
-      (-8, 2, -4, 0),
-      (-7, 3, -2, -1),
-      (0, 5, 0, 0),
-    ] {
-      let (q, r) = truncated_divmod(&BigInt::from(g), &BigUint::from(d));
-      assert_eq!(q, BigInt::from(eq), "q wrong for {g} / {d}");
-      assert_eq!(r, BigInt::from(er), "r wrong for {g} mod {d}");
-      // Identity always holds.
-      assert_eq!(&q * BigInt::from(d) + &r, BigInt::from(g));
-    }
   }
 
   /// Partial-eval at the last variable should match a 2-step direct

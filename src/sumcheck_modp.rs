@@ -1,9 +1,5 @@
-// TODO Phase 2 step 5+: remove `allow(dead_code)` once a Phase-2
-// IntModSpartan driver starts consuming this module.
-#![allow(dead_code)]
-
-//! Parallel sumcheck protocol bound on `SumcheckEngine`, used by Phase-2
-//! IntMod-Spartan. Lives alongside `src/sumcheck.rs` rather than
+//! Parallel sumcheck protocol bound on `SumcheckEngine`, used by the
+//! dual-field IntMod-Spartan driver (`imod_spartan_modp`). Lives alongside `src/sumcheck.rs` rather than
 //! replacing it, so the field-generic stack stays untouched and the two
 //! implementations can be differentially tested; a later unification
 //! remains possible.
@@ -13,7 +9,7 @@
 //! protocol math, easy to read and verify. Optimizations can be added
 //! later if benchmarks demand.
 //!
-//! After the Phase-2 step-5 refactor, all constructors of `Self::Scalar`
+//! All constructors of `Self::Scalar`
 //! (`zero`, `one`, `from_u64`) take the field's `Params` context, which
 //! comes from the polynomials passed in (each `MultilinearPolynomial`
 //! carries its own `Params`).
@@ -386,7 +382,7 @@ mod tests {
     );
   }
 
-  /// The load-bearing Phase-2 test: run the 5-input cubic sumcheck over the
+  /// The load-bearing dynamic-field test: run the 5-input cubic sumcheck over the
   /// dynamic-prime field `DynPrime<2>` (not a static curve scalar). Same
   /// shape as `prove_cubic_with_five_inputs_roundtrips_on_satisfying_witness`
   /// but with `Scalar = DynPrime<2>` parameterized by a runtime 256-bit

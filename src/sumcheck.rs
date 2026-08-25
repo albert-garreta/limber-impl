@@ -677,7 +677,7 @@ pub(crate) mod eq_sumcheck {
       // Note: we do not use the wide-accumulator delayed-reduction path here
       // because the integrand mixes two quadratic terms with opposite signs;
       // the existing accumulator API only accumulates products. A normal
-      // field-multiply path is plenty for phase 1; revisit if this is hot.
+      // field-multiply path is plenty for now; revisit if this is hot.
       let (t_0, t_inf) = if in_first_half {
         let (poly_eq_left, poly_eq_right, second_half) = self.poly_eqs_first_half();
         let eq_out_len = poly_eq_left.len();

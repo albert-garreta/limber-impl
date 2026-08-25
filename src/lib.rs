@@ -4,9 +4,17 @@
 // See the LICENSE file in the project root for full license information.
 // Source repository: https://github.com/Microsoft/Spartan2
 
-//! This library implements Spartan, a high-speed SNARK.
-//! We currently implement a non-preprocessing version of Spartan
-//! that is generic over the polynomial commitment and evaluation argument (i.e., a PCS).
+//! Limber: SNARKs for integer Mod-R1CS — constraints with arbitrary,
+//! per-row integer moduli — built on Spartan's sum-check pipeline.
+//!
+//! The integer proof system lives in [`imod_spartan_modp`] (the
+//! dual-field driver: sumcheck over a verifier-sampled prime `p`, with
+//! an integer Mod-PCS bridging to the commitment field `q`) and its
+//! relation [`imod_r1cs_modp`]; the Mod-PCS is
+//! `provider::pcs::integer_modpcs`, instantiable over Hyrax (curve mode)
+//! or Brakedown (hash mode). [`imod_spartan`] / [`imod_r1cs`] are the
+//! simpler single-field (`p = q`) prototype. The fork also retains the
+//! original PCS-generic Spartan ([`spartan`]).
 #![deny(
   warnings,
   unused,
@@ -37,18 +45,24 @@ pub mod traits;
 
 // internal modules
 mod big_num;
-mod dyn_prime;
-mod ecdsa_msm; // ECDSA-verify MSM circuit gadgets (secp256k1) for integer Mod-R1CS
 mod polys;
-mod polys_modp;
 mod sumcheck;
-mod sumcheck_modp;
+
+// ECDSA-verify MSM circuit gadgets (secp256k1): row-count / prove-time
+// experiments, test-only.
+#[cfg(test)]
+mod ecdsa_msm;
+
+// dynamic-prime (dual-field) sumcheck stack
+pub mod dyn_prime;
+pub mod polys_modp;
+pub mod sumcheck_modp;
 
 // public modules for proof systems
 pub mod imod_r1cs; // Integer Mod-R1CS relation (paper Def 5.4)
-pub mod imod_r1cs_modp; // Phase-2 IntMod-R1CS over a ModEngine (dynamic prime)
+pub mod imod_r1cs_modp; // Integer Mod-R1CS over a ModEngine (dual-field, verifier-sampled prime)
 pub mod imod_spartan; // Spartan over Integer Mod-R1CS
-pub mod imod_spartan_modp; // Phase-2 SNARK driver over a ModEngine
+pub mod imod_spartan_modp; // Dual-field SNARK driver over a ModEngine
 pub mod logup_gkr; // LogUp-GKR range proof (16-bit range check via fractional-sum GKR)
 pub mod spartan; // Spartan without zero-knowledge
 

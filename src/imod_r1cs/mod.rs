@@ -1,9 +1,10 @@
-//! Integer Mod-R1CS relation types (paper Def 5.4, phase 1: no limb split).
+//! Integer Mod-R1CS relation types (paper Def 5.4) — the single-field
+//! prototype; `imod_r1cs_modp` is the dual-field relation.
 //!
-//! Phase 1 simplifications:
+//! Simplifications relative to `imod_r1cs_modp`:
 //!   - single field: we use `E::Scalar` (= `Fq`, the curve scalar field) as
 //!     both the sumcheck field and the PCS field. The paper's separate prime
-//!     `p` is deferred to phase 4.
+//!     `p` is what `imod_r1cs_modp` / `imod_spartan_modp` add.
 //!   - no limb split (ν_z = ν_q = 1).
 //!   - no range checks (norm bounds are metadata only).
 //!
@@ -65,7 +66,7 @@ pub struct IntModR1CSInstance<E: Engine> {
 }
 
 impl<E: Engine> IntModR1CSShape<E> {
-  /// Build a new shape. Phase-1 invariants: `num_vars` and `num_cons` are
+  /// Build a new shape. Invariants: `num_vars` and `num_cons` are
   /// powers of two, and `num_vars >= 1 + num_io` so the public side fits
   /// inside the upper half of the MLE.
   pub fn new(
@@ -185,7 +186,7 @@ impl<E: Engine> IntModR1CSShape<E> {
   }
 
   /// Check that (instance, witness) satisfies the Integer Mod-R1CS equation
-  /// over E::Scalar (phase 1: p = q). Also verifies that the commitments
+  /// over E::Scalar (p = q). Also verifies that the commitments
   /// open to the claimed w and q.
   pub fn is_sat(
     &self,

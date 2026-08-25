@@ -269,7 +269,7 @@ pub fn open_direct<F: PrimeFieldExt>(poly: &[F]) -> BrakedownDirectOpen<F> {
 
 /// Verify a directly-shipped polynomial: re-hash the shipped bytes
 /// against the plain-hash commitment (see
-/// [`commit_plain`](super::commit_plain)) and evaluate the multilinear
+/// [`commit_plain`](super::commit::commit_plain)) and evaluate the multilinear
 /// claim directly.
 pub fn verify_direct<F: PrimeFieldExt>(
   root: &Hash,

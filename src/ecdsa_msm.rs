@@ -7,9 +7,8 @@
 //! `(p−1)`-coefficient negation would produce negative quotients — unsound
 //! here). All witness/quotient values are `< p`.
 //!
-//! This is the gadget layer; the full Shamir MSM loop and bench build on it.
-
-#![allow(dead_code)]
+//! This is the gadget layer; the Shamir MSM loop and the row-count /
+//! prove-time experiments in the test module build on it. Test-only.
 
 use num_bigint::BigUint;
 use num_integer::Integer;
@@ -160,11 +159,6 @@ impl CircuitBuilder {
   /// Push a modular row with modulus `p` (the EC base field).
   fn push_row(&mut self, row: usize, a: &[(usize, u32)], b: &[(usize, u32)], c: &[(usize, u32)]) {
     self.push_row_m(row, a, b, c, self.p.clone());
-  }
-
-  /// Constrain `col` to be boolean: `b·b = b` over ℤ (exact, `m=0`).
-  fn boolean(&mut self, row: usize, col: usize) {
-    self.push_row_m(row, &[(col, 1)], &[(col, 1)], &[(col, 1)], BigUint::ZERO);
   }
 
   /// Difference witness `d = (a − b) mod p` with the row `d + b ≡ a (mod p)`.

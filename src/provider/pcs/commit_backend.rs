@@ -22,10 +22,6 @@
 //! randomness, so that instantiation is not zero-knowledge (the same
 //! trade-off Zinc+ makes).
 
-// Staged: consumed by the Brakedown Mod-PCS integration (threading the
-// backend through integer_modpcs is the next milestone).
-#![allow(dead_code)]
-
 use crate::{
   errors::SpartanError,
   provider::pcs::brakedown::{

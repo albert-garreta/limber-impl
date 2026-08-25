@@ -1,15 +1,11 @@
-// TODO Phase 2 step 6+: remove `allow(dead_code)` once a Phase-2
-// IntModSpartan driver starts consuming this type.
-#![allow(dead_code)]
-
 //! Dynamic-modulus prime field `DynPrime<LIMBS>`, backed by
 //! `crypto_bigint::modular::FixedMontyForm<LIMBS>`. The runtime modulus
 //! is sampled by the verifier and carried inside each value via its
 //! `FixedMontyParams<LIMBS>` context.
 //!
-//! Used by Phase-2 IntMod-Spartan when the SNARK arithmetic happens
-//! modulo a verifier-sampled ~128-bit prime that isn't known at compile
-//! time.
+//! Used by the dual-field IntMod-Spartan driver (`imod_spartan_modp`)
+//! when the SNARK arithmetic happens modulo a verifier-sampled prime
+//! that isn't known at compile time.
 
 use crate::traits::{mod_engine::SumcheckField, transcript::TranscriptReprTrait};
 use crypto_bigint::{
@@ -155,7 +151,7 @@ impl<const LIMBS: usize> SumcheckField for DynPrime<LIMBS> {
 }
 
 // Absorbing a DynPrime into a ByteTranscript: hand over its canonical LE
-// bytes. The Phase-2 SNARK driver needs this to absorb mods, IO, and the
+// bytes. The dual-field SNARK driver needs this to absorb mods, IO, and the
 // outer-SC claims into the shared Fiat-Shamir chain.
 impl<const LIMBS: usize> TranscriptReprTrait for DynPrime<LIMBS> {
   fn to_transcript_bytes(&self) -> Vec<u8> {

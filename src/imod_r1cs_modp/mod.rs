@@ -1,8 +1,8 @@
-//! Phase-2 Integer Mod-R1CS relation over arbitrary-precision integers,
+//! Integer Mod-R1CS relation over arbitrary-precision integers,
 //! parameterized over a `ModEngine`.
 //!
-//! In contrast to Phase 1 (which used the curve scalar field directly),
-//! Phase 2 stores the matrices, mods, and witness as `BigUint` integers —
+//! In contrast to `imod_r1cs` (which uses the curve scalar field directly),
+//! this relation stores the matrices, mods, and witness as `BigUint` integers —
 //! they're chosen at shape-construction time, *before* the verifier samples
 //! the runtime prime `p`. The SNARK driver reduces the integer data into
 //! `M::Scalar` (the dynamic-prime field `Z_p`) once `p` is sampled inside
@@ -12,7 +12,7 @@
 //! reuse `SparseMatrix<F: PrimeField>` since `BigUint` isn't a field).
 //! `is_sat` checks the relation over Z: `A·z ∘ B·z = C·z + m ∘ q`.
 //!
-//! Phase-2 invariants: `num_vars`, `num_cons` are powers of two,
+//! Invariants: `num_vars`, `num_cons` are powers of two,
 //! `num_vars ≥ 1 + num_io`, and `mods.len() == num_cons`.
 
 use crate::{
@@ -31,7 +31,7 @@ type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
 type ModComm<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Commitment;
 type ModBlind<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::Blind;
 
-/// Phase-2 IntMod-R1CS shape over `M: ModEngine`. Integer-valued
+/// IntMod-R1CS shape over `M: ModEngine`. Integer-valued
 /// matrices/mods; `p`-independent so the same shape can be used with any
 /// verifier-sampled prime.
 ///
@@ -75,7 +75,7 @@ pub struct IntModR1CSInstanceModp<M: ModEngine> {
 }
 
 impl<M: ModEngine> IntModR1CSShapeModp<M> {
-  /// Build a new shape. Phase-2 invariants: power-of-two sizes,
+  /// Build a new shape. Invariants: power-of-two sizes,
   /// `num_vars ≥ 1 + num_io`, `mods.len() == num_cons`.
   pub fn new(
     num_cons: usize,
@@ -215,7 +215,7 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
   }
 
   /// Hash the shape's public data to a 32-byte digest for transcript
-  /// binding. Phase-1 uses `bincode`-based `Digestible`; here we hash raw
+  /// binding. `imod_r1cs` uses `bincode`-based `Digestible`; here we hash raw
   /// bytes since `BigUint` is serializable but we want a stable, simple
   /// byte layout independent of `serde`'s encoding choices.
   pub fn digest(&self) -> [u8; 32] {

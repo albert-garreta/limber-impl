@@ -1,40 +1,39 @@
-//! Phase-2 trait scaffolding for running IntMod-Spartan over a
-//! runtime-determined prime field.
+//! Trait scaffolding for running IntMod-Spartan over a
+//! runtime-determined prime field (the dual-field driver).
 //!
 //! The existing `Engine` trait (in `traits/mod.rs`) bakes the sumcheck field
 //! into the curve via `Engine::Scalar: PrimeField + PrimeFieldBits + …`. Those
 //! `ff` traits require a compile-time-known modulus (`MODULUS: &'static str`),
-//! which excludes dynamic-modulus arithmetic. Phase 2 needs the SNARK
+//! which excludes dynamic-modulus arithmetic. The dual-field driver needs the SNARK
 //! arithmetic to happen modulo a verifier-sampled ~128-bit prime, so this file
 //! introduces a parallel trait hierarchy:
 //!
 //!   - [`SumcheckField`]: a field-like interface that does **not** require a
 //!     static modulus. Implemented by both static-modulus curve scalars
-//!     (via a blanket impl that lands in step 2) and by the runtime-modulus
-//!     `DynPrime` type (Phase 2b, backed by `crypto-bigint::MontyForm`).
+//!     (via a blanket impl) and by the runtime-modulus
+//!     `DynPrime` type (backed by `crypto-bigint::MontyForm`).
 //!
 //!   - [`SumcheckEngine`]: the minimum surface that `sumcheck.rs` needs. Both
-//!     `Engine` and [`ModEngine`] implement it (via blanket impls in step 2).
+//!     `Engine` and [`ModEngine`] implement it (via blanket impls).
 //!     Loosening `impl<E: Engine> SumcheckProof<E>` to `impl<E: SumcheckEngine>`
 //!     is what lets the sumcheck code run over either static or dynamic fields
 //!     without algorithmic changes.
 //!
-//!   - [`ModEngine`]: the Phase-2 engine for `IntModSpartanSNARK`. Bundles a
+//!   - [`ModEngine`]: the engine for `IntModSpartanModpSNARK`. Bundles a
 //!     `SumcheckField` (the dynamic prime), a [`ModPCSEngineTrait`] (the
 //!     Mod-PCS), and a transcript. **Deliberately PCS-agnostic** — does not
 //!     assume the Mod-PCS sits on an elliptic-curve / Pedersen commitment;
 //!     FRI-based, hash-based, or other underlying structures are also fine.
 //!
 //!   - [`ModPCSEngineTrait`]: PCS interface for committing polynomials over
-//!     `Self::Scalar` and opening them at `Self::Scalar` points. The Phase-2+
+//!     `Self::Scalar` and opening them at `Self::Scalar` points. The Mod-PCS
 //!     analog of `PCSEngineTrait`. Concrete impls hide their underlying
 //!     machinery (curve+Pedersen, FRI, Merkle, etc.) entirely.
 //!
-//! This file only defines the trait shapes. Step 2 of the Phase 2 plan
-//! loosens `sumcheck.rs`'s bound from `E: Engine` to `E: SumcheckEngine`,
-//! drops the `Group` marker from `TranscriptReprTrait`, and adds the
-//! blanket impls; step 4 adds the first `ModEngine` impl (a trivial
-//! backward-compat wrapper around an existing `Engine`).
+//! This file only defines the trait shapes. `sumcheck_modp.rs` and
+//! `imod_spartan_modp.rs` consume them; `provider/mod.rs` supplies the
+//! concrete `ModEngine` impls (`T256DynPrimeEngine` and the Brakedown-
+//! backed variants).
 
 use crate::{
   errors::SpartanError,
@@ -55,7 +54,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Unlike `ff::PrimeField`, does **not** require a compile-time-known modulus.
 /// This lets the trait be implemented by both static-modulus curve scalars
-/// (Phase 1) and by `DynPrime`-style dynamic-modulus types (Phase 2+).
+/// and by `DynPrime`-style dynamic-modulus types.
 ///
 /// The trait provides only what the sumcheck and MLE code requires:
 /// arithmetic, additive/multiplicative identities, `u64` casting, inversion,
@@ -121,7 +120,7 @@ pub trait SumcheckField:
   ///
   /// NOTE (followup): the dynamic-field implementation currently consumes
   /// at most `LIMBS * 8` bytes, so for a modulus near that width the
-  /// challenge is slightly biased. Fine for the Phase-2 prototype; a
+  /// challenge is slightly biased. Fine for the prototype; a
   /// soundness-grade version needs wide reduction (≥ modulus_bits + 128
   /// input bits).
   fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self;
@@ -129,8 +128,8 @@ pub trait SumcheckField:
 
 /// Blanket impl: any static-modulus prime field that already implements
 /// `PrimeField + PrimeFieldExt` (i.e. every `Engine::Scalar` in this codebase)
-/// automatically satisfies `SumcheckField`. This is the Phase-1 backward-compat
-/// path — existing code keeps running without any per-type impls.
+/// automatically satisfies `SumcheckField`. This is the backward-compat
+/// path for the static-field code — it keeps running without any per-type impls.
 impl<F> SumcheckField for F
 where
   F: PrimeField + PrimeFieldExt + TranscriptReprTrait + Copy + Send + Sync + 'static,
@@ -160,11 +159,10 @@ where
 /// The minimum engine surface that `sumcheck.rs` and the MLE polynomial
 /// operations need.
 ///
-/// Both `Engine` and [`ModEngine`] are intended to satisfy this (via blanket
-/// impls added in step 2). Loosening the bound on `SumcheckProof<E>` from
+/// Both `Engine` and [`ModEngine`] satisfy this (via blanket
+/// impls). Loosening the bound on `SumcheckProof<E>` from
 /// `E: Engine` to `E: SumcheckEngine` is what lets the same sumcheck code
-/// run over the curve scalar (Phase 1) or over a dynamic prime field
-/// (Phase 2).
+/// run over the curve scalar or over a dynamic prime field.
 pub trait SumcheckEngine:
   Clone + Copy + Debug + Send + Sync + Sized + Eq + PartialEq + 'static
 {
@@ -180,7 +178,7 @@ pub trait SumcheckEngine:
 /// Blanket impl: any `Engine` is a `SumcheckEngine` (its `Scalar` is the
 /// curve scalar, which satisfies `SumcheckField` via the blanket impl
 /// above; its `TE` is just the engine's own transcript). This is the
-/// Phase-1 backward-compat path — Phase-1 SNARK code can switch its trait
+/// backward-compat path — static-field SNARK code can switch its trait
 /// bound from `E: Engine` to `E: SumcheckEngine` without changing any
 /// concrete impl.
 impl<E: Engine> SumcheckEngine for E {
@@ -188,17 +186,13 @@ impl<E: Engine> SumcheckEngine for E {
   type TE = E::TE;
 }
 
-/// The Phase-2 engine for `IntModSpartanSNARK`.
+/// The engine for the dual-field `IntModSpartanModpSNARK`.
 ///
 /// Pairs a `SumcheckField` (the runtime-sampled prime field) with a Mod-PCS
 /// that commits integer-valued polynomials and opens them at points in
 /// `Self::Scalar^n`. The underlying curve and its static-modulus PCS are
-/// hidden inside [`ModEngine::Curve`] — the SNARK code never sees the curve
-/// scalar directly.
-///
-/// For Phase 1 backward compatibility, a trivial `ModEngine` impl wraps an
-/// existing `Engine` with `Scalar = Engine::Scalar` and a no-op Mod-PCS that
-/// delegates to the standard PCS.
+/// hidden inside [`ModEngine::ModPCS`] — the SNARK code never sees the
+/// commitment field directly.
 pub trait ModEngine: SumcheckEngine {
   /// The Mod-PCS. Commits polynomials whose evaluations are in
   /// `Self::Scalar` and opens them at `Self::Scalar^n` points.
@@ -235,10 +229,9 @@ pub trait ModEngine: SumcheckEngine {
 /// PCS interface for committing polynomials whose evaluations come from a
 /// dynamic-prime field, and opening them at points in that field.
 ///
-/// Phase-2 analog of `PCSEngineTrait`. Concrete implementations handle the
-/// `Self::Scalar` ↔ underlying-curve-scalar conversion internally (e.g.
-/// limb-splitting in Phase 3's real Mod-PCS, or trivial casting in Phase 2's
-/// placeholder).
+/// Mod-PCS analog of `PCSEngineTrait`. Concrete implementations handle the
+/// `Self::Scalar` ↔ underlying-field conversion internally (limb-splitting
+/// plus the IntEval small-prime fingerprinting in `IntegerModPCS`).
 ///
 /// The interface deliberately mirrors `PCSEngineTrait` so the SNARK code that
 /// calls it (`IntModSpartanSNARK::prove`/`verify`) has the same shape as
@@ -253,7 +246,7 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Commitment value, absorbable into the transcript.
   ///
   /// `TranscriptReprTrait` is marker-free (no `<G: Group>`) since the
-  /// Phase-2 transcript trait split — non-group-based PCSes can implement
+  /// transcript trait split — non-group-based PCSes can implement
   /// it without inventing a placeholder curve group.
   type Commitment: Clone
     + Debug
@@ -290,8 +283,8 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
 
   /// Sample a fresh blind suitable for committing a polynomial of length `n`.
   ///
-  /// Mirrors `PCSEngineTrait::blind` for the Phase-2 step-6 wrapping
-  /// pattern. For future hash-based / non-hiding Mod-PCS impls, this can
+  /// Mirrors `PCSEngineTrait::blind` for engines that wrap a field
+  /// PCS. For future hash-based / non-hiding Mod-PCS impls, this can
   /// return a unit-typed sentinel.
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind;
 

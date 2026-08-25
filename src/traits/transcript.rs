@@ -13,7 +13,7 @@ use crate::{
 
 /// This trait allows types to implement how they want to be added to `TranscriptEngine`.
 ///
-/// (Step 2 of Phase 2 dropped the previous `<G: Group>` marker — the parameter
+/// (The previous `<G: Group>` marker was dropped — the parameter
 /// was only used as a phantom for type-level domain separation between
 /// protocols, which the `dom_sep` label already handles. Removing it lets
 /// non-group-based PCSes implement the trait without inventing a placeholder
@@ -27,7 +27,7 @@ pub trait TranscriptReprTrait: Send + Sync {
 /// bytes, and domain separation.
 ///
 /// This is the byte-level Fiat-Shamir chain. A single byte-chain can feed
-/// multiple field reductions — e.g. a Phase-2 SNARK's `Z_p` sumcheck and
+/// multiple field reductions — e.g. the dual-field SNARK's `Z_p` sumcheck and
 /// the underlying PCS's `F_q` opening both read challenges from the *same*
 /// `ByteTranscript`, each reducing the raw bytes into its own field. This
 /// decoupling is what lets `sumcheck_modp` (arithmetic over a dynamic

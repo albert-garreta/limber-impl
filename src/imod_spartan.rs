@@ -1,9 +1,10 @@
-//! Phase-1 Integer Mod-R1CS SNARK driver.
+//! Single-field (p = q) Integer Mod-R1CS SNARK driver — the prototype
+//! that `imod_spartan_modp` generalizes.
 //!
 //! Mirrors `spartan::SpartanSNARK` but proves the IntMod-R1CS relation
 //!   `Az ∘ Bz = Cz + m ∘ q`
-//! over the curve scalar field (i.e. p = q for now; the paper's separate
-//! random prime p is deferred to phase 4). Single witness segment (no
+//! over the curve scalar field (i.e. p = q; the paper's separate
+//! random prime p is what `imod_spartan_modp` adds). Single witness segment (no
 //! shared/precommitted/rest split), no limb decomposition, no range checks,
 //! no BDDT first-round optimization in the inner sumcheck — this is the
 //! simplest version that exercises every structural change.
@@ -347,7 +348,7 @@ impl<E: Engine> IntModSpartanSNARK<E> {
     let eval_x = eval_public_at::<E>(num_rounds_y - 1, &U.x, &r_y[1..]);
     let eval_z = (E::Scalar::ONE - r_y[0]) * self.eval_w + r_y[0] * eval_x;
 
-    // Evaluate A, B, C MLEs at (r_x, r_y) via full eq tables (phase 1 path).
+    // Evaluate A, B, C MLEs at (r_x, r_y) via full eq tables.
     let t_x = EqPolynomial::evals_from_points(&r_x);
     let t_y = EqPolynomial::evals_from_points(&r_y);
     let (eval_a, eval_b, eval_c) = evaluate_matrices::<E>(shape, &t_x, &t_y);

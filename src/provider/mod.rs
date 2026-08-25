@@ -93,11 +93,10 @@ impl Engine for Bn254Engine {
 
 // ---- ModEngine impls ------------------------------------------------------
 
-/// A Phase-2 engine whose sumcheck arithmetic runs over the dynamic-prime
-/// field `DynPrime<2>` (256-bit, runtime modulus). This is *not* an
-/// `Engine` — it's a `SumcheckEngine` only, used to drive `sumcheck_modp`
-/// over a runtime prime. (The full `ModEngine` impl, pairing it with a
-/// Mod-PCS, lands in step 7b.)
+/// The curve-mode `ModEngine`: sumcheck arithmetic over the dynamic-prime
+/// field `DynPrime<2>` (256-bit, runtime modulus), integer Mod-PCS over
+/// Hyrax-T256. This is *not* an `Engine` — it's a `SumcheckEngine` +
+/// `ModEngine` only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct T256DynPrimeEngine;
 
@@ -197,8 +196,8 @@ impl ModEngine for M127DynPrimeBdEngine {
 }
 
 impl ModEngine for T256DynPrimeEngine {
-  // Phase-3 step B: sound IntegerModPCS (small-prime fingerprinting +
-  // Hyrax-T256 underneath).
+  // The integer Mod-PCS (IntEval small-prime fingerprinting over a field
+  // PCS — Hyrax-T256 here; the `*BdEngine`s use Brakedown).
   type ModPCS = crate::provider::pcs::integer_modpcs::IntegerModPCS;
 
   /// Bootstrap params: smallest valid odd-modulus `FixedMontyParams<2>`
