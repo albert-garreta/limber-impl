@@ -840,6 +840,13 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let arg_bytes = proof.eval_arg_size();
     let (pp, rc, co) = proof.eval_arg_component_sizes();
     println!("  breakdown: per_poly {pp} B, range_check {rc} B, combined_open {co} B");
+    // PSDUMP=<path>: write the serialized eval_arg so its compressed
+    // size can be measured externally (e.g. `zstd -19`).
+    if let Some(path) = std::env::var_os("PSDUMP") {
+      let bytes = bincode::serialize(proof.eval_arg_ref()).unwrap();
+      std::fs::write(&path, &bytes).unwrap();
+      println!("  dumped eval_arg ({} bytes) to {:?}", bytes.len(), path);
+    }
     // Dynamic-prime remainder: 13 cubic outer rounds (3 coeffs each) +
     // 14 quadratic inner rounds (2 coeffs) + 6 claimed evals, 16 B per
     // 2-limb scalar.

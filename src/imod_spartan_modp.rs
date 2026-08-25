@@ -124,6 +124,16 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
 }
 
 impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
+  /// The full batch evaluation argument, for serialization accounting
+  /// (e.g. dumping the bytes to measure compressed size).
+  pub fn eval_arg_ref(
+    &self,
+  ) -> &crate::provider::pcs::integer_modpcs::IntEvalBatchArgument<
+    crate::provider::pcs::integer_modpcs::HyBackend,
+  > {
+    &self.eval_arg
+  }
+
   /// Per-component serialized sizes of the batch evaluation argument:
   /// `(per_poly, range_check, combined_open)` bytes. Proof-size
   /// accounting; see `eval_arg_size` for the total.
