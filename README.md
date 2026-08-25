@@ -25,22 +25,12 @@ Limber is a compiler from **almost any** field PCS to a integer mod-PCS with min
 
 ## The base library
 
-The fork retains Spartan2's proving systems, which the integer work
-builds on and benchmarks against:
+This repository is forked from Spartan2 and builds on top of:
 
 - **Spartan SNARK** — a PCS-generic implementation of
   [Spartan](https://eprint.iacr.org/2019/550), a sum-check-based
   SNARK with a linear-time prover (the non-zero-knowledge variant).
-  Accepts R1CS circuits written with
-  [bellpepper](https://github.com/lurk-lab/bellpepper) and works with
-  any multilinear PCS (Hyrax engines over Pallas/Vesta/P-256/T-256 and
-  BN254 are provided).
-
-- **Precomputable / online witness split** — the Spartan module
-  exposes `setup` → `prep_prove` → `prove`, so witness material known
-  ahead of time is synthesized and committed once and reused across
-  proofs. The integer protocol (`imod_spartan_modp`) is a plain
-  `setup` → `prove` → `verify`.
+- **Hyrax** - an elliptic curve-based PCS with fast prover performance.
 
 ## Benchmarks
 
