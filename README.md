@@ -1,36 +1,34 @@
-# Limber: SNARKs for Integers on Spartan
+# Limber: Low Overhead SNARKs for Integers
 
-A research prototype of **Integer Mod-R1CS** proving — SNARKs whose
-constraints are modular arithmetic over arbitrary, per-constraint
-integer moduli — built as a fork of
-[Microsoft Spartan2](https://github.com/Microsoft/Spartan2). It
-implements the protocol from the accompanying paper
-[*Limber: Low Overhead SNARKs for Integers from Any
-PCS*](https://eprint.iacr.org/2026/1635) (Def. 5.4) on top of
-Spartan's sum-check pipeline.
+In this repo, we build prototypes of SNARKs for Integers over Mod R1CS, where constraints support arbitrary modular arithmetic. 
+It implements the protocol from the accompanying paper [*Limber: Low Overhead SNARKs for Integers from Any PCS*](https://eprint.iacr.org/2026/1635) 
 
-## Why integer Mod-R1CS
+This repo is forked from
+[Microsoft Spartan2](https://github.com/Microsoft/Spartan2), and we accordingly build Limber-Spartan with various choices of underlying PCS, including Hyrax and Brakedown.
 
-Standard R1CS forces all arithmetic into one fixed prime field, so a
-single multiplication modulo a foreign modulus `N` (say, a 2048-bit RSA
-modulus) costs thousands of constraints in limb-decomposed form. The
-Integer Mod-R1CS relation works over the integers with a **per-row
-modulus** `m_i` and a prover-supplied quotient `q_i`:
+## Integer Mod-R1CS Arithmetization
+
+The Integer Mod-R1CS relation is different from the standard R1CS relation, adding a modulus `m_i` and a quotient `q_i` per constraint:
 
 ```text
 A·z ∘ B·z = C·z + m ∘ q        (over Z, with bounded norms)
 ```
 
-so one row *is* one modular multiplication `LC_A · LC_B ≡ LC_C (mod m_i)`,
-regardless of how wide `m_i` is. The sum-check is then run modulo a
-random prime `p` sampled by the verifier via Fiat–Shamir.
+so one row *is* one modular multiplication. This naturally and efficiently supports large and varying modular arithmetic gates.
+
+## Fingerprinting
+
+Proving this Integer Mod-R1CS relation over the integers can be reduced to proving it over a randomly sampled prime modulus $p$. However, we now need to be able to construct a PCS that is able to commit to **integers** in one field $\mathbb{F}_q$ and open in another $\mathbb{F}_p$. We call this a **integer mod-PCS**.
+
+## Limber: An Integer Mod-PCS Compiler
+Limber is a compiler from **almost any** field PCS to a integer mod-PCS with minimal multiplicative overhead $o(1)$. 
 
 ## The base library
 
 The fork retains Spartan2's proving systems, which the integer work
 builds on and benchmarks against:
 
-- **Spartan zkSNARK** — a PCS-generic implementation of
+- **Spartan SNARK** — a PCS-generic implementation of
   [Spartan](https://eprint.iacr.org/2019/550), a sum-check-based
   zkSNARK with a linear-time prover. Accepts R1CS circuits written
   with [bellpepper](https://github.com/lurk-lab/bellpepper) and works
