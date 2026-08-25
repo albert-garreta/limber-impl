@@ -31,7 +31,7 @@ It has two algorithms:
 - **Commit.** An integer polynomial $f$ with hypercube evaluations bounded by $`T_f`$ is limb-split into a polynomial $`f_{\mathsf{limb}}`$ whose entries are bounded by a base bound $T$ (we use $T = 2^{64}$), cast into $`\mathbb{F}_q`$, and committed with the underlying PCS.
 A batched range check (LogUp-GKR) proves every limb is below $T$.
 
-- **Evaluate mod $p$.** To open $f$ at a point $`\vec r \in \mathbb{Z}_p^{\mu}`$, a sumcheck reduces the claim to one about $`f_{\mathsf{limb}}`$, the prover sends the *integer* evaluation $y \in \mathbb{Z}$, and the verifier checks $y \equiv y' \pmod p$.
+- **Evaluate mod $p$.** To open $f$ at a point $`\vec r \in \mathbb{Z}_p^{\mu}`$ to $v$, a sumcheck reduces the claim to one about $`f_{\mathsf{limb}}`$, the prover sends the *integer* evaluation $y \in \mathbb{Z}$, and the verifier checks $y \equiv v \pmod p$.
 What remains is proving $`y = f_{\mathsf{limb}}(\vec{r'})`$ over the integers, which is handled by our IntEval protocol.
   - **IntEval.** The verifier samples $s$ small primes $`p_i`$ and the prover opens $`f_{\mathsf{limb}}`$ at $`\vec r \bmod p_i`$ for each.
   IntEval partially evaluates $k$ variables at a time to avoid overflow: the partially evaluated polynomial is decomposed as $`a + p_i \cdot b`$, the prover commits $a$ and $b$ (each $2^{-k}$ the size of the previous layer), and the protocol recurses on $a$.
@@ -48,17 +48,17 @@ The benchmarks below use the following parameters (Table 4 of the paper):
 | $s$ | $16$ | $30$ | Number of small CRT primes $`p_i`$ sampled by the IntEval verifier |
 | Commitment overhead | $\approx 0.13\times$ | $\approx 0.07\times$ | Extra committed data relative to the witness |
 
-The values shown are for the MultiSwap benchmark ($`T_f = 2^{2048}`$, $N = 2^{13}$ rows). The above parameters for the plain Spartan comparison ($`T_f = 2^{256}`$, $N = 2^{10} - 2^{14}$) are similar.
+The values shown are for the MultiSwap benchmark ($`T_f = 2^{2048}`$, $N = 2^{13}$ rows). The above parameters for the plain Spartan comparison ($`T_f = 2^{256}`$, $N = 2^{10} \text{-} 2^{14}$) are similar.
 
 $s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`).
-Larger $k$ lowers the commitment overhead at the cost of more CRT primes.
+Larger $k$ lowers the commitment overhead at the cost of more CRT primes. See the paper for more details.
 
 ## Code layout
 
 - `src/provider/pcs/integer_modpcs.rs` — the mod-PCS compiler: commit, evaluate mod $p$, and IntEval.
-- `src/provider/pcs/commit_backend.rs` — PCS-agnostic backend seam the compiler is written against.
+- `src/provider/pcs/commit_backend.rs` — the `CommitBackend` trait for underlying PCSs.
 - `src/provider/pcs/hyrax_pc.rs`, `src/provider/pcs/brakedown/` — the two PCS instantiations: Hyrax over the Tom-256 curve and Brakedown over the Tom-256 scalar field.
-- `src/logup_gkr.rs` — batched LogUp-GKR range check for the limbs.
+- `src/logup_gkr.rs` — batched LogUp-GKR range check for the limbs and decomposed polynomials in IntEval.
 - `src/dyn_prime.rs`, `src/sumcheck_modp.rs`, `src/polys_modp/` — runtime-modulus field for the Fiat–Shamir-sampled prime $p$, and the sumcheck/polynomial code running over it.
 - `src/imod_spartan_modp.rs` — the SNARK driver tying the Spartan-style mod-PIOP to the mod-PCS; trait surface in `src/traits/mod_engine.rs`.
 
@@ -169,7 +169,7 @@ RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 ```
 
 This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`.
-We get 5.9–8.1× prover overhead over plain Spartan at $2^{10}$–$2^{14}$ constraints, verify is under 30 ms vs 15–17 ms, proof is 135–149 KB vs ~68 KB.
+We get 5.9–8.1× prover overhead over plain Spartan at $2^{10}\text{–}2^{14}$ constraints, verify is under 30 ms vs 15–17 ms, proof is 135–149 KB vs ~68 KB.
 
 ## References
 [Limber: Low Overhead SNARKs for Integers from Any PCS](https://eprint.iacr.org/2026/1635) — the protocol this repository implements.
