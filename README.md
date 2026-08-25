@@ -38,16 +38,18 @@ It has two algorithms:
 
 ### Parameters
 
-All benchmarks below use the following parameters (Table 4 of the paper):
+The benchmarks below use the following parameters (Table 4 of the paper):
 
-| Parameter | Value | Meaning |
-| --- | ---: | --- |
-| $q$ | $\approx 2^{256}$ | Field characteristic of the underlying PCS (Tom-256 scalar field) |
-| $T$ | $2^{64}$ | Limb base bound; every limb of $f_{\mathsf{limb}}$ is range-checked to $[0, T)$ |
-| $k$ | $9$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{-k}$ |
-| $s$ | $15$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
+| Parameter | Hyrax | Brakedown | Meaning |
+| --- | ---: | ---: | --- |
+| $q$ | $\approx 2^{256}$ | $\approx 2^{256}$ | Field characteristic of the underlying PCS (Tom-256 scalar field) |
+| $T$ | $2^{64}$ | $2^{64}$ | Limb base bound; every limb of $f_{\mathsf{limb}}$ is range-checked to $[0, T)$ |
+| $k$ | $9$ | $11$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{-k}$ |
+| $s$ | $16$ | $30$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
+| Commitment overhead | $\approx 0.13\times$ | $\approx 0.07\times$ | Extra committed data relative to the witness |
 
-With these settings the commitment overhead is about $0.13\times$ the witness size (lower for larger $k$).
+$s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`); the values shown are for the MultiSwap benchmark.
+Larger $k$ lowers the commitment overhead at the cost of more CRT primes.
 
 ## Code layout
 
@@ -84,7 +86,7 @@ BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spar
 
 All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 Pro, 24 GB RAM, 14 cores); all baselines were re-run on the same machine.
 
-### MultiSwap statement
+### MultiSwap benchmark
 The MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) benchmark is two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation.
 
 Constraint counts for Zinc+ and Limber are integer gates; the others are ordinary R1CS constraints over a prime field.
@@ -94,11 +96,11 @@ Constraint counts for Zinc+ and Limber are integer gates; the others are ordinar
 | Arkworks (emulated field arithmetic + Garuda) | 25.2 M | 231 s | 25 ms | 7.2 KB |
 | MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) (xJsnark techniques + Groth16) | 6.2 M | 88.5 s | 2 ms | 0.2 KB |
 | Zinc+ (concurrent work based on Brakedown) | 6,209 | 2.06 s | 514 ms | 1.2 MB |
-| **Limber-Spartan (Hyrax)** | 6,209 | **1.32 s** | **39 ms** | **175 KB** |
+| **Limber-Spartan (Hyrax)** | 6,209 | **1.32 s** | **39 ms** | **170 KB** |
 | **Limber-Spartan (Brakedown)** | 6,209 | **1.18 s** | 45 ms | 5.3 MB |
 
 Limber demonstrates a 175×/196× (Hyrax/Brakedown) prover speedup over Arkworks and 67×/75× over the MultiSwap implementation.
-Against Zinc+, the Hyrax prover is 1.6× faster, the verifier 13× faster, and the proof 7× smaller (raw 175 KB vs. their compressed 1.2 MB).
+Against Zinc+, the Hyrax prover is 1.6× faster, the verifier 13× faster, and the proof 7× smaller (170 KB vs. 1.2 MB).
 The Brakedown prover is 1.7× faster and the verifier 11× faster than Zinc+, with a 4.4× larger proof (5.3 MB vs. 1.2 MB).
 
 ### Non-native overhead relative to native constraints
@@ -120,14 +122,24 @@ All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) 
 Multi-threaded runs are not comparable across configurations (thermal throttling and rayon spin-up confound the ratios), so always pin the thread count when reproducing.
 
 ### MultiSwap table (Table 1 of the paper)
-**Our Hyrax and Brakedown Rows**:
+
+Both rows prove the paper's MultiSwap computation — 4 Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, 2^13 rows; see the bench's module docs for what is wired faithfully vs modeled by operation count.
+
+**Hyrax row**:
 
 ```bash
 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
 ```
 
-Set `PSIZE=1` to print serialized proof sizes and `KSWEEP=1` to sweep the reduction parameter `k`.
-The bench's default config is the paper's statement — 4 Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, swept over the swap batch size `k`; see the bench's module docs for what is wired faithfully vs modeled by operation count.
+Set `PSIZE=1` to print the proof size instead, and `KSWEEP=1` to sweep the IntEval reduction parameter `k`.
+
+**Brakedown row**:
+
+```bash
+BDPCS=1 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
+```
+
+This instantiation defaults to `k = 11` (faster than `k = 9` for the hash backend); override with `BDK=<k>`.
 
 **Arkworks/Garuda baseline row**: measured with an external harness, [`bbuenz/rsa-exp-snark`](https://github.com/bbuenz/rsa-exp-snark) (GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic; Garuda/Pari from [`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari), BLS12-381), patched to print `proof.serialized_size()` after verify.
 The circuit contains ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7.2 B).
