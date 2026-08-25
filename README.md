@@ -7,10 +7,10 @@ This repo is forked from [Microsoft Spartan2](https://github.com/Microsoft/Spart
 
 ## Integer Mod-R1CS Arithmetization
 
-The Integer Mod-R1CS relation is different from the standard R1CS relation, adding a modulus `m_i` and a quotient `q_i` per constraint:
+The Integer Mod-R1CS relation is different from the standard R1CS relation, adding a modulus `m_i` and a quotient `u_i` per constraint:
 
 ```text
-A·z ∘ B·z = C·z + m ∘ q        (over the bounded integers)
+A·z ∘ B·z = C·z + m ∘ u        (over the bounded integers)
 ```
 
 so one row is one modular multiplication.
@@ -18,7 +18,7 @@ This naturally and efficiently supports large and varying modular arithmetic gat
 
 ## Fingerprinting
 
-Proving this Integer Mod-R1CS relation over the integers can be reduced to proving it over a randomly sampled prime modulus $p$.
+Following [Zaratan](https://eprint.iacr.org/2024/1548), proving this Integer Mod-R1CS relation over the integers can be reduced to proving it over a randomly sampled prime modulus $p$ (fingerprinting).
 However, we now need to be able to construct a PCS that is able to commit to **integers** in one field $`\mathbb{F}_q`$ and open in another $`\mathbb{F}_p`$.
 We call this an **integer mod-PCS**.
 
@@ -96,15 +96,15 @@ All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 P
 ### MultiSwap benchmark
 The MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) benchmark is two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation.
 
-Constraint counts for Zinc+ and Limber are integer gates; the others are ordinary R1CS constraints over a prime field.
+Constraint counts for [Zinc+](https://eprint.iacr.org/2026/855) and Limber are integer gates; the others are ordinary R1CS constraints over a prime field.
 
 | System | Constraints | Prove | Verify | Proof size |
 | --- | ---: | ---: | ---: | ---: |
 | Arkworks (emulated field arithmetic + Garuda) | 25.2 M | 231 s | 25 ms | 7.2 KB |
 | MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) (xJsnark techniques + Groth16) | 6.2 M | 88.5 s | 2 ms | 0.2 KB |
-| Zinc+ (concurrent work based on Brakedown) | 6,209 | 2.06 s | 514 ms | 1.2 MB |
+| [Zinc+](https://eprint.iacr.org/2026/855) (concurrent work based on Brakedown) | 6,209 | 2.06 s | 514 ms | 1.2 MB |
 | **Limber-Spartan (Hyrax)** | 6,209 | **1.32 s** | **39 ms** | **170 KB** |
-| **Limber-Spartan (Brakedown)** | 6,209 | **1.18 s** | 45 ms | 5.3 MB |
+| **Limber-Spartan (Brakedown)** | 6,209 | **1.18 s** | **45 ms** | 5.3 MB |
 
 Limber demonstrates a 175×/196× (Hyrax/Brakedown) prover speedup over Arkworks and 67×/75× over the MultiSwap implementation.
 Against Zinc+, the Hyrax prover is 1.6× faster, the verifier 13× faster, and the proof 7× smaller (170 KB vs. 1.2 MB).
@@ -159,7 +159,7 @@ RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
   cargo bench --bench e2e --features "parallel simd unchecked iprs-rate-1-8"
 ```
 
-Zinc+ does not benchmark big-integer arithmetic, so the 2048-bit workload is a small custom UAIR — one `a·b ≡ c (mod N)` per row via `assert_zero(a·b − c − k·N)` — written against their framework. We note that this circuit is not properly wired and it does not include the hash-to-prime or bit checking gates for the actual MultiSwap computation.
+Zinc+ does not benchmark big-integer arithmetic, so the 2048-bit workload is a small custom UAIR — one `a·b ≡ c (mod N)` per row via `assert_zero(a·b − c − k·N)` — written in their framework. We note that this circuit is not properly wired and it does not include the hash-to-prime or bit checking gates for the actual MultiSwap computation.
 
 ### Native-overhead figure (Figure 3 of the paper)
 We use Limber-Spartan with Hyrax in this comparison. To generate the data and plots, run:
@@ -181,6 +181,14 @@ CRYPTO 2020
 [Scaling Verifiable Computation Using Efficient Set Accumulators](https://eprint.iacr.org/2019/1494) \
 Alex Ozdemir, Riad S. Wahby, Barry Whitehat, Dan Boneh \
 USENIX Security 2020
+
+[Fully Succinct Arguments over the Integers from First Principles](https://eprint.iacr.org/2024/1548) (Zaratan) \
+Matteo Campanelli, Mathias Hall-Andersen \
+PKC 2026
+
+[Zinc+: SNARKs for Polynomial Rings](https://eprint.iacr.org/2026/855) \
+Alexander Abdugafarov, Albert Garreta, Amit Kumar, Michał Osadnik, Psi Vesely, Ilia Vlasov, Kai Zhe Zheng \
+Cryptology ePrint Archive 2026/855
 
 ## License
 
