@@ -1155,8 +1155,8 @@ mod tests {
   /// *panics* inside `crypto-bigint`'s `FixedMontyForm` op when the
   /// proof's `DynPrime` values carry params from the original `p` while
   /// the verifier reduces shape2 data with the freshly sampled `p`.
-  /// The panic IS a form of rejection, but it's ungraceful — a followup
-  /// should convert the param mismatch into a clean `SpartanError`.
+  /// The panic IS a form of rejection, but it's ungraceful — the param
+  /// mismatch should eventually surface as a clean `SpartanError`.
   /// For now this test asserts only the digest distinction.)
   #[test]
   fn imod_modp_digest_binds_matrices() {

@@ -9,7 +9,7 @@
 #
 # Knobs:
 #   IMOD_K=<k>   override IntEval's per-iteration variable count for the
-#                imod side (default DEFAULT_K = 7); recorded in the plot? No —
+#                imod side (default DEFAULT_K = 9); recorded in the plot? No —
 #                note the k you used alongside the figure.
 #
 # The bench configs live in benches/imod_spartan_modp.rs (MSSHAPE_GATES)

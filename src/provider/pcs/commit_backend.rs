@@ -95,10 +95,10 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
     .ok()
     .and_then(|v| v.parse::<usize>().ok())
     .map(|i| crate::provider::pcs::brakedown::SPECS[i])
-    // Default for the Mod-PCS backend: spec4 — after the 2026-08-24
-    // delayed-reduction encoder win the prover margin comfortably
-    // absorbs the denser code (~+35 ms for -0.7 MB proof vs spec3;
-    // spec5 buys only -0.15 MB more for another ~+80 ms).
+    // Default for the Mod-PCS backend: spec4 — with the delayed-
+    // reduction encoder the prover margin comfortably absorbs the
+    // denser code (~+35 ms for -0.7 MB proof vs spec3; spec5 buys only
+    // -0.15 MB more for another ~+80 ms).
     .unwrap_or(crate::provider::pcs::brakedown::SPECS[4]);
   // Uniform row length across all lengths (BDROWLEN override, benching
   // knob). Trees sharing (row_len, spec, seed) share the code, so the
@@ -106,8 +106,8 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
   // ONE global pair — the per-tree layout optimum is worse than a
   // shared-row global layout once rows are amortized across trees. The
   // default 2^15 sits at the global optimum L* ≈ √(t·Σn/2) for the
-  // MultiSwap-scale target set and won the 2026-08-21 sweep against
-  // 2^16 on proof size, prover, AND verify.
+  // MultiSwap-scale target set and beat 2^16 in a measured sweep on
+  // proof size, prover, AND verify.
   let row_len = std::env::var("BDROWLEN")
     .ok()
     .and_then(|v| v.parse::<usize>().ok())

@@ -106,7 +106,7 @@ pub const LAMBDA: usize = 128;
 /// would over-secure one term while another sits lower. Set to 117 so
 /// a ~2^127 field (e.g. M127) passes with challenges drawn from the
 /// base field; may be lowered further if a future instantiation calls
-/// for it (decision 2026-08-19).
+/// for it.
 pub const LAMBDA_BOUND2: usize = 117;
 
 /// Bit-width of the underlying F's characteristic `q`. Fixed at 256 for
@@ -1519,7 +1519,7 @@ pub const DEFAULT_LOG_T_F: usize = 32;
 /// recommends `k = ⌈log λ⌉ = 7`, but a measured (size × k × log_t) sweep on
 /// the msshape family (vars 2^11–2^14, 256-bit) and MultiSwap (2^13,
 /// 2048-bit) found `k = 9` (with `log_t = 64`) fastest at every size, with a
-/// flat basin k=8–10 (measured 2026-07).
+/// flat basin k=8–10.
 pub const DEFAULT_K: usize = 9;
 
 impl IntegerModPCS {
@@ -1761,7 +1761,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // product opening are then run ONCE over every polynomial's batches.
     // Two-phase schedule: every polynomial's reduction + chain COMMITS
     // land on the transcript before ANY checking challenge (gammas) is
-    // squeezed — the batching-friendly ordering (see followups doc).
+    // squeezed — the batching-friendly ordering.
     let mut ph1s: Vec<ChainPhase1<HyBackend>> = Vec::with_capacity(n);
     for i in 0..n {
       ph1s.push(prove_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
@@ -2061,8 +2061,8 @@ where
         reason: "IntegerModPCSBd::prove_batch: empty or mismatched inputs".to_string(),
       });
     }
-    // Two-phase schedule (see the Hyrax impl / followups doc): all
-    // commits before all checking challenges.
+    // Two-phase schedule (as in the Hyrax impl): all commits before
+    // all checking challenges.
     let mut ph1s: Vec<ChainPhase1<BdBackend<SE>>> = Vec::with_capacity(n);
     for i in 0..n {
       ph1s.push(prove_one_poly_phase1::<BdBackend<SE>, ME>(

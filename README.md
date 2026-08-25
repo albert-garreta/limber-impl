@@ -168,7 +168,7 @@ pip install matplotlib
 RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 ```
 
-This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`; see the script header for knobs.
+This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`.
 We get 5.9–8.1× prover overhead over plain Spartan at $2^{10}$–$2^{14}$ constraints, verify is under 30 ms vs 15–17 ms, proof is 135–149 KB vs ~68 KB.
 
 ## References

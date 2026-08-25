@@ -118,7 +118,7 @@ pub trait SumcheckField:
   /// forwards to `PrimeFieldExt::from_uniform`; for dynamic-modulus fields
   /// it builds an integer from the bytes and reduces mod the modulus.
   ///
-  /// NOTE (followup): the dynamic-field implementation currently consumes
+  /// NOTE: the dynamic-field implementation currently consumes
   /// at most `LIMBS * 8` bytes, so for a modulus near that width the
   /// challenge is slightly biased. Fine for the prototype; a
   /// soundness-grade version needs wide reduction (≥ modulus_bits + 128
