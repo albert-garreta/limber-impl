@@ -1,6 +1,6 @@
 # Limber: Low Overhead SNARKs for Integers
 
-In this repo, we build prototypes of SNARKs for Integers over Mod R1CS, where constraints support arbitrary modular arithmetic.
+In this repo, we build SNARKs for Integers over Mod R1CS, where constraints support arbitrary modular arithmetic.
 It implements the protocol from the accompanying paper [*Limber: Low Overhead SNARKs for Integers from Any PCS*](https://eprint.iacr.org/2026/1635).
 
 This repo is forked from [Microsoft Spartan2](https://github.com/Microsoft/Spartan2), and we accordingly build Limber-Spartan with various choices of underlying PCS, including Hyrax and Brakedown.
@@ -19,22 +19,22 @@ This naturally and efficiently supports large and varying modular arithmetic gat
 ## Fingerprinting
 
 Proving this Integer Mod-R1CS relation over the integers can be reduced to proving it over a randomly sampled prime modulus $p$.
-However, we now need to be able to construct a PCS that is able to commit to **integers** in one field $\mathbb{F}_q$ and open in another $\mathbb{F}_p$.
+However, we now need to be able to construct a PCS that is able to commit to **integers** in one field $`\mathbb{F}_q`$ and open in another $`\mathbb{F}_p`$.
 We call this an **integer mod-PCS**.
 
 ## Limber: An Integer Mod-PCS Compiler
 
 Limber is a compiler from **almost any** field PCS to an integer mod-PCS with $o(1)$ multiplicative commitment overhead.
-The only requirement on the underlying field is $q = \Omega(\lambda^2 \mu^2)$ for a $\mu$-variable polynomial, so it works over small fields, and the compiled scheme inherits the assumptions and performance of whatever PCS it wraps.
+The only requirement on the underlying field is $q = \Omega(\lambda^2 \mu^2)$ for a $\mu$-variable polynomial and $\lambda$-bit security, so it works over small fields (64-bit). The compiled scheme inherits the assumptions and performance of whatever PCS it wraps.
 It has two algorithms:
 
-- **Commit.** An integer polynomial $f$ with hypercube evaluations bounded by $T_f$ is limb-split into a polynomial $f_{\mathsf{limb}}$ whose entries are bounded by a base bound $T$ (we use $T = 2^{64}$), cast into $\mathbb{F}_q$, and committed with the underlying PCS.
+- **Commit.** An integer polynomial $f$ with hypercube evaluations bounded by $`T_f`$ is limb-split into a polynomial $`f_{\mathsf{limb}}`$ whose entries are bounded by a base bound $T$ (we use $T = 2^{64}$), cast into $`\mathbb{F}_q`$, and committed with the underlying PCS.
 A batched range check (LogUp-GKR) proves every limb is below $T$.
 
-- **Evaluate mod $p$.** To open $f$ at a point $\vec r \in \mathbb{Z}_p^{\mu}$, a sumcheck reduces the claim to one about $f_{\mathsf{limb}}$, the prover sends the *integer* evaluation $y \in \mathbb{Z}$, and the verifier checks $y \equiv y' \pmod p$.
-What remains is proving $y = f_{\mathsf{limb}}(\vec{r'})$ over the integers, which is handled by our IntEval protocol.
-  - **IntEval.** The verifier samples $s$ small primes $p_i$ and the prover opens $f_{\mathsf{limb}}$ at $\vec r \bmod p_i$ for each.
-  IntEval partially evaluates $k$ variables at a time to avoid overflow: the partially evaluated polynomial is decomposed as $a + p_i \cdot b$, the prover commits $a$ and $b$ (each $2^{-k}$ the size of the previous layer), and the protocol recurses on $a$.
+- **Evaluate mod $p$.** To open $f$ at a point $`\vec r \in \mathbb{Z}_p^{\mu}`$, a sumcheck reduces the claim to one about $`f_{\mathsf{limb}}`$, the prover sends the *integer* evaluation $y \in \mathbb{Z}$, and the verifier checks $y \equiv y' \pmod p$.
+What remains is proving $`y = f_{\mathsf{limb}}(\vec{r'})`$ over the integers, which is handled by our IntEval protocol.
+  - **IntEval.** The verifier samples $s$ small primes $`p_i`$ and the prover opens $`f_{\mathsf{limb}}`$ at $`\vec r \bmod p_i`$ for each.
+  IntEval partially evaluates $k$ variables at a time to avoid overflow: the partially evaluated polynomial is decomposed as $`a + p_i \cdot b`$, the prover commits $a$ and $b$ (each $2^{-k}$ the size of the previous layer), and the protocol recurses on $a$.
 
 ### Parameters
 
@@ -43,12 +43,12 @@ The benchmarks below use the following parameters (Table 4 of the paper):
 | Parameter | Hyrax | Brakedown | Meaning |
 | --- | ---: | ---: | --- |
 | $q$ | $\approx 2^{256}$ | $\approx 2^{256}$ | Field characteristic of the underlying PCS (Tom-256 scalar field) |
-| $T$ | $2^{64}$ | $2^{64}$ | Limb base bound; every limb of $f_{\mathsf{limb}}$ is range-checked to $[0, T)$ |
-| $k$ | $9$ | $11$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{-k}$ |
-| $s$ | $16$ | $30$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
+| $T$ | $2^{64}$ | $2^{64}$ | Limb base bound; every limb of $`f_{\mathsf{limb}}`$ is range-checked to $[0, T)$ |
+| $k$ | $9$ | $11$ | Variables partially evaluated per IntEval layer; each layer shrinks by $2^{k}$ |
+| $s$ | $16$ | $30$ | Number of small CRT primes $`p_i`$ sampled by the IntEval verifier |
 | Commitment overhead | $\approx 0.13\times$ | $\approx 0.07\times$ | Extra committed data relative to the witness |
 
-The values shown are for the MultiSwap benchmark ($T_f = 2^{2048}$, $N = 2^{13}$ rows). The above parameters for the plain Spartan comparison ($T_f = 2^{256}$, $N = 2^{10} - 2^{14}$) are similar.
+The values shown are for the MultiSwap benchmark ($`T_f = 2^{2048}`$, $N = 2^{13}$ rows). The above parameters for the plain Spartan comparison ($`T_f = 2^{256}`$, $N = 2^{10} - 2^{14}$) are similar.
 
 $s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`).
 Larger $k$ lowers the commitment overhead at the cost of more CRT primes.
