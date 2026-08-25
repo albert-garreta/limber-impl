@@ -1,7 +1,7 @@
 # Limber: Low Overhead SNARKs for Integers
 
 In this repo, we build prototypes of SNARKs for Integers over Mod R1CS, where constraints support arbitrary modular arithmetic.
-It implements the protocol from the accompanying paper [*Limber: Low Overhead SNARKs for Integers from Any PCS*](https://eprint.iacr.org/2026/1635)
+It implements the protocol from the accompanying paper [*Limber: Low Overhead SNARKs for Integers from Any PCS*](https://eprint.iacr.org/2026/1635).
 
 This repo is forked from [Microsoft Spartan2](https://github.com/Microsoft/Spartan2), and we accordingly build Limber-Spartan with various choices of underlying PCS, including Hyrax and Brakedown.
 
@@ -20,7 +20,7 @@ This naturally and efficiently supports large and varying modular arithmetic gat
 
 Proving this Integer Mod-R1CS relation over the integers can be reduced to proving it over a randomly sampled prime modulus $p$.
 However, we now need to be able to construct a PCS that is able to commit to **integers** in one field $\mathbb{F}_q$ and open in another $\mathbb{F}_p$.
-We call this a **integer mod-PCS**.
+We call this an **integer mod-PCS**.
 
 ## Limber: An Integer Mod-PCS Compiler
 
@@ -29,10 +29,10 @@ The only requirement on the underlying field is $q = \Omega(\lambda^2 \mu^2)$ fo
 It has two algorithms:
 
 - **Commit.** An integer polynomial $f$ with hypercube evaluations bounded by $T_f$ is limb-split into a polynomial $f_{\mathsf{limb}}$ whose entries are bounded by a base bound $T$ (we use $T = 2^{64}$), cast into $\mathbb{F}_q$, and committed with the underlying PCS.
-  A batched range check (LogUp-GKR) proves every limb is below $T$.
+A batched range check (LogUp-GKR) proves every limb is below $T$.
 
 - **Evaluate mod $p$.** To open $f$ at a point $\vec r \in \mathbb{Z}_p^{\mu}$, a sumcheck reduces the claim to one about $f_{\mathsf{limb}}$, the prover sends the *integer* evaluation $y \in \mathbb{Z}$, and the verifier checks $y \equiv y' \pmod p$.
-  What remains is proving $y = f_{\mathsf{limb}}(\vec{r'})$ over the integers, which is handled by our IntEval protocol.
+What remains is proving $y = f_{\mathsf{limb}}(\vec{r'})$ over the integers, which is handled by our IntEval protocol.
   - **IntEval.** The verifier samples $s$ small primes $p_i$ and the prover opens $f_{\mathsf{limb}}$ at $\vec r \bmod p_i$ for each.
   IntEval partially evaluates $k$ variables at a time to avoid overflow: the partially evaluated polynomial is decomposed as $a + p_i \cdot b$, the prover commits $a$ and $b$ (each $2^{-k}$ the size of the previous layer), and the protocol recurses on $a$.
 
@@ -48,7 +48,9 @@ The benchmarks below use the following parameters (Table 4 of the paper):
 | $s$ | $16$ | $30$ | Number of small CRT primes $p_i$ sampled by the IntEval verifier |
 | Commitment overhead | $\approx 0.13\times$ | $\approx 0.07\times$ | Extra committed data relative to the witness |
 
-$s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`); the values shown are for the MultiSwap benchmark.
+The values shown are for the MultiSwap benchmark ($T_f = 2^{2048}$, $N = 2^{13}$ rows). The above parameters for the plain Spartan comparison ($T_f = 2^{256}$, $N = 2^{10} - 2^{14}$) are similar.
+
+$s$ and the commitment overhead are derived from the other three parameters and the polynomial size (`IntEvalParams::derive`).
 Larger $k$ lowers the commitment overhead at the cost of more CRT primes.
 
 ## Code layout
@@ -60,9 +62,20 @@ Larger $k$ lowers the commitment overhead at the cost of more CRT primes.
 - `src/dyn_prime.rs`, `src/sumcheck_modp.rs`, `src/polys_modp/` — runtime-modulus field for the Fiat–Shamir-sampled prime $p$, and the sumcheck/polynomial code running over it.
 - `src/imod_spartan_modp.rs` — the SNARK driver tying the Spartan-style mod-PIOP to the mod-PCS; trait surface in `src/traits/mod_engine.rs`.
 
+## Building and testing
+
+Requires a stable Rust toolchain (edition 2024, so Rust 1.85 or newer).
+
+```bash
+cargo build --release
+cargo test --release
+```
+
+CI additionally runs `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
+
 ## Benchmarks
 
-All benchmarks use [Criterion](https://github.com/bheisler/criterion.rs) and report setup / (prep_)prove / verify times plus proof sizes.
+All benchmarks use [Criterion](https://github.com/bheisler/criterion.rs) and report setup / prove / verify times plus proof sizes.
 Run with native CPU codegen:
 
 ```bash
@@ -75,12 +88,6 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 | `spartan_synthetic` | Plain-Spartan baseline to compare to Limber |
 | `multiswap_modp` | MultiSwap (RSA-accumulator verification circuit, [OWWB20](https://eprint.iacr.org/2019/1494)). `BDPCS=1` runs the Brakedown instantiation instead of Hyrax |
 | `logup_gkr` | LogUp-GKR range proof in isolation |
-
-Override thread counts with `BENCH_THREADS` (comma-separated):
-
-```bash
-BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spartan
-```
 
 ## Results
 
@@ -122,7 +129,7 @@ All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) 
 
 ### MultiSwap table (Table 1 of the paper)
 
-Both of the Limber rows prove the MultiSwap computation: 4 Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus and the hash-to-prime which we model with the right number of gates (~2000).
+Both of the Limber rows prove the MultiSwap computation: 4 fully wired Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus and the hash-to-prime which we model with the right number of gates (~2000).
 
 **Hyrax row**:
 
@@ -130,6 +137,7 @@ Both of the Limber rows prove the MultiSwap computation: 4 Wesolowski exponentia
 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
 ```
 
+This instantiation defaults to `k = 9`; override with `IMOD_K=<k>`.
 Set `PSIZE=1` to print the proof size instead, and `KSWEEP=1` to sweep the IntEval reduction parameter `k`.
 
 **Brakedown row**:
@@ -141,7 +149,7 @@ BDPCS=1 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench
 This instantiation defaults to `k = 11` (faster than `k = 9` for the hash backend); override with `BDK=<k>`.
 
 **Arkworks/Garuda baseline row**: measured with an external harness, [`bbuenz/rsa-exp-snark`](https://github.com/bbuenz/rsa-exp-snark) (GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic; Garuda/Pari from [`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari), BLS12-381).
-The circuit contains ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7.2 B).
+The circuit contains ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7.2 KB).
 
 **Zinc+ row**:
 We compare to Zinc+'s implementation [`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus) at commit `7eadc16` and with `crypto-primitives` git dependency pinned to rev `2cf39db8` to fix the build. Under this setup, run:
@@ -153,18 +161,17 @@ RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
 
 Zinc+ does not benchmark big-integer arithmetic, so the 2048-bit workload is a small custom UAIR — one `a·b ≡ c (mod N)` per row via `assert_zero(a·b − c − k·N)` — written against their framework. We note that this circuit is not properly wired and it does not include the hash-to-prime or bit checking gates for the actual MultiSwap computation.
 
-### Native-overhead figure (Figure 3 of the paper):
+### Native-overhead figure (Figure 3 of the paper)
 We use Limber-Spartan with Hyrax in this comparison. To generate the data and plots, run:
 ```bash
+pip install matplotlib
 RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
 ```
 
 This runs the pair of benchmarks (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`; see the script header for knobs.
 We get 5.9–8.1× prover overhead over plain Spartan at $2^{10}$–$2^{14}$ constraints, verify is under 30 ms vs 15–17 ms, proof is 135–149 KB vs ~68 KB.
 
-
 ## References
-
 [Limber: Low Overhead SNARKs for Integers from Any PCS](https://eprint.iacr.org/2026/1635) — the protocol this repository implements.
 
 [Spartan: Efficient and general-purpose zkSNARKs without trusted setup](https://eprint.iacr.org/2019/550) \

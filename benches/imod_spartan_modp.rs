@@ -51,7 +51,7 @@ fn t256_base_modulus() -> BigUint {
 }
 
 /// Setup honoring an optional `IMOD_K` env override for IntEval's
-/// per-iteration variable count `k` (default `DEFAULT_K = 7`), so a
+/// per-iteration variable count `k` (default `DEFAULT_K = 9`), so a
 /// sweep can compare derived `(log_p, s, t)` trade-offs without code
 /// edits.
 fn setup_for(
@@ -79,7 +79,7 @@ fn setup_for(
 /// `a, b` are uniform 256-bit values below `p`. Pads to the same
 /// `(2^12 cons, 2^13 vars)` shape as MultiSwap k=0 (real RSA-2048 rows
 /// pad identically), and exercises the same machinery —
-/// `log_t_f = 256` → `numlimb = 8`, `t = 2` IntEval iterations — at
+/// `log_t_f = 256`, `log_t = 64` → `numlimb = 4` — at
 /// 256-bit instead of 2048-bit width. `spartan_synthetic`'s `msshape`
 /// config provides the shape-matched *native baseline* (same R1CS
 /// dimensions, full-width values, native gates): it does NOT express
@@ -156,7 +156,7 @@ fn make_msshape_shape_and_witness(
 const MSSHAPE_GATES: &[usize] = &[682, 2730, 10922, 43690, 174762];
 
 /// Setup for the MultiSwap-shaped config: `log_t_f = 256` (limb-split
-/// into 8 limbs of 32 bits), honoring the `IMOD_K` override.
+/// into 4 limbs of 64 bits), honoring the `IMOD_K` override.
 fn setup_msshape(
   shape: IntModR1CSShapeModp<M>,
 ) -> (

@@ -679,6 +679,15 @@ fn params_for(shape: &IntModR1CSShapeModp<M>, int_k: usize) -> IntEvalParams {
   IntEvalParams::derive(2048, LOG_T, int_k, log_n).expect("IntEval params satisfy bounds")
 }
 
+/// IntEval `k` for the Hyrax instantiation: `IMOD_K=<k>` overrides the
+/// tuned `DEFAULT_K` (mirrors `BDK` for the Brakedown path).
+fn hyrax_k() -> usize {
+  std::env::var("IMOD_K")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(DEFAULT_K)
+}
+
 fn paper_fp_constraints(k: usize) -> u64 {
   let f = 255u64;
   let b_h_delta = 2048u64;
@@ -829,7 +838,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let (shape, w, q) = multiswap_shape_and_witness(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
     let params =
-      IntEvalParams::derive(2048, LOG_T, DEFAULT_K, log_n).expect("IntEval params satisfy bounds");
+      IntEvalParams::derive(2048, LOG_T, hyrax_k(), log_n).expect("IntEval params satisfy bounds");
     let (pk, vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
     let t0 = Instant::now();
     let (witness, instance) =
@@ -943,7 +952,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, _, _) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape, DEFAULT_K);
+          let params = params_for(&shape, hyrax_k());
           (shape, params)
         },
         |(shape, params)| {
@@ -975,7 +984,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, w, q) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape, DEFAULT_K);
+          let params = params_for(&shape, hyrax_k());
           let (pk, _vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
           (pk, shape, w, q)
@@ -998,7 +1007,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, _, _) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape, DEFAULT_K);
+          let params = params_for(&shape, hyrax_k());
           let (pk, _vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape, params).unwrap();
           pk
         },
@@ -1016,7 +1025,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       b.iter_batched(
         || {
           let (shape, w, q) = multiswap_shape_and_witness(dims);
-          let params = params_for(&shape, DEFAULT_K);
+          let params = params_for(&shape, hyrax_k());
           let (pk, vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
           let (witness, instance) =

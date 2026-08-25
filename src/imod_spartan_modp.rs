@@ -1078,7 +1078,7 @@ mod tests {
     let one = BigUint::from(1u32);
     let zero = BigUint::from(0u32);
     let num_cons = 2usize;
-    let num_vars = 256usize; // log_2(256) = 8 > default k = 7
+    let num_vars = 256usize; // log_2(256) = 8 > pinned k = 7
     let num_io = 0usize;
 
     // One real row: 3·5 ≡ 1 (mod 14), q₀ = 1. Layout: w[0..3] = [3, 5, 1],
