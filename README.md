@@ -49,10 +49,14 @@ All benchmarks below use the following parameters (Table 4 of the paper):
 
 With these settings the commitment overhead is about $0.13\times$ the witness size (lower for larger $k$).
 
-**In this repo.** The compiler is `src/provider/pcs/integer_modpcs.rs` (IntEval and the mod-PCS commit/eval protocol) behind a PCS-agnostic backend seam, `src/provider/pcs/commit_backend.rs`.
-We currently provide two PCS instantiations: Hyrax (`src/provider/pcs/hyrax_pc.rs`) over the Tom-256 curve and Brakedown (`src/provider/pcs/brakedown/`) over the Tom-256 scalar field.
+## Code layout
 
-The batch range check is `src/logup_gkr.rs`; the fingerprinting prime $p$ is sampled by Fiat–Shamir and the SNARK's sumchecks run over it via the runtime-modulus field `src/dyn_prime.rs` (`sumcheck_modp` / `polys_modp`); the SNARK driver that ties the Spartan-style mod-PIOP to the mod-PCS is `src/imod_spartan_modp.rs`, with the trait surface in `src/traits/mod_engine.rs`.
+- `src/provider/pcs/integer_modpcs.rs` — the mod-PCS compiler: commit, evaluate mod $p$, and IntEval.
+- `src/provider/pcs/commit_backend.rs` — PCS-agnostic backend seam the compiler is written against.
+- `src/provider/pcs/hyrax_pc.rs`, `src/provider/pcs/brakedown/` — the two PCS instantiations: Hyrax over the Tom-256 curve and Brakedown over the Tom-256 scalar field.
+- `src/logup_gkr.rs` — batched LogUp-GKR range check for the limbs.
+- `src/dyn_prime.rs`, `src/sumcheck_modp.rs`, `src/polys_modp/` — runtime-modulus field for the Fiat–Shamir-sampled prime $p$, and the sumcheck/polynomial code running over it.
+- `src/imod_spartan_modp.rs` — the SNARK driver tying the Spartan-style mod-PIOP to the mod-PCS; trait surface in `src/traits/mod_engine.rs`.
 
 ## Benchmarks
 
@@ -65,9 +69,9 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench <name>
 
 | Bench | What it measures |
 | --- | --- |
-| `imod_spartan_modp` | The dual-field driver (`T256DynPrimeEngine` + integer Mod-PCS) on the same shapes |
+| `imod_spartan_modp` | Limber-Spartan on various shapes |
 | `spartan_synthetic` | Plain-Spartan baseline, shape-matched to the imod benches |
-| `multiswap_modp` | MultiSwap (RSA-accumulator swap batches, [OWWB20](https://eprint.iacr.org/2019/1494)) with wired 2048-bit square-and-multiply chains — one imod row per `mod N` multiply. `BDPCS=1` runs the Brakedown (hash-commitment) instantiation instead of Hyrax |
+| `multiswap_modp` | MultiSwap (RSA-accumulator swap batches, [OWWB20](https://eprint.iacr.org/2019/1494)). `BDPCS=1` runs the Brakedown (hash-commitment) instantiation instead of Hyrax |
 | `logup_gkr` | LogUp-GKR range proof in isolation |
 
 Override thread counts with `BENCH_THREADS` (comma-separated):
@@ -80,24 +84,27 @@ BENCH_THREADS=1,8 RUSTFLAGS="-C target-cpu=native" cargo bench --bench imod_spar
 
 All numbers are single-threaded (`RAYON_NUM_THREADS=1`) on a MacBook (Apple M4 Pro, 24 GB RAM, 14 cores); all baselines were re-run on the same machine.
 
-**MultiSwap statement** (Table 1 of the paper): two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation, the benchmark of [OWWB20](https://eprint.iacr.org/2019/1494).
-Constraint counts for Zinc+ and Limber are integer Mod-R1CS rows; the others are ordinary R1CS constraints over a prime field.
+### MultiSwap statement
+The MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) benchmark is two RSA accumulator updates (4 Wesolowski exponentiations with 352-bit exponents modulo an RSA-2048 modulus) plus a Poseidon-based hash-to-prime evaluation.
+
+Constraint counts for Zinc+ and Limber are integer gates; the others are ordinary R1CS constraints over a prime field.
 
 | System | Constraints | Prove | Verify | Proof size |
 | --- | ---: | ---: | ---: | ---: |
-| Arkworks (emulated field arithmetic) + Garuda | 25.2 M | 231 s | 25 ms | 7.2 KB |
-| MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) (using xJsnark techniques) | 6.2 M | 88.5 s | 2 ms | 0.2 KB |
-| Zinc+ (concurrent work; unwired mock constraints in their framework) | 6,209 | 2.06 s | 514 ms | 1.2 MB |
+| Arkworks (emulated field arithmetic + Garuda) | 25.2 M | 231 s | 25 ms | 7.2 KB |
+| MultiSwap [OWWB20](https://eprint.iacr.org/2019/1494) (xJsnark techniques + Groth16) | 6.2 M | 88.5 s | 2 ms | 0.2 KB |
+| Zinc+ (concurrent work based on Brakedown) | 6,209 | 2.06 s | 514 ms | 1.2 MB |
 | **Limber-Spartan (Hyrax)** | 6,209 | **1.32 s** | **39 ms** | **175 KB** |
 | **Limber-Spartan (Brakedown)** | 6,209 | **1.18 s** | 45 ms | 5.3 MB |
 
-The Hyrax row demonstrates a 175× prover speedup over Arkworks and 67× over MultiSwap; against Zinc+ the prover is 1.6× faster, the verifier 13× faster, and the proof 7× smaller (raw 175 KB vs. their compressed 1.2 MB).
-The Brakedown row is not in the paper: it is the same statement on current `main` (`BDPCS=1 cargo bench --bench multiswap_modp`, 2^13 rows), where the Hyrax instantiation now measures 1.35 s / 21 ms / 175 KB.
-Hash mode trades proof size for a prover with no elliptic-curve operations and plausibly post-quantum assumptions; it is non-hiding.
+Limber demonstrates a 175×/196× (Hyrax/Brakedown) prover speedup over Arkworks and 67×/75× over the MultiSwap implementation.
+Against Zinc+, the Hyrax prover is 1.6× faster, the verifier 13× faster, and the proof 7× smaller (raw 175 KB vs. their compressed 1.2 MB).
+The Brakedown prover is 1.7× faster and the verifier 11× faster than Zinc+, with a 4.4× larger proof (5.3 MB vs. 1.2 MB).
 
-**Native overhead** (regenerated by `scripts/regen_msshape_plots.sh` into `docs/plots/msshape_table.tex`): Limber vs. a shape-matched plain-Spartan baseline with the same constraint and variable counts.
-Each Limber gate is a random multiplication modulo the Tom-256 base-field prime — one row here, but not expressible in one native constraint; the baseline proves native gates of the same shape.
-Prover time includes witness generation and commitment on both sides.
+### Non-native overhead relative to native constraints
+This experiment compares Limber against a plain-Spartan baseline with the same constraint and variable counts.
+Each Limber gate is a random multiplication modulo the Tom-256 **base-field** modulus; the baseline proves native **scalar-field** gates.
+Prover time includes witness generation and commitment.
 
 | Constraints | Prove (Limber) | Prove (Spartan) | Ratio | Verify (Limber) | Verify (Spartan) | Ratio |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -105,21 +112,15 @@ Prover time includes witness generation and commitment on both sides.
 | 2^12 | 270 ms | 46.0 ms | 6× | 28.7 ms | 15.4 ms | 1.9× |
 | 2^14 | 790 ms | 97.7 ms | 8× | 27.5 ms | 17.2 ms | 1.6× |
 
+We demonstrate a low (6-8×) prover overhead for large 256-bit non-native gates compared to proving completely native constraints.
+
 ## Reproducing the paper's numbers
 
 All numbers quoted in the paper are **single-threaded** (`RAYON_NUM_THREADS=1`) with native codegen (`RUSTFLAGS="-C target-cpu=native"`).
 Multi-threaded runs are not comparable across configurations (thermal throttling and rayon spin-up confound the ratios), so always pin the thread count when reproducing.
 
-**Native-overhead figure (Figure 3 of the paper) and the msshape plots/table** (`docs/plots/msshape_*`):
-
-```bash
-RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
-```
-
-This runs the shape-matched pair of sweeps (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`; see the script header for knobs.
-Expected ballpark (Apple Silicon, 2026-08): 5.9–8.1× prover overhead over plain Spartan at 2^10–2^14 constraints, verify under 30 ms vs 15–17 ms, proof 135–149 KB vs ~68 KB.
-
-**MultiSwap table (Table 1 of the paper), our rows**:
+### MultiSwap table (Table 1 of the paper)
+**Our Hyrax and Brakedown Rows**:
 
 ```bash
 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
@@ -129,17 +130,27 @@ Set `PSIZE=1` to print serialized proof sizes and `KSWEEP=1` to sweep the reduct
 The bench's default config is the paper's statement — 4 Wesolowski exponentiations with 352-bit exponents mod an RSA-2048 modulus, swept over the swap batch size `k`; see the bench's module docs for what is wired faithfully vs modeled by operation count.
 
 **Arkworks/Garuda baseline row**: measured with an external harness, [`bbuenz/rsa-exp-snark`](https://github.com/bbuenz/rsa-exp-snark) (GR1CS `RsaExpCircuit` via r1cs-std emulated field arithmetic; Garuda/Pari from [`alireza-shirzad/garuda-pari`](https://github.com/alireza-shirzad/garuda-pari), BLS12-381), patched to print `proof.serialized_size()` after verify.
-The paper's `(352, 4)` schoolbook statement synthesizes to ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7,168 B compressed).
+The circuit contains ~25.2M constraints; reproducing the full-size row needs ~14 GB of RAM (single-threaded: keygen ~904 s, prove ~231 s, verify ~25 ms, proof 7.2 B).
 
-**Zinc+ comparison**: our side is the `multiswap_modp` run above at 2^13 rows.
-Their side needs revision pinning to build: check out [`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus) at `7eadc16` (the release the paper figures came from) and pin its `crypto-primitives` git dependency to rev `2cf39db8` (the revision that May code was written against — later revs change the `PrimeField` API and nothing compiles); then
+**Zinc+ row**:
+We compare to Zinc+'s implementation [`NethermindEth/zinc-plus`](https://github.com/NethermindEth/zinc-plus) at commit `7eadc16` and pin its `crypto-primitives` git dependency to rev `2cf39db8` to fix the build; then
 
 ```bash
 RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" \
   cargo bench --bench e2e --features "parallel simd unchecked iprs-rate-1-8"
 ```
 
-Zinc+ ships no big-integer benchmark, so the 2048-bit workload is a small custom UAIR — one `a·b ≡ c (mod N)` per row via `assert_zero(a·b − c − k·N)` — written against their framework.
+Zinc+ ships no big-integer benchmark, so the 2048-bit workload is a small custom UAIR — one `a·b ≡ c (mod N)` per row via `assert_zero(a·b − c − k·N)` — written against their framework. We note that this circuit is not properly wired and it does not include the hash-to-prime or bit checking gates.
+
+### Native-overhead figure (Figure 3 of the paper):
+We use Limber-Spartan with Hyrax in this comparison. To generate the data and plots, run:
+```bash
+RAYON_NUM_THREADS=1 ./scripts/regen_msshape_plots.sh
+```
+
+This runs the shape-matched pair of sweeps (`cargo bench --bench imod_spartan_modp -- msshape` vs `cargo bench --bench spartan_synthetic -- msshape`) and renders the figures via `scripts/plot_msshape.py`; see the script header for knobs.
+Expected ballpark (Apple Silicon, 2026-08): 5.9–8.1× prover overhead over plain Spartan at 2^10–2^14 constraints, verify under 30 ms vs 15–17 ms, proof 135–149 KB vs ~68 KB.
+
 
 ## References
 
