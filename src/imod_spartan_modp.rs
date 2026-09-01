@@ -429,7 +429,7 @@ where
     let (_open_span, open_t) = start_span!("imod_modp_wq_open");
     let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
     let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
-    let eval_arg = <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch(
+    let eval_arg = <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_blocks(
       &pk.ck,
       &mut transcript,
       &[&U.comm_w, &U.comm_q],
@@ -437,6 +437,7 @@ where
       &[&W.r_w, &W.r_q],
       &[&r_y[1..], &r_x[..]],
       &[&eval_w_bu, &v_q_bu],
+      &[pk.shape.small_blocks.as_slice(), &[]],
     )?;
     info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_modp_wq_open");
 
@@ -560,13 +561,14 @@ where
     let (_wqver_span, wqver_t) = start_span!("imod_modp_wq_verify");
     let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
-    <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch(
+    <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_blocks(
       &vk.vk_ee,
       &mut transcript,
       &[&U.comm_w, &U.comm_q],
       &[&r_y[1..], &r_x[..]],
       &[&eval_w_bu, &v_q_bu],
       &self.eval_arg,
+      &[vk.shape.small_blocks.as_slice(), &[]],
     )?;
     info!(elapsed_ms = %wqver_t.elapsed().as_millis(), "imod_modp_wq_verify");
 
@@ -951,6 +953,60 @@ mod tests {
     let (witness, instance) =
       IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
     assert!(shape.is_sat(&pk.ck, &instance, &witness).is_err());
+  }
+
+  /// Small-value blocks: an aligned witness block asserted `< 2^16` by
+  /// the Mod-PCS with no rows. In-range values round-trip; a value
+  /// `≥ 2^16` inside the block is rejected even though every row is
+  /// satisfied over ℤ (the block variables are row-unconstrained).
+  #[test]
+  fn imod_modp_small_value_block_roundtrip_and_rejects() {
+    use crate::traits::mod_engine::SmallValueBlock;
+    let one = BigUint::from(1u32);
+    let num_cons = 4usize;
+    let num_vars = 8usize;
+    // Row 0: w[0]·w[1] = w[2] exactly; block [4, 8) is row-free.
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one.clone())];
+    let mods = vec![
+      BigUint::from(0u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+    ];
+    let shape = IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods)
+      .unwrap()
+      .with_small_value_blocks(vec![SmallValueBlock {
+        start: 4,
+        log_len: 2,
+      }])
+      .unwrap();
+    let mk = |v4: u64| -> (Vec<BigUint>, Vec<BigUint>) {
+      let w = [3u64, 5, 15, 0, v4, 7, 65535, 0]
+        .iter()
+        .map(|x| BigUint::from(*x))
+        .collect();
+      let q = vec![BigUint::from(0u32); num_cons];
+      (w, q)
+    };
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+
+    let (w, q) = mk(65535);
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &instance, &witness).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+
+    // Out of range: rows still hold, `is_sat` and the verifier both reject.
+    let (w, q) = mk(65536);
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    assert!(shape.is_sat(&pk.ck, &instance, &witness).is_err());
+    // The prover does not self-check blocks; the verifier must reject.
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    assert!(proof.verify(&vk, &instance).is_err());
   }
 
   /// Wired circuit: the output of row 0 feeds into the input of row 1.

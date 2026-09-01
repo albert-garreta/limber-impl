@@ -28,7 +28,7 @@ use crate::{
   start_span,
   traits::{
     PrimeFieldExt,
-    mod_engine::{ModPCSEngineTrait, SumcheckEngine, SumcheckField},
+    mod_engine::{ModPCSEngineTrait, SmallValueBlock, SumcheckEngine, SumcheckField},
     pcs::PCSEngineTrait,
     transcript::{ByteTranscript, TranscriptEngineTrait, TranscriptReprTrait},
   },
@@ -676,6 +676,10 @@ pub struct IntEvalBatchArgument<B: CommitBackend> {
   pub(crate) range_check: SharedRangeCheck<B>,
   /// ONE combined opening discharging every evaluation claim of every poly.
   pub(crate) combined_open: CombinedBatchOpen<B>,
+  /// Per polynomial, per declared [`SmallValueBlock`]: the block's own
+  /// MLE evaluation `e2` at the transcript point (see
+  /// [`small_block_claims`]). Empty for polynomials without blocks.
+  pub(crate) small_block_evals: Vec<Vec<B::Scalar>>,
 }
 
 impl<B: CommitBackend> IntEvalBatchArgument<B>
@@ -1721,13 +1725,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     let mut st = prove_one_poly::<HyBackend, T256DynPrimeEngine>(
       &ck.params, ck, transcript, poly, point, eval,
     )?;
-    let (range_check, combined_open) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
+    let (range_check, combined_open, _) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
       &ck.params,
       ck,
       transcript,
       std::slice::from_mut(&mut st),
       &[&comm.inner],
       &[&blind.inner],
+      &[&[]],
     )?;
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_prove");
     Ok(IntEvalArgument {
@@ -1748,6 +1753,22 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     blinds: &[&Self::Blind],
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    let empty: Vec<&[SmallValueBlock]> = vec![&[]; polys.len()];
+    <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::prove_batch_with_blocks(
+      ck, transcript, comms, polys, blinds, points, evals, &empty,
+    )
+  }
+
+  fn prove_batch_with_blocks(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_prove_batch");
     let n = polys.len();
@@ -1776,14 +1797,16 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     }
     let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
     let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
-    let (range_check, combined_open) = finish_batch_open::<HyBackend, T256DynPrimeEngine>(
-      &ck.params,
-      ck,
-      transcript,
-      &mut states,
-      &comm_inners,
-      &blind_inners,
-    )?;
+    let (range_check, combined_open, small_block_evals) =
+      finish_batch_open::<HyBackend, T256DynPrimeEngine>(
+        &ck.params,
+        ck,
+        transcript,
+        &mut states,
+        &comm_inners,
+        &blind_inners,
+        blocks,
+      )?;
     let per_poly = states
       .into_iter()
       .map(|st| IntEvalPerPolyArgument {
@@ -1798,6 +1821,7 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       per_poly,
       range_check,
       combined_open,
+      small_block_evals,
     })
   }
 
@@ -1829,6 +1853,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &[arg.ab_comms.as_slice()],
       &arg.range_check,
       &arg.combined_open,
+      &[&[]],
+      &[],
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify");
     Ok(())
@@ -1841,6 +1867,21 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
     arg: &Self::BatchEvaluationArgument,
+  ) -> Result<(), SpartanError> {
+    let empty: Vec<&[SmallValueBlock]> = vec![&[]; comms.len()];
+    <Self as ModPCSEngineTrait<T256DynPrimeEngine>>::verify_batch_with_blocks(
+      vk, transcript, comms, points, evals, arg, &empty,
+    )
+  }
+
+  fn verify_batch_with_blocks(
+    vk: &Self::VerifierKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+    blocks: &[&[SmallValueBlock]],
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("integer_modpcs_verify_batch");
     let n = arg.per_poly.len();
@@ -1887,6 +1928,8 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       &ab_comms_per_poly,
       &arg.range_check,
       &arg.combined_open,
+      blocks,
+      &arg.small_block_evals,
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify_batch");
     Ok(())
@@ -2026,13 +2069,14 @@ where
     let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove");
     let mut st =
       prove_one_poly::<BdBackend<SE>, ME>(&ck.params, &(), transcript, poly, point, eval)?;
-    let (range_check, combined_open) = finish_batch_open::<BdBackend<SE>, ME>(
+    let (range_check, combined_open, _) = finish_batch_open::<BdBackend<SE>, ME>(
       &ck.params,
       &(),
       transcript,
       std::slice::from_mut(&mut st),
       &[&comm.root],
       &[blind],
+      &[&[]],
     )?;
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "integer_modpcs_bd_prove");
     Ok(IntEvalArgument {
@@ -2053,6 +2097,22 @@ where
     blinds: &[&Self::Blind],
     points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    let empty: Vec<&[SmallValueBlock]> = vec![&[]; polys.len()];
+    <Self as ModPCSEngineTrait<ME>>::prove_batch_with_blocks(
+      ck, transcript, comms, polys, blinds, points, evals, &empty,
+    )
+  }
+
+  fn prove_batch_with_blocks(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <ME as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[<ME as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
   ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
     let (_prove_span, prove_t) = start_span!("integer_modpcs_bd_prove_batch");
     let n = polys.len();
@@ -2081,13 +2141,14 @@ where
       )?);
     }
     let comm_roots: Vec<_> = comms.iter().map(|c| &c.root).collect();
-    let (range_check, combined_open) = finish_batch_open::<BdBackend<SE>, ME>(
+    let (range_check, combined_open, small_block_evals) = finish_batch_open::<BdBackend<SE>, ME>(
       &ck.params,
       &(),
       transcript,
       &mut states,
       &comm_roots,
       blinds,
+      blocks,
     )?;
     let per_poly = states
       .into_iter()
@@ -2103,6 +2164,7 @@ where
       per_poly,
       range_check,
       combined_open,
+      small_block_evals,
     })
   }
 
@@ -2134,6 +2196,8 @@ where
       &[arg.ab_comms.as_slice()],
       &arg.range_check,
       &arg.combined_open,
+      &[&[]],
+      &[],
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_bd_verify");
     Ok(())
@@ -2146,6 +2210,21 @@ where
     points: &[&[<ME as SumcheckEngine>::Scalar]],
     evals: &[&BigUint],
     arg: &Self::BatchEvaluationArgument,
+  ) -> Result<(), SpartanError> {
+    let empty: Vec<&[SmallValueBlock]> = vec![&[]; comms.len()];
+    <Self as ModPCSEngineTrait<ME>>::verify_batch_with_blocks(
+      vk, transcript, comms, points, evals, arg, &empty,
+    )
+  }
+
+  fn verify_batch_with_blocks(
+    vk: &Self::VerifierKey,
+    transcript: &mut <ME as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[<ME as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+    blocks: &[&[SmallValueBlock]],
   ) -> Result<(), SpartanError> {
     let (_verify_span, verify_t) = start_span!("integer_modpcs_bd_verify_batch");
     let n = arg.per_poly.len();
@@ -2192,6 +2271,8 @@ where
       &ab_comms_per_poly,
       &arg.range_check,
       &arg.combined_open,
+      blocks,
+      &arg.small_block_evals,
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_bd_verify_batch");
     Ok(())
@@ -2765,6 +2846,68 @@ fn prove_one_poly<
 /// polynomial in turn (its `f_limb` batch then its `a_j`/`b_j` layer
 /// batches), then all chunk commitments in that batch order, then the
 /// shared multiplicity table.
+/// The two zero-subcube claims of one [`SmallValueBlock`] on a
+/// polynomial's chunk oracle `C(x, k, c)` (index `(x·2^nlv + k)·stride +
+/// c`). With every chunk already range-checked below `2^16`, `w[x] <
+/// 2^16` for all `x` in the block iff `C(x, k, c) = 0` for `(k, c) ≠
+/// (0, 0)`, i.e. iff
+///   `C(prefix, r_x, r_kc) = eq(r_kc, 0) · C(prefix, r_x, 0)`
+/// as polynomials in `(r_x, r_kc)` — the difference is multilinear with
+/// hypercube values exactly the block's non-lowest chunks. Both sides
+/// squeeze `r_x`, `r_kc` here; the prover computes `e2 = C(prefix, r_x,
+/// 0)` from the chunk polynomial, the verifier takes it from the proof;
+/// `e1 = eq(r_kc, 0)·e2` is derived. The batched open then binds both
+/// evaluations to the commitment. `n` is the polynomial's variable
+/// count, `nlv`/`log_stride` the limb/chunk index bits.
+fn small_block_claims<B: CommitBackend, T: ByteTranscript>(
+  transcript: &mut T,
+  n: usize,
+  nlv: usize,
+  log_stride: usize,
+  block: &SmallValueBlock,
+  chunk_fq: Option<&[B::Scalar]>,
+  e2_in: Option<B::Scalar>,
+) -> Result<(OpenClaims<B::Scalar>, B::Scalar), SpartanError> {
+  block.validate(n)?;
+  let m = block.log_len;
+  let kc_bits = nlv + log_stride;
+  let mut squeeze = |label: &'static [u8], i: usize| -> Result<B::Scalar, SpartanError> {
+    let bytes = transcript.squeeze_bytes(label)?;
+    transcript.absorb_bytes(b"blk_idx", &(i as u64).to_le_bytes());
+    Ok(<B::Scalar as PrimeFieldExt>::from_uniform(&bytes))
+  };
+  let r_x: Vec<B::Scalar> = (0..m)
+    .map(|i| squeeze(b"blk_rx", i))
+    .collect::<Result<_, _>>()?;
+  let r_kc: Vec<B::Scalar> = (0..kc_bits)
+    .map(|i| squeeze(b"blk_rkc", i))
+    .collect::<Result<_, _>>()?;
+  let prefix = bool_point_of_index::<B::Scalar>(block.start >> m, n - m);
+  let mut p1 = prefix.clone();
+  p1.extend_from_slice(&r_x);
+  p1.extend_from_slice(&r_kc);
+  let mut p2 = prefix;
+  p2.extend_from_slice(&r_x);
+  p2.extend(core::iter::repeat_n(B::Scalar::ZERO, kc_bits));
+  let eq0 = r_kc
+    .iter()
+    .fold(B::Scalar::ONE, |acc, r| acc * (B::Scalar::ONE - *r));
+  let e2 = match (chunk_fq, e2_in) {
+    (Some(c), _) => mle_evaluate_fq(c, &p2),
+    (None, Some(e)) => e,
+    (None, None) => {
+      return Err(SpartanError::InternalError {
+        reason: "small_block_claims: neither chunk data nor a proof value".to_string(),
+      });
+    }
+  };
+  transcript.absorb_bytes(b"blk_ev", e2.to_repr().as_ref());
+  let mut cl = OpenClaims::<B::Scalar>::default();
+  cl.push(p1, eq0 * e2);
+  cl.push(p2, e2);
+  Ok((cl, e2))
+}
+
 fn finish_batch_open<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
@@ -2778,7 +2921,15 @@ fn finish_batch_open<
   states: &mut [PerPolyProver<B>],
   comms: &[&B::Comm],
   blinds: &[&B::Blind],
-) -> Result<(SharedRangeCheck<B>, CombinedBatchOpen<B>), SpartanError>
+  blocks: &[&[SmallValueBlock]],
+) -> Result<
+  (
+    SharedRangeCheck<B>,
+    CombinedBatchOpen<B>,
+    Vec<Vec<B::Scalar>>,
+  ),
+  SpartanError,
+>
 where
   B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
 {
@@ -2864,6 +3015,7 @@ where
   // `r` is `f_batch_idx[p] + 1 + 2j + r`.
   let mut f_target_claims: Vec<OpenClaims<B::Scalar>> = Vec::with_capacity(states.len());
   let mut ab_target_claims: Vec<Vec<OpenClaims<B::Scalar>>> = Vec::with_capacity(states.len());
+  let mut small_block_evals: Vec<Vec<B::Scalar>> = Vec::with_capacity(states.len());
   for (p, st) in states.iter().enumerate() {
     let d = BatchDims::new(1, st.f_limb.len(), params.log_t);
     let (fold_pt, alpha) = chunk_fold_point::<B::Scalar>(d.log_stride);
@@ -2878,6 +3030,27 @@ where
     for (z, y) in rc_claims.points.iter().zip(rc_claims.evals.iter()) {
       cl.push(z.clone(), *y);
     }
+    // Small-value block claims (zero-subcube gadget), transcript-ordered
+    // after the range check, per poly, in declaration order.
+    let poly_n = (st.f_limb.len().trailing_zeros() as usize) - params.numlimb_var;
+    let blk_list: &[SmallValueBlock] = blocks.get(p).copied().unwrap_or(&[]);
+    let mut blk_evals = Vec::with_capacity(blk_list.len());
+    for blk in blk_list {
+      let (bcl, e2) = small_block_claims::<B, _>(
+        transcript,
+        poly_n,
+        params.numlimb_var,
+        d.log_stride,
+        blk,
+        Some(rc_art.chunk_data[f_batch_idx[p]].0.as_slice()),
+        None,
+      )?;
+      for (z, y) in bcl.points.into_iter().zip(bcl.evals) {
+        cl.push(z, y);
+      }
+      blk_evals.push(e2);
+    }
+    small_block_evals.push(blk_evals);
     f_target_claims.push(cl);
 
     let mut per_layer = Vec::with_capacity(2 * st.t_layers);
@@ -2948,7 +3121,7 @@ where
   let combined_open = prove_combined_batch_open::<B>(backend_ck, &mut bsub, &bo_targets)?;
   info!(elapsed_ms = %bo_t.elapsed().as_millis(), "imod_pcs_batched_opens");
 
-  Ok((range_check, combined_open))
+  Ok((range_check, combined_open, small_block_evals))
 }
 
 /// Per-polynomial verifier state: the accumulated open claims plus the
@@ -3304,6 +3477,8 @@ fn finish_batch_verify<
   ab_comms_per_poly: &[&[B::Comm]],
   range_check: &SharedRangeCheck<B>,
   combined_open: &CombinedBatchOpen<B>,
+  blocks: &[&[SmallValueBlock]],
+  small_block_evals: &[Vec<B::Scalar>],
 ) -> Result<(), SpartanError>
 where
   B::Scalar: crate::big_num::DelayedReduction<B::Scalar>,
@@ -3367,6 +3542,29 @@ where
     let rc_cl = &rc_claims.chunk_claims[f_batch_idx[p]];
     for (z, y) in rc_cl.points.iter().zip(rc_cl.evals.iter()) {
       cl.push(z.clone(), *y);
+    }
+    // Small-value block claims: mirror of the prover's assembly, with
+    // `e2` read from the proof.
+    let poly_n = v.num_vars - params.numlimb_var;
+    let blk_list: &[SmallValueBlock] = blocks.get(p).copied().unwrap_or(&[]);
+    for (bi, blk) in blk_list.iter().enumerate() {
+      let e2 = small_block_evals
+        .get(p)
+        .and_then(|e| e.get(bi))
+        .copied()
+        .ok_or(SpartanError::InvalidSumcheckProof)?;
+      let (bcl, _) = small_block_claims::<B, _>(
+        transcript,
+        poly_n,
+        params.numlimb_var,
+        d.log_stride,
+        blk,
+        None,
+        Some(e2),
+      )?;
+      for (z, y) in bcl.points.into_iter().zip(bcl.evals) {
+        cl.push(z, y);
+      }
     }
     f_target_claims.push(cl);
     f_log_stride.push(d.log_stride);

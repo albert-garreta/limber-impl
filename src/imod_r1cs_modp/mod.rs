@@ -15,6 +15,7 @@
 //! Invariants: `num_vars`, `num_cons` are powers of two,
 //! `num_vars ≥ 1 + num_io`, and `mods.len() == num_cons`.
 
+use crate::traits::mod_engine::SmallValueBlock;
 use crate::{
   errors::SpartanError,
   start_span,
@@ -53,6 +54,8 @@ pub struct IntModR1CSShapeModp<M: ModEngine> {
   pub(crate) B: Vec<(usize, usize, BigUint)>,
   pub(crate) C: Vec<(usize, usize, BigUint)>,
   pub(crate) mods: Vec<BigUint>,
+  /// Aligned witness blocks asserted `< 2^16` by the Mod-PCS (no rows).
+  pub(crate) small_blocks: Vec<SmallValueBlock>,
   pub(crate) _phantom: core::marker::PhantomData<M>,
 }
 
@@ -125,8 +128,29 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       B,
       C,
       mods,
+      small_blocks: Vec::new(),
       _phantom: core::marker::PhantomData,
     })
+  }
+
+  /// Declare aligned witness blocks whose values the Mod-PCS asserts to
+  /// be `< 2^16` (see [`SmallValueBlock`]) — the SNARK's range lookup for
+  /// chunk decompositions. Blocks enter the shape digest.
+  pub fn with_small_value_blocks(
+    mut self,
+    blocks: Vec<SmallValueBlock>,
+  ) -> Result<Self, SpartanError> {
+    let n = self.num_vars.trailing_zeros() as usize;
+    for b in &blocks {
+      b.validate(n)?;
+    }
+    self.small_blocks = blocks;
+    Ok(self)
+  }
+
+  /// The declared small-value blocks.
+  pub fn small_value_blocks(&self) -> &[SmallValueBlock] {
+    &self.small_blocks
   }
 
   /// Number of witness columns (`|w|`), a power of two.
@@ -187,6 +211,13 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
     let ok_eq = (0..self.num_cons)
       .into_par_iter()
       .all(|i| &az[i] * &bz[i] == &cz[i] + &self.mods[i] * &W.q[i]);
+    // Small-value blocks are asserted by the Mod-PCS, not by rows; check
+    // them here so an out-of-range witness is caught before proving.
+    let ok_blocks = self.small_blocks.iter().all(|b| {
+      W.w[b.start..b.start + b.size()]
+        .iter()
+        .all(|v| v.bits() <= 16)
+    });
 
     let (comm_w_ok, comm_q_ok) = rayon::join(
       || -> Result<bool, SpartanError> {
@@ -204,6 +235,11 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
     if !ok_eq {
       return Err(SpartanError::UnSat {
         reason: "IntMod-R1CS equation does not hold over Z".to_string(),
+      });
+    }
+    if !ok_blocks {
+      return Err(SpartanError::UnSat {
+        reason: "IntMod-R1CS small-value block holds a value >= 2^16".to_string(),
       });
     }
     if !(comm_w_ok && comm_q_ok) {
@@ -240,6 +276,11 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       let bytes = m.to_bytes_le();
       h.update((bytes.len() as u64).to_le_bytes());
       h.update(&bytes);
+    }
+    h.update((self.small_blocks.len() as u64).to_le_bytes());
+    for b in &self.small_blocks {
+      h.update((b.start as u64).to_le_bytes());
+      h.update((b.log_len as u64).to_le_bytes());
     }
     h.finalize().into()
   }
