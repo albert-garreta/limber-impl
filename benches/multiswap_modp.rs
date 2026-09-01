@@ -441,8 +441,48 @@ fn compute_witness_advice(
   out
 }
 
-fn multiswap_shape_and_witness(d: Dims) -> (IntModR1CSShapeModp<M>, Vec<BigUint>, Vec<BigUint>) {
-  multiswap_shape_and_witness_for::<M>(d)
+/// Which statement the bench proves. `MSCFG=full` (default): the OWWB20
+/// `SetBench` statement from `limber::multiswap` with real dataflow
+/// (`MSSWAPS` swaps, default 1). `MSCFG=paper`: the cost-model circuit
+/// above (the paper's submission-time row). `MSCFG=bare`: the four variable-base 352-bit
+/// exponentiations of the Garuda / Zinc+ comparison rows. Returns
+/// `(shape, w, q, public_io)`.
+type Workload<MM> = (
+  IntModR1CSShapeModp<MM>,
+  Vec<BigUint>,
+  Vec<BigUint>,
+  Vec<BigUint>,
+);
+fn ws<MM: limber::traits::mod_engine::ModEngine>(d: Dims) -> Workload<MM> {
+  use limber::multiswap::{
+    poseidon::PoseidonParams,
+    statement::{self, Config},
+  };
+  let cfg = cfg_name();
+  match cfg.as_str() {
+    "full" | "rsa" | "bare" => {
+      let config = if cfg == "full" {
+        let swaps = std::env::var("MSSWAPS")
+          .ok()
+          .and_then(|v| v.parse().ok())
+          .unwrap_or(1);
+        Config::Full { swaps }
+      } else {
+        Config::Rsa
+      };
+      let st = statement::build::<MM>(&config, &PoseidonParams::bls12_381_owwb20())
+        .expect("statement builds");
+      (st.built.shape, st.built.w, st.built.q, st.built.io)
+    }
+    _ => {
+      let (shape, w, q) = multiswap_shape_and_witness_for::<MM>(d);
+      (shape, w, q, vec![])
+    }
+  }
+}
+
+fn cfg_name() -> String {
+  std::env::var("MSCFG").unwrap_or_else(|_| "full".to_string())
 }
 
 fn multiswap_shape_and_witness_for<MM: limber::traits::mod_engine::ModEngine>(
@@ -724,7 +764,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
         .try_init();
     }
     let dims = Dims::multiswap(0);
-    let (shape, w, q) = multiswap_shape_and_witness_for::<BE>(dims);
+    let (shape, w, q, io) = ws::<BE>(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
     let bdk: usize = std::env::var("BDK")
       .ok()
@@ -744,8 +784,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       tw.elapsed().as_secs_f64() * 1e3
     );
     let t0 = Instant::now();
-    let (witness, instance) =
-      IntModR1CSWitnessModp::<BE>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let (witness, instance) = IntModR1CSWitnessModp::<BE>::new(&shape, pk.ck(), w, q, io).unwrap();
     let t_commit = t0.elapsed().as_secs_f64() * 1e3;
     let t1 = Instant::now();
     let proof = IntModSpartanModpSNARK::<BE>::prove(&pk, &instance, &witness).unwrap();
@@ -770,8 +809,10 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       }
     }
     println!(
-      "MultiSwap 2^13 / Brakedown Mod-PCS: commit {t_commit:.1} ms, prove {t_prove:.1} ms, \
+      "MultiSwap {} 2^{} / Brakedown Mod-PCS: commit {t_commit:.1} ms, prove {t_prove:.1} ms, \
        total {:.1} ms, verify {t_verify:.1} ms, proof {} bytes ({:.2} MB)",
+      cfg_name(),
+      log_n,
       t_commit + t_prove,
       proof_bytes,
       proof_bytes as f64 / 1e6,
@@ -799,7 +840,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     }
     type Sf = limber::provider::M127DynPrimeBdEngine;
     let dims = Dims::multiswap(0);
-    let (shape, w, q) = multiswap_shape_and_witness_for::<Sf>(dims);
+    let (shape, w, q, io) = ws::<Sf>(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
     // q = 127; 16-bit limbs (= chunks); k = 5 per the parameter grid.
     let params =
@@ -810,8 +851,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     );
     let (pk, vk) = IntModSpartanModpSNARK::<Sf>::setup_with_params(shape.clone(), params).unwrap();
     let t0 = Instant::now();
-    let (witness, instance) =
-      IntModR1CSWitnessModp::<Sf>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let (witness, instance) = IntModR1CSWitnessModp::<Sf>::new(&shape, pk.ck(), w, q, io).unwrap();
     let proof = IntModSpartanModpSNARK::<Sf>::prove(&pk, &instance, &witness).unwrap();
     let t_prove = t0.elapsed().as_secs_f64();
     let t1 = Instant::now();
@@ -835,17 +875,18 @@ fn multiswap_modp_benches(c: &mut Criterion) {
         .try_init();
     }
     let dims = Dims::multiswap(0);
-    let (shape, w, q) = multiswap_shape_and_witness(dims);
+    let (shape, w, q, io) = ws::<M>(dims);
     let log_n = (shape.num_vars().max(shape.num_cons()) as u64).ilog2() as usize;
     let params =
       IntEvalParams::derive(2048, LOG_T, hyrax_k(), log_n).expect("IntEval params satisfy bounds");
     let (pk, vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
     let t0 = Instant::now();
-    let (witness, instance) =
-      IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+    let (witness, instance) = IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, io).unwrap();
     let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
     let total = t0.elapsed().as_secs_f64();
+    let t1 = Instant::now();
     proof.verify(&vk, &instance).unwrap();
+    let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
     let arg_bytes = proof.eval_arg_size();
     let (pp, rc, co) = proof.eval_arg_component_sizes();
     println!("  breakdown: per_poly {pp} B, range_check {rc} B, combined_open {co} B");
@@ -861,8 +902,10 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     // 2-limb scalar.
     let dyn_bytes = (13 * 3 + 14 * 2 + 6) * 16;
     println!(
-      "MultiSwap 2^13 / Hyrax Mod-PCS proof size: eval_arg {arg_bytes} bytes \
-       + ~{dyn_bytes} B sumcheck side ≈ {:.1} KB  (commit+prove {total:.2} s)",
+      "MultiSwap {} 2^{} / Hyrax Mod-PCS proof size: eval_arg {arg_bytes} bytes \
+       + ~{dyn_bytes} B sumcheck side ≈ {:.1} KB  (commit+prove {total:.2} s, verify {verify_ms:.1} ms)",
+      cfg_name(),
+      log_n,
       (arg_bytes + dyn_bytes) as f64 / 1e3,
     );
     return;
@@ -874,7 +917,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
   if std::env::var_os("KSWEEP").is_some() {
     use std::time::Instant;
     let dims = Dims::multiswap(0);
-    let (shape, w, q) = multiswap_shape_and_witness(dims);
+    let (shape, w, q, io) = ws::<M>(dims);
     println!(
       "\nMultiSwap k-sweep (LOG_T={LOG_T}, 2^{} rows):",
       (shape.num_cons() as u64).ilog2(),
@@ -885,7 +928,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       let (pk, vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
       let t0 = Instant::now();
       let (witness, instance) =
-        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+        IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), io.clone()).unwrap();
       let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
       let ms = t0.elapsed().as_secs_f64() * 1e3;
       proof.verify(&vk, &instance).unwrap();
@@ -901,7 +944,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
       .try_init();
     for &k in ks {
       let dims = Dims::multiswap(k);
-      let (shape, w, q) = multiswap_shape_and_witness(dims);
+      let (shape, w, q, io) = ws::<M>(dims);
       for int_k in 7..=10usize {
         let params = params_for(&shape, int_k);
         println!(
@@ -916,7 +959,8 @@ fn multiswap_modp_benches(c: &mut Criterion) {
         let (pk, vk) =
           IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
         let (witness, instance) =
-          IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+          IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w.clone(), q.clone(), io.clone())
+            .unwrap();
         shape.is_sat(pk.ck(), &instance, &witness).unwrap();
         println!("is_sat passed");
         let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
@@ -929,7 +973,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
 
   for &k in ks {
     let dims = Dims::multiswap(k);
-    let (shape, _w, _q) = multiswap_shape_and_witness(dims);
+    let (shape, _w, _q, _io) = ws::<M>(dims);
     println!(
       "MultiSwap k={k}: num_cons=2^{} num_vars=2^{} (imod rows) vs paper F_p≈{} constraints",
       (shape.num_cons() as u64).ilog2(),
@@ -945,13 +989,17 @@ fn multiswap_modp_benches(c: &mut Criterion) {
 
   for &k in ks {
     let dims = Dims::multiswap(k);
-    let (shape0, _, _) = multiswap_shape_and_witness(dims);
-    let tag = format!("k{k}_c2^{}", (shape0.num_cons() as u64).ilog2());
+    let (shape0, _, _, _) = ws::<M>(dims);
+    let tag = format!(
+      "{}_k{k}_c2^{}",
+      cfg_name(),
+      (shape0.num_cons() as u64).ilog2()
+    );
 
     g.bench_function(format!("setup/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, _, _) = multiswap_shape_and_witness(dims);
+          let (shape, _, _, _) = ws::<M>(dims);
           let params = params_for(&shape, hyrax_k());
           (shape, params)
         },
@@ -983,14 +1031,14 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     g.bench_function(format!("commit_witness/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, w, q) = multiswap_shape_and_witness(dims);
+          let (shape, w, q, io) = ws::<M>(dims);
           let params = params_for(&shape, hyrax_k());
           let (pk, _vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
-          (pk, shape, w, q)
+          (pk, shape, w, q, io)
         },
-        |(pk, shape, w, q)| {
-          let _ = IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+        |(pk, shape, w, q, io)| {
+          let _ = IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, io).unwrap();
         },
         BatchSize::LargeInput,
       );
@@ -1006,15 +1054,15 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     g.bench_function(format!("prove/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, _, _) = multiswap_shape_and_witness(dims);
+          let (shape, _, _, _) = ws::<M>(dims);
           let params = params_for(&shape, hyrax_k());
           let (pk, _vk) = IntModSpartanModpSNARK::<M>::setup_with_params(shape, params).unwrap();
           pk
         },
         |pk| {
-          let (shape, w, q) = multiswap_shape_and_witness(dims);
+          let (shape, w, q, io) = ws::<M>(dims);
           let (witness, instance) =
-            IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+            IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, io).unwrap();
           let _ = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
         },
         BatchSize::LargeInput,
@@ -1024,12 +1072,12 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     g.bench_function(format!("verify/{tag}"), |b| {
       b.iter_batched(
         || {
-          let (shape, w, q) = multiswap_shape_and_witness(dims);
+          let (shape, w, q, io) = ws::<M>(dims);
           let params = params_for(&shape, hyrax_k());
           let (pk, vk) =
             IntModSpartanModpSNARK::<M>::setup_with_params(shape.clone(), params).unwrap();
           let (witness, instance) =
-            IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
+            IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, io).unwrap();
           let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
           (vk, instance, proof)
         },
