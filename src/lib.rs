@@ -64,10 +64,7 @@ pub mod imod_r1cs_modp; // Integer Mod-R1CS over a ModEngine (dual-field, verifi
 pub mod imod_spartan; // Spartan over Integer Mod-R1CS
 pub mod imod_spartan_modp; // Dual-field SNARK driver over a ModEngine
 pub mod logup_gkr; // LogUp-GKR range proof (16-bit range check via fractional-sum GKR)
-#[doc(hidden)] // bench/test support; not part of the supported API
-pub mod poseidon2;
-#[doc(hidden)] // bench/test support; not part of the supported API
-pub mod poseidon_bench;
+pub mod multiswap; // OWWB20 MultiSwap statement: primitives and instance generation
 pub mod spartan; // Spartan without zero-knowledge
 
 /// Start a span + timer, return `(Span, Instant)`.

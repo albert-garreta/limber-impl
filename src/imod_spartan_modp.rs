@@ -35,7 +35,7 @@ use crate::{
   start_span,
   sumcheck_modp::SumcheckProof,
   traits::{
-    mod_engine::{ModEngine, ModPCSEngineTrait, SumcheckEngine, SumcheckField},
+    mod_engine::{ModEngine, ModPCSEngineTrait, SmallValueBlock, SumcheckEngine, SumcheckField},
     transcript::{ByteTranscript, TranscriptEngineTrait},
   },
 };
@@ -69,6 +69,52 @@ pub(crate) fn to_canonical_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u
 /// modulo the runtime modulus carried in `params`.
 fn biguint_to_scalar<M: ModEngine>(v: &BigUint, params: &MParams<M>) -> MScalar<M> {
   MScalar::<M>::from_bytes_reduce(params, &v.to_bytes_le())
+}
+
+/// Width-grouped selector for the segment `[start, start+2^log_len)` at the
+/// witness point `wp` (MSB-first): the product over the leading
+/// `wp.len() - log_len` coords of `eq(bit_j, wp[j])`, with bits taken from
+/// `start >> log_len`. The segment's local evaluation point is the last
+/// `log_len` coords of `wp`, so `W(wp) = sum_seg selector(seg) * Seg(local)`.
+fn segment_selector<M: ModEngine>(
+  start: usize,
+  log_len: usize,
+  wp: &[MScalar<M>],
+  params: &MParams<M>,
+) -> MScalar<M> {
+  let hi = wp.len() - log_len;
+  let h = start >> log_len;
+  let one = MScalar::<M>::one(params);
+  let mut sel = one;
+  for (j, wj) in wp.iter().take(hi).enumerate() {
+    let bit = (h >> (hi - 1 - j)) & 1;
+    let factor = if bit == 1 { *wj } else { one - *wj };
+    sel = sel * factor;
+  }
+  sel
+}
+
+/// Distribute the shape's aligned small-value blocks across the width
+/// segments, rebasing each block's `start` to be relative to the segment
+/// that contains it. Every block lies within exactly one segment (the
+/// layout keeps the 16-bit region inside one aligned segment).
+fn segment_relative_blocks(
+  segs: &[crate::imod_r1cs_modp::WidthSegment],
+  blocks: &[SmallValueBlock],
+) -> Vec<Vec<SmallValueBlock>> {
+  segs
+    .iter()
+    .map(|seg| {
+      blocks
+        .iter()
+        .filter(|b| b.start >= seg.start && b.start + b.size() <= seg.start + seg.size())
+        .map(|b| SmallValueBlock {
+          start: b.start - seg.start,
+          log_len: b.log_len,
+        })
+        .collect()
+    })
+    .collect()
 }
 
 fn biguint_vec_to_scalars<M: ModEngine>(v: &[BigUint], params: &MParams<M>) -> Vec<MScalar<M>> {
@@ -132,6 +178,10 @@ pub struct IntModSpartanModpSNARK<M: ModEngine> {
   // inner sumcheck (for w)
   sc_inner: SumcheckProof<M>,
   eval_w: MScalar<M>,
+  // Per-segment evaluations of W (width-grouped commitment): eval_w =
+  // sum_i selector_i(r_y[1..]) · seg_evals[i]. Empty when the shape
+  // declares no segments (W committed as one polynomial).
+  seg_evals: Vec<MScalar<M>>,
   // Mod-PCS opening of W (at r_y[1..]) and Q (at r_x) merged into ONE
   // batched argument: a single shared LogUp-GKR range check and a single
   // combined inner-product opening cover both polynomials.
@@ -354,7 +404,9 @@ where
     // 2. Byte-absorb pre-`p` data. Public IO is `BigUint`, not a
     //    `TranscriptReprTrait` type, so absorb its LE bytes directly.
     transcript.absorb_bytes(b"vk", &pk.vk_digest);
-    transcript.absorb(b"comm_w", &U.comm_w);
+    for cw in &U.comm_w {
+      transcript.absorb(b"comm_w", cw);
+    }
     transcript.absorb(b"comm_q", &U.comm_q);
     for xi in &U.x {
       transcript.absorb_bytes(b"x", &xi.to_bytes_le());
@@ -483,15 +535,68 @@ where
     let (_open_span, open_t) = start_span!("imod_modp_wq_open");
     let eval_w_bu = BigUint::from_bytes_le(&eval_w.to_le_bytes());
     let v_q_bu = BigUint::from_bytes_le(&v_q.to_le_bytes());
-    let eval_arg = <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch(
-      &pk.ck,
-      &mut transcript,
-      &[&U.comm_w, &U.comm_q],
-      &[W.w.as_slice(), W.q.as_slice()],
-      &[&W.r_w, &W.r_q],
-      &[&r_y[1..], &r_x[..]],
-      &[&eval_w_bu, &v_q_bu],
-    )?;
+    let segs = pk.shape.width_segments();
+    let mut seg_evals: Vec<MScalar<M>> = Vec::new();
+    let eval_arg = if segs.is_empty() {
+      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_blocks(
+        &pk.ck,
+        &mut transcript,
+        &[&U.comm_w[0], &U.comm_q],
+        &[W.w.as_slice(), W.q.as_slice()],
+        &[&W.r_w[0], &W.r_q],
+        &[&r_y[1..], &r_x[..]],
+        &[&eval_w_bu, &v_q_bu],
+        &[pk.shape.small_blocks.as_slice(), &[]],
+      )?
+    } else {
+      // Width-grouped open: one poly per segment (at its own bound) plus Q.
+      // eval_w is recovered on the verifier from the per-segment evals via
+      // the selector sum, so it isn't opened directly. Small-value blocks
+      // are not yet threaded through the segmented open (is_sat still
+      // range-checks them); see docs/imod_followups.md.
+      let wp = &r_y[1..];
+      let q_ltf = <ModPCS<M> as ModPCSEngineTrait<M>>::commitment_log_t_f(&pk.ck);
+      let mut locals: Vec<Vec<MScalar<M>>> = Vec::with_capacity(segs.len());
+      let mut ev_bus: Vec<BigUint> = Vec::with_capacity(segs.len() + 1);
+      let mut log_t_fs: Vec<usize> = Vec::with_capacity(segs.len() + 1);
+      let mut slices: Vec<&[BigUint]> = Vec::with_capacity(segs.len() + 1);
+      for seg in segs {
+        let slice = &W.w[seg.start..seg.start + seg.size()];
+        let local: Vec<MScalar<M>> = wp[wp.len() - seg.log_len..].to_vec();
+        let seg_fq = biguint_vec_to_scalars::<M>(slice, &params);
+        let seg_eval = MultilinearPolynomial::new(seg_fq, params.clone()).evaluate(&local);
+        seg_evals.push(seg_eval);
+        ev_bus.push(BigUint::from_bytes_le(&seg_eval.to_le_bytes()));
+        log_t_fs.push(seg.log_t_f);
+        slices.push(slice);
+        locals.push(local);
+      }
+      ev_bus.push(v_q_bu.clone());
+      log_t_fs.push(q_ltf);
+      slices.push(W.q.as_slice());
+      let comms: Vec<_> = U.comm_w.iter().chain(std::iter::once(&U.comm_q)).collect();
+      let blinds: Vec<_> = W.r_w.iter().chain(std::iter::once(&W.r_q)).collect();
+      let mut points: Vec<&[MScalar<M>]> = locals.iter().map(|v| v.as_slice()).collect();
+      points.push(&r_x[..]);
+      let ev_refs: Vec<&BigUint> = ev_bus.iter().collect();
+      // 16-bit range-check blocks, offsets made relative to their segment;
+      // Q carries none. Each block lies within exactly one segment.
+      let seg_blocks = segment_relative_blocks(segs, &pk.shape.small_blocks);
+      let mut blocks_ref: Vec<&[SmallValueBlock]> =
+        seg_blocks.iter().map(|v| v.as_slice()).collect();
+      blocks_ref.push(&[]);
+      <ModPCS<M> as ModPCSEngineTrait<M>>::prove_batch_with_params(
+        &pk.ck,
+        &mut transcript,
+        &comms,
+        &slices,
+        &blinds,
+        &points,
+        &ev_refs,
+        &blocks_ref,
+        &log_t_fs,
+      )?
+    };
     info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_modp_wq_open");
 
     info!(elapsed_ms = %prove_t.elapsed().as_millis(), "imod_spartan_modp_prove");
@@ -504,6 +609,7 @@ where
       v_q,
       sc_inner,
       eval_w,
+      seg_evals,
       eval_arg,
     })
   }
@@ -522,7 +628,9 @@ where
 
     // 2. Byte-absorb pre-`p` data identically to prove().
     transcript.absorb_bytes(b"vk", &vk.digest);
-    transcript.absorb(b"comm_w", &U.comm_w);
+    for cw in &U.comm_w {
+      transcript.absorb(b"comm_w", cw);
+    }
     transcript.absorb(b"comm_q", &U.comm_q);
     for xi in &U.x {
       transcript.absorb_bytes(b"x", &xi.to_bytes_le());
@@ -624,14 +732,62 @@ where
     let (_wqver_span, wqver_t) = start_span!("imod_modp_wq_verify");
     let eval_w_bu = BigUint::from_bytes_le(&self.eval_w.to_le_bytes());
     let v_q_bu = BigUint::from_bytes_le(&self.v_q.to_le_bytes());
-    <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch(
-      &vk.vk_ee,
-      &mut transcript,
-      &[&U.comm_w, &U.comm_q],
-      &[&r_y[1..], &r_x[..]],
-      &[&eval_w_bu, &v_q_bu],
-      &self.eval_arg,
-    )?;
+    let segs = vk.shape.width_segments();
+    if segs.is_empty() {
+      <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_blocks(
+        &vk.vk_ee,
+        &mut transcript,
+        &[&U.comm_w[0], &U.comm_q],
+        &[&r_y[1..], &r_x[..]],
+        &[&eval_w_bu, &v_q_bu],
+        &self.eval_arg,
+        &[vk.shape.small_blocks.as_slice(), &[]],
+      )?;
+    } else {
+      // Bind the per-segment evals to the R1CS: eval_w must equal the
+      // selector-weighted sum of the segment evaluations.
+      if self.seg_evals.len() != segs.len() {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+      let wp = &r_y[1..];
+      let mut acc = MScalar::<M>::zero(&params);
+      for (seg, se) in segs.iter().zip(self.seg_evals.iter()) {
+        acc = acc + segment_selector::<M>(seg.start, seg.log_len, wp, &params) * *se;
+      }
+      if acc != self.eval_w {
+        return Err(SpartanError::InvalidSumcheckProof);
+      }
+      // Open each segment at its local point + Q at r_x.
+      let q_ltf = <ModPCS<M> as ModPCSEngineTrait<M>>::verifier_log_t_f(&vk.vk_ee);
+      let mut locals: Vec<Vec<MScalar<M>>> = Vec::with_capacity(segs.len());
+      let mut ev_bus: Vec<BigUint> = Vec::with_capacity(segs.len() + 1);
+      let mut log_t_fs: Vec<usize> = Vec::with_capacity(segs.len() + 1);
+      for (seg, se) in segs.iter().zip(self.seg_evals.iter()) {
+        locals.push(wp[wp.len() - seg.log_len..].to_vec());
+        ev_bus.push(BigUint::from_bytes_le(&se.to_le_bytes()));
+        log_t_fs.push(seg.log_t_f);
+      }
+      ev_bus.push(v_q_bu.clone());
+      log_t_fs.push(q_ltf);
+      let comms: Vec<_> = U.comm_w.iter().chain(std::iter::once(&U.comm_q)).collect();
+      let mut points: Vec<&[MScalar<M>]> = locals.iter().map(|v| v.as_slice()).collect();
+      points.push(&r_x[..]);
+      let ev_refs: Vec<&BigUint> = ev_bus.iter().collect();
+      let seg_blocks = segment_relative_blocks(segs, &vk.shape.small_blocks);
+      let mut blocks_ref: Vec<&[SmallValueBlock]> =
+        seg_blocks.iter().map(|v| v.as_slice()).collect();
+      blocks_ref.push(&[]);
+      <ModPCS<M> as ModPCSEngineTrait<M>>::verify_batch_with_params(
+        &vk.vk_ee,
+        &mut transcript,
+        &comms,
+        &points,
+        &ev_refs,
+        &self.eval_arg,
+        &blocks_ref,
+        &log_t_fs,
+      )?;
+    }
     info!(elapsed_ms = %wqver_t.elapsed().as_millis(), "imod_modp_wq_verify");
 
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "imod_spartan_modp_verify");
@@ -837,7 +993,7 @@ mod tests {
     // Tampering the witness commitment (a Merkle root byte) must break
     // verification via the transcript binding.
     let mut bad_u = U.clone();
-    bad_u.comm_w.root[0] ^= 1;
+    bad_u.comm_w[0].root[0] ^= 1;
     assert!(proof.verify(&vk, &bad_u).is_err());
   }
 
@@ -876,7 +1032,7 @@ mod tests {
 
     // Same Merkle-root tamper check as the t256 Brakedown test.
     let mut bad_u = U.clone();
-    bad_u.comm_w.root[0] ^= 1;
+    bad_u.comm_w[0].root[0] ^= 1;
     assert!(proof.verify(&vk, &bad_u).is_err());
   }
 
@@ -905,7 +1061,9 @@ mod tests {
       <ME as ModEngine>::bootstrap_params(),
     );
     t.absorb_bytes(b"vk", &pk.vk_digest);
-    t.absorb(b"comm_w", &U.comm_w);
+    for cw in &U.comm_w {
+      t.absorb(b"comm_w", cw);
+    }
     t.absorb(b"comm_q", &U.comm_q);
     let params = <ME as ModEngine>::sample_params(&mut t);
     proof.v_q += MScalar::<ME>::one(&params);
@@ -1015,6 +1173,112 @@ mod tests {
     let (witness, instance) =
       IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
     assert!(shape.is_sat(&pk.ck, &instance, &witness).is_err());
+  }
+
+  /// Small-value blocks: an aligned witness block asserted `< 2^16` by
+  /// the Mod-PCS with no rows. In-range values round-trip; a value
+  /// `≥ 2^16` inside the block is rejected even though every row is
+  /// satisfied over ℤ (the block variables are row-unconstrained).
+  /// Width-scaling measurement (the width-grouping optimization's basis):
+  /// the SAME narrow-value circuit proved at log_t_f=2048 (128 chunks/
+  /// value) vs log_t_f=256 (16 chunks/value). Confirms commit + prove
+  /// scale with committed chunk count, grounding the projection that
+  /// committing narrow values at a narrow bound is proportionally faster.
+  /// Run: `cargo test --release width_scaling -- --ignored --nocapture`.
+  #[test]
+  #[ignore]
+  fn width_scaling_measurement() {
+    use crate::provider::pcs::integer_modpcs::{DEFAULT_K, IntEvalParams};
+    use std::time::Instant;
+    // Narrow circuit: n rows of a*b = c mod (256-bit prime), all values < 2^256.
+    let log_n = 12usize;
+    let num_cons = 1usize << log_n;
+    let num_vars = 1usize << log_n;
+    let one = BigUint::from(1u32);
+    // a 250-bit prime-ish modulus (values stay < 2^256)
+    let m: BigUint = (BigUint::from(1u32) << 250) - BigUint::from(1u32);
+    // One column per row: w[i]·1 = w[i] (mod m). Satisfied for any w[i] < m,
+    // quotient 0 — a clean narrow-witness carrier for the timing measurement.
+    let const_col = num_vars;
+    let a_e: Vec<_> = (0..num_cons).map(|i| (i, i, one.clone())).collect();
+    let b_e: Vec<_> = (0..num_cons).map(|i| (i, const_col, one.clone())).collect();
+    let c_e: Vec<_> = (0..num_cons).map(|i| (i, i, one.clone())).collect();
+    let mods = vec![m.clone(); num_cons];
+    let shape = IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, a_e, b_e, c_e, mods).unwrap();
+    // narrow witness: each w[i] a ~250-bit value < m.
+    let mut w = vec![BigUint::from(0u32); num_vars];
+    for (i, wi) in w.iter_mut().enumerate() {
+      *wi = ((BigUint::from(0x9e37_79b9_7f4a_7c15u64) << 180) | BigUint::from(i as u64 + 1)) % &m;
+    }
+    let q = vec![BigUint::from(0u32); num_cons];
+
+    for log_t_f in [2048usize, 256] {
+      let params = IntEvalParams::derive(log_t_f, 64, DEFAULT_K, log_n).unwrap();
+      let (pk, vk) =
+        IntModSpartanModpSNARK::<ME>::setup_with_params(shape.clone(), params).unwrap();
+      let t0 = Instant::now();
+      let (witness, instance) =
+        IntModR1CSWitnessModp::<ME>::new(&shape, pk.ck(), w.clone(), q.clone(), vec![]).unwrap();
+      let commit_ms = t0.elapsed().as_secs_f64() * 1e3;
+      let t1 = Instant::now();
+      let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+      let prove_ms = t1.elapsed().as_secs_f64() * 1e3;
+      proof.verify(&vk, &instance).unwrap();
+      eprintln!(
+        "log_t_f={log_t_f:<4} (numlimb={:2}): commit {commit_ms:7.1} ms, prove {prove_ms:7.1} ms",
+        (log_t_f + 63) / 64
+      );
+    }
+  }
+
+  #[test]
+  fn imod_modp_small_value_block_roundtrip_and_rejects() {
+    use crate::traits::mod_engine::SmallValueBlock;
+    let one = BigUint::from(1u32);
+    let num_cons = 4usize;
+    let num_vars = 8usize;
+    // Row 0: w[0]·w[1] = w[2] exactly; block [4, 8) is row-free.
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 2, one.clone())];
+    let mods = vec![
+      BigUint::from(0u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+      BigUint::from(2u32),
+    ];
+    let shape = IntModR1CSShapeModp::<ME>::new(num_cons, num_vars, 0, mat_a, mat_b, mat_c, mods)
+      .unwrap()
+      .with_small_value_blocks(vec![SmallValueBlock {
+        start: 4,
+        log_len: 2,
+      }])
+      .unwrap();
+    let mk = |v4: u64| -> (Vec<BigUint>, Vec<BigUint>) {
+      let w = [3u64, 5, 15, 0, v4, 7, 65535, 0]
+        .iter()
+        .map(|x| BigUint::from(*x))
+        .collect();
+      let q = vec![BigUint::from(0u32); num_cons];
+      (w, q)
+    };
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+
+    let (w, q) = mk(65535);
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    shape.is_sat(&pk.ck, &instance, &witness).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+
+    // Out of range: rows still hold, `is_sat` and the verifier both reject.
+    let (w, q) = mk(65536);
+    let (witness, instance) =
+      IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, vec![]).unwrap();
+    assert!(shape.is_sat(&pk.ck, &instance, &witness).is_err());
+    // The prover does not self-check blocks; the verifier must reject.
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    assert!(proof.verify(&vk, &instance).is_err());
   }
 
   /// Wired circuit: the output of row 0 feeds into the input of row 1.
@@ -1450,7 +1714,9 @@ mod tests {
       <ME as ModEngine>::bootstrap_params(),
     );
     t.absorb_bytes(b"vk", &pk.vk_digest);
-    t.absorb(b"comm_w", &U.comm_w);
+    for cw in &U.comm_w {
+      t.absorb(b"comm_w", cw);
+    }
     t.absorb(b"comm_q", &U.comm_q);
     let params_p = <ME as ModEngine>::sample_params(&mut t);
     let params_q = t256_scalar_params();

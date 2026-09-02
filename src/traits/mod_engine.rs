@@ -50,6 +50,45 @@ use ff::{Field, PrimeField};
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 
+/// An aligned block of witness indices `[start, start + 2^log_len)` whose
+/// committed integer values are asserted to be below `2^16` — one chunk
+/// of the Mod-PCS's committed representation. A sound Mod-PCS discharges
+/// the assertion with zero-subcube opening claims on its chunk oracle
+/// (see `provider::pcs::integer_modpcs`), so it is the SNARK-level
+/// analogue of a 16-bit range lookup and costs no constraint rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmallValueBlock {
+  /// First witness index; must be a multiple of `2^log_len`.
+  pub start: usize,
+  /// Log2 of the block length.
+  pub log_len: usize,
+}
+
+impl SmallValueBlock {
+  /// Block length `2^log_len`.
+  pub fn size(&self) -> usize {
+    1usize << self.log_len
+  }
+
+  /// Check alignment and containment in a polynomial of `2^num_vars`
+  /// coefficients.
+  pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
+    let ok = self.log_len <= num_vars
+      && self.start.is_multiple_of(self.size())
+      && self.start + self.size() <= (1usize << num_vars);
+    if ok {
+      Ok(())
+    } else {
+      Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "SmallValueBlock {{ start: {}, log_len: {} }} is misaligned or out of range for 2^{num_vars} coefficients",
+          self.start, self.log_len
+        ),
+      })
+    }
+  }
+}
+
 /// A field-like interface suitable for sumcheck arithmetic.
 ///
 /// Unlike `ff::PrimeField`, does **not** require a compile-time-known modulus.
@@ -315,6 +354,14 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Length / shape sanity check on a commitment.
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 
+  /// The commitment key's native value-width bound in bits (the width a
+  /// plain [`commit`](Self::commit) uses). Width-grouped segments commit at
+  /// `<= ` this via [`commit_at`](Self::commit_at).
+  fn commitment_log_t_f(ck: &Self::CommitmentKey) -> usize;
+
+  /// Verifier-key mirror of [`commitment_log_t_f`](Self::commitment_log_t_f).
+  fn verifier_log_t_f(vk: &Self::VerifierKey) -> usize;
+
   /// Prove that the integer-valued polynomial `poly` evaluates at the
   /// `Z_p` point `point` to `eval` (the canonical integer in `[0, p)`
   /// representing the `Z_p` evaluation).
@@ -377,14 +424,100 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
     arg: &Self::BatchEvaluationArgument,
   ) -> Result<(), SpartanError>;
 
-  /// Whether every `E::Scalar` carried by `arg` belongs to the modulus
-  /// context `expected`. Required with NO permissive default: each impl
-  /// must traverse every `E::Scalar` its batch argument carries (q-side
-  /// static scalars and group values need no check), so a future argument
-  /// field cannot be silently omitted from the verifier's pre-arithmetic
-  /// context validation.
-  fn batch_arg_is_in_context(
+  /// [`prove_batch`](Self::prove_batch) plus per-polynomial
+  /// [`SmallValueBlock`] assertions: `blocks[i]` lists the blocks of
+  /// `polys[i]` whose values are asserted `< 2^16`. The default only
+  /// supports the trivial (all-empty) case.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_batch_with_blocks(
+    ck: &Self::CommitmentKey,
+    transcript: &mut E::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    if blocks.iter().any(|b| !b.is_empty()) {
+      return Err(SpartanError::InternalError {
+        reason: "this Mod-PCS does not support small-value blocks".to_string(),
+      });
+    }
+    Self::prove_batch(ck, transcript, comms, polys, blinds, points, evals)
+  }
+
+  /// Verify a [`prove_batch_with_blocks`](Self::prove_batch_with_blocks)
+  /// argument; `blocks` mirrors the prover's declaration.
+  fn verify_batch_with_blocks(
+    vk: &Self::VerifierKey,
+    transcript: &mut E::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[E::Scalar]],
+    evals: &[&BigUint],
     arg: &Self::BatchEvaluationArgument,
-    expected: &<E::Scalar as SumcheckField>::Params,
-  ) -> bool;
+    blocks: &[&[SmallValueBlock]],
+  ) -> Result<(), SpartanError> {
+    if blocks.iter().any(|b| !b.is_empty()) {
+      return Err(SpartanError::InternalError {
+        reason: "this Mod-PCS does not support small-value blocks".to_string(),
+      });
+    }
+    Self::verify_batch(vk, transcript, comms, points, evals, arg)
+  }
+
+  /// Commit `v` as an integer polynomial whose values are bounded by
+  /// `2^log_t_f` bits — a width-grouped commitment *segment*. A narrower
+  /// bound lets the impl commit at fewer internal limbs (cheaper MSM /
+  /// range check). The default only supports the key's native width.
+  fn commit_at(
+    _ck: &Self::CommitmentKey,
+    _v: &[BigUint],
+    _r: &Self::Blind,
+    _log_t_f: usize,
+  ) -> Result<Self::Commitment, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
+    })
+  }
+
+  /// [`prove_batch_with_blocks`](Self::prove_batch_with_blocks) where
+  /// polynomial `i` was committed at width `log_t_fs[i]` bits (its
+  /// width-grouped segment bound). Every poly shares one range check and
+  /// combined opening; the per-poly width only changes its own limb count.
+  /// The default is unsupported.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_batch_with_params(
+    _ck: &Self::CommitmentKey,
+    _transcript: &mut E::TE,
+    _comms: &[&Self::Commitment],
+    _polys: &[&[BigUint]],
+    _blinds: &[&Self::Blind],
+    _points: &[&[E::Scalar]],
+    _evals: &[&BigUint],
+    _blocks: &[&[SmallValueBlock]],
+    _log_t_fs: &[usize],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
+    })
+  }
+
+  /// Verify a [`prove_batch_with_params`](Self::prove_batch_with_params)
+  /// argument; `log_t_fs` mirrors the prover's per-poly segment widths.
+  #[allow(clippy::too_many_arguments)]
+  fn verify_batch_with_params(
+    _vk: &Self::VerifierKey,
+    _transcript: &mut E::TE,
+    _comms: &[&Self::Commitment],
+    _points: &[&[E::Scalar]],
+    _evals: &[&BigUint],
+    _arg: &Self::BatchEvaluationArgument,
+    _blocks: &[&[SmallValueBlock]],
+    _log_t_fs: &[usize],
+  ) -> Result<(), SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
+    })
+  }
 }
