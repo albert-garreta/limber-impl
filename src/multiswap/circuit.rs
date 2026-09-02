@@ -559,7 +559,7 @@ impl Builder {
       .enumerate()
       .map(|(i, b)| (class_of(b.bits() as usize), i))
       .collect();
-    reg.sort_by(|a, b| b.0.cmp(&a.0));
+    reg.sort_by_key(|x| core::cmp::Reverse(x.0));
 
     // Small block is a single aligned region at the END (all values < 2^16,
     // one range-check block); putting it last keeps the wide run at 0.

@@ -74,7 +74,7 @@ fn segment_selector<M: ModEngine>(
   for (j, wj) in wp.iter().take(hi).enumerate() {
     let bit = (h >> (hi - 1 - j)) & 1;
     let factor = if bit == 1 { *wj } else { one - *wj };
-    sel = sel * factor;
+    sel *= factor;
   }
   sel
 }
@@ -688,7 +688,7 @@ where
       let wp = &r_y[1..];
       let mut acc = MScalar::<M>::zero(&params);
       for (seg, se) in segs.iter().zip(self.seg_evals.iter()) {
-        acc = acc + segment_selector::<M>(seg.start, seg.log_len, wp, &params) * *se;
+        acc += segment_selector::<M>(seg.start, seg.log_len, wp, &params) * *se;
       }
       if acc != self.eval_w {
         return Err(SpartanError::InvalidSumcheckProof);
@@ -1162,7 +1162,7 @@ mod tests {
       proof.verify(&vk, &instance).unwrap();
       eprintln!(
         "log_t_f={log_t_f:<4} (numlimb={:2}): commit {commit_ms:7.1} ms, prove {prove_ms:7.1} ms",
-        (log_t_f + 63) / 64
+        log_t_f.div_ceil(64)
       );
     }
   }

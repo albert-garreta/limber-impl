@@ -452,7 +452,7 @@ impl IntEvalParams {
   /// then hold a fortiori — narrower values with the same `(log_t, k)`
   /// and at least as many CRT primes (derived for the wider `num_vars`).
   pub fn narrowed(&self, log_t_f: usize) -> Result<Self, SpartanError> {
-    if log_t_f == 0 || log_t_f % self.log_t != 0 || log_t_f > self.log_t_f {
+    if log_t_f == 0 || !log_t_f.is_multiple_of(self.log_t) || log_t_f > self.log_t_f {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
           "IntEvalParams::narrowed: log_t_f={log_t_f} must be a positive multiple of \
@@ -5728,7 +5728,7 @@ mod tests {
       &[point.as_slice()],
       &[&eval],
       &[&[]],
-      &[wide.clone()],
+      std::slice::from_ref(&wide),
     )
     .unwrap();
     let u_open = t.elapsed().as_secs_f64() * 1e3;
@@ -5741,7 +5741,7 @@ mod tests {
       &[&eval],
       &arg,
       &[&[]],
-      &[wide.clone()],
+      std::slice::from_ref(&wide),
     )
     .unwrap();
 
@@ -5818,10 +5818,10 @@ mod tests {
       // selector = eq(start >> log_len, point[0..hi_vars]) as an integer product.
       let h = start >> log_len;
       let mut sel = BigInt::from(1u32);
-      for i in 0..hi_vars {
+      for (i, pt) in point.iter().enumerate().take(hi_vars) {
         // point[i] corresponds to bit (hi_vars-1-i) of h.
         let bit = (h >> (hi_vars - 1 - i)) & 1;
-        let pi = BigInt::from(point[i].clone());
+        let pi = BigInt::from(pt.clone());
         sel *= if bit == 1 {
           pi
         } else {
@@ -5904,7 +5904,7 @@ mod tests {
     let dyn_params = small_dyn_params();
     let p: BigUint = BigUint::from(37u32);
     let wide = IntEvalParams::derive_optimized(256, 7).unwrap();
-    let narrow = wide.narrowed(wide.log_t / 1 * 1).unwrap(); // = log_t (numlimb 1)
+    let narrow = wide.narrowed(wide.log_t).unwrap(); // = log_t (numlimb 1)
     let (ck, vk) = IntegerModPCS::setup_with_params(b"ds", 128, 256, wide.clone()).unwrap();
 
     let n0 = 1usize << 7;
@@ -6011,7 +6011,7 @@ mod tests {
       &[&point],
       &[&e],
       &blks,
-      &[narrow.clone()],
+      std::slice::from_ref(&narrow),
     )
     .unwrap();
     let mut tv = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
@@ -6023,7 +6023,7 @@ mod tests {
       &[&e],
       &arg,
       &blks,
-      &[narrow.clone()],
+      std::slice::from_ref(&narrow),
     )
     .unwrap();
 
@@ -6043,7 +6043,7 @@ mod tests {
       &[&point],
       &[&e2],
       &blks,
-      &[narrow.clone()],
+      std::slice::from_ref(&narrow),
     )
     .unwrap();
     let mut tv2 = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
@@ -6056,7 +6056,7 @@ mod tests {
         &[&e2],
         &arg2,
         &blks,
-        &[narrow.clone()],
+        std::slice::from_ref(&narrow),
       )
       .is_err(),
       "block must reject a value >= 2^16 on a narrow segment"
@@ -6235,7 +6235,7 @@ mod tests {
       &[&point],
       &[&eval],
       &[&[]],
-      &[wide.clone()],
+      std::slice::from_ref(&wide),
     )
     .unwrap();
     let base_open = t.elapsed().as_secs_f64() * 1e3;
@@ -6248,7 +6248,7 @@ mod tests {
       &[&eval],
       &arg,
       &[&[]],
-      &[wide.clone()],
+      std::slice::from_ref(&wide),
     )
     .unwrap();
 
