@@ -277,7 +277,7 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
 
   // PSIZE=1: full-impl proof size on the msshape configs (the §7.2
   // comparison vs plain Spartan). The proof isn't fully `Serialize`
-  // (dynamic-prime sumcheck side), so report `eval_arg_size` — the
+  // (dynamic-prime sumcheck side), so report `eval_arg_bytes` — the
   // dominant Mod-PCS batch argument (per-poly commits, LogUp-GKR range
   // check, combined open) — plus the analytical sumcheck remainder.
   // Deterministic: one prove each, then return (skip criterion).
@@ -299,7 +299,7 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
         IntModR1CSWitnessModp::<M>::new(&shape, pk.ck(), w, q, vec![]).unwrap();
       let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
       proof.verify(&vk, &instance).unwrap();
-      let arg = proof.eval_arg_size();
+      let arg = proof.eval_arg_bytes().expect("eval_arg serializes").len();
       let (pp, rc, co) = proof.eval_arg_component_sizes();
       // Dynamic-prime sumcheck side: `lc` cubic outer rounds (3 coeffs)
       // + `lv` quadratic inner rounds (2 coeffs) + 6 claimed evals, at
@@ -347,7 +347,7 @@ fn imod_spartan_modp_benches(c: &mut Criterion) {
       println!(
         "msshape c2^{} proof size: eval_arg {} bytes",
         (shape.num_cons() as u64).ilog2(),
-        proof.eval_arg_size()
+        proof.eval_arg_bytes().expect("eval_arg serializes").len()
       );
     }
     return;

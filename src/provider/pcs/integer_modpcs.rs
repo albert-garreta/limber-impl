@@ -136,15 +136,26 @@ impl IntEvalParams {
     k: usize,
     num_vars: usize,
   ) -> Result<Self, SpartanError> {
-    let nl_pre = numlimb(log_t_f, log_t);
+    if k == 0 {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "IntEvalParams::derive: k must be positive".to_string(),
+      });
+    }
+    let nl_pre = checked_numlimb(log_t_f, log_t)?;
     let nlv_pre = numlimb_var(nl_pre);
-    let num_vars_total = num_vars + nlv_pre;
+    let num_vars_total = num_vars
+      .checked_add(nlv_pre)
+      .ok_or_else(|| params_overflow("num_vars + numlimb_var"))?;
 
     // Find max log_p satisfying Partial Evaluation Norm Bound:
     //   k + k·log_p + max(log_t, log_p) < log_q   (uses limb bound T)
     let mut log_p = 0usize;
     for lp in 1..log_q {
-      let partial = k + k * lp + log_t.max(lp);
+      let partial = k
+        .checked_mul(lp)
+        .and_then(|x| x.checked_add(k))
+        .and_then(|x| x.checked_add(log_t.max(lp)))
+        .ok_or_else(|| params_overflow("k + k*log_p + max(log_t, log_p)"))?;
       if partial < log_q {
         log_p = lp;
       } else {
@@ -179,7 +190,7 @@ impl IntEvalParams {
     }
     let s = (LAMBDA as f64 / bits_per_prime).ceil() as usize;
 
-    let nl = numlimb(log_t_f, log_t);
+    let nl = nl_pre;
     let p = Self {
       log_q,
       k,
@@ -215,7 +226,7 @@ impl IntEvalParams {
     log_t_f: usize,
     num_vars: usize,
   ) -> Result<Self, SpartanError> {
-    let nl = numlimb(log_t_f, log_t);
+    let nl = checked_numlimb(log_t_f, log_t)?;
     let p = Self {
       log_q: LOG_Q,
       k,
@@ -237,13 +248,23 @@ impl IntEvalParams {
   /// `num_vars + numlimb_var` variables, and that's what enters the
   /// soundness bounds.
   pub fn validate(&self, num_vars: usize) -> Result<(), SpartanError> {
-    let num_vars_total = num_vars + self.numlimb_var;
+    // `k = 0` would divide by zero in the iteration-layer formulas and
+    // makes no protocol sense (zero variables consumed per iteration).
+    if self.k == 0 {
+      return Err(SpartanError::InvalidInputLength {
+        reason: "IntEvalParams: k must be positive".to_string(),
+      });
+    }
+    let num_vars_total = num_vars
+      .checked_add(self.numlimb_var)
+      .ok_or_else(|| params_overflow("num_vars + numlimb_var"))?;
 
     // Limb-decomposition self-consistency: `numlimb` and `numlimb_var`
     // must match the formulas implied by `(log_t, log_t_f)`. Catches
     // hand-rolled `IntEvalParams { ... }` literals that get the
-    // relation wrong.
-    let expected_nl = numlimb(self.log_t_f, self.log_t);
+    // relation wrong (and rejects `log_t = 0` before the asserting
+    // `numlimb` helper would panic).
+    let expected_nl = checked_numlimb(self.log_t_f, self.log_t)?;
     if self.numlimb != expected_nl {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
@@ -264,7 +285,12 @@ impl IntEvalParams {
 
     // Final Evaluation Bound: 2^k * P^(k+1) < q
     //   log: k + (k+1)·log_p < log_q
-    let final_eval_lhs = self.k + (self.k + 1) * self.log_p;
+    let final_eval_lhs = self
+      .k
+      .checked_add(1)
+      .and_then(|x| x.checked_mul(self.log_p))
+      .and_then(|x| x.checked_add(self.k))
+      .ok_or_else(|| params_overflow("k + (k+1)*log_p"))?;
     if final_eval_lhs >= self.log_q {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
@@ -278,7 +304,12 @@ impl IntEvalParams {
     //   log (approximate, dropping the -P-1 below q): k + k·log_p + max(log_t, log_p) < log_q
     // Uses `log_t` (the *limb* bound), not `log_t_f`, since IntEval
     // operates on the (possibly limb-split) polynomial.
-    let partial_norm_lhs = self.k + self.k * self.log_p + self.log_t.max(self.log_p);
+    let partial_norm_lhs = self
+      .k
+      .checked_mul(self.log_p)
+      .and_then(|x| x.checked_add(self.k))
+      .and_then(|x| x.checked_add(self.log_t.max(self.log_p)))
+      .ok_or_else(|| params_overflow("k + k*log_p + max(log_t, log_p)"))?;
     if partial_norm_lhs >= self.log_q {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
@@ -316,8 +347,18 @@ impl IntEvalParams {
     // target `LAMBDA_BOUND2` (117, not λ = 128 — see its doc comment).
     //   log: log(s·n) - log_q <= -target
     //   <=>  log_q >= target + log(s·n)
-    let log_sn = ceil_log2((self.s * num_vars).max(1));
-    if self.log_q < LAMBDA_BOUND2 + log_sn {
+    let log_sn = ceil_log2(
+      self
+        .s
+        .checked_mul(num_vars)
+        .ok_or_else(|| params_overflow("s * num_vars"))?
+        .max(1),
+    );
+    if self.log_q
+      < LAMBDA_BOUND2
+        .checked_add(log_sn)
+        .ok_or_else(|| params_overflow("target + log(s*n)"))?
+    {
       return Err(SpartanError::InvalidInputLength {
         reason: format!(
           "IntEval Soundness Bound 2 violated: log_q = {} < target + log(s·n) = {}",
@@ -410,10 +451,13 @@ impl IntEvalParams {
     let mut best: Option<(f64, Self)> = None;
     let mut last_err: Option<SpartanError> = None;
     for &log_t in &log_t_candidates {
-      let nlv = numlimb_var(numlimb(log_t_f, log_t));
+      let nlv = numlimb_var(checked_numlimb(log_t_f, log_t)?);
       // k > n_tot behaves like k = n_tot (zero iterations) but only
       // tightens the norm bounds, so cap the search there.
-      let k_max = (num_vars + nlv).max(1);
+      let k_max = num_vars
+        .checked_add(nlv)
+        .ok_or_else(|| params_overflow("num_vars + numlimb_var"))?
+        .max(1);
       for k in 1..=k_max {
         match Self::derive(log_t_f, log_t, k, num_vars) {
           Ok(p) => {
@@ -442,6 +486,29 @@ impl IntEvalParams {
       })
     })
   }
+}
+
+/// The error every checked `IntEvalParams`/chunk-layout arithmetic path
+/// maps overflow to: malformed public parameters must return
+/// `SpartanError`, never panic, truncate, or overflow first.
+fn params_overflow(what: &str) -> SpartanError {
+  SpartanError::InvalidInputLength {
+    reason: format!("IntEvalParams: {what} overflows usize"),
+  }
+}
+
+/// Checked limb-count helper: rejects `log_t = 0` (the asserting
+/// [`numlimb`] would panic) and overflow in the ceiling division.
+fn checked_numlimb(log_t_f: usize, log_t: usize) -> Result<usize, SpartanError> {
+  if log_t == 0 {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "IntEvalParams: log_t must be positive".to_string(),
+    });
+  }
+  log_t_f
+    .checked_add(log_t - 1)
+    .map(|x| (x / log_t).max(1))
+    .ok_or_else(|| params_overflow("ceil(log_t_f / log_t)"))
 }
 
 /// Ceiling `log_2`. `ceil_log2(0)` returns 0 (callers guard with `.max(1)`).
@@ -509,6 +576,29 @@ pub struct IntegerModCommitmentKey {
   pub(crate) inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   pub(crate) eval: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
   pub(crate) params: IntEvalParams,
+  /// Maximum committable polynomial length: the capacity the inner Hyrax
+  /// key (and every `f_chunk_len` the key implies) was validated for.
+  pub(crate) max_n: usize,
+}
+
+impl IntegerModCommitmentKey {
+  /// The shared fallible constructor (see [`validate_key_capacity`]):
+  /// every Hyrax-side integer commitment key is built through here, so a
+  /// stored key always carries a validated `(params, max_n)` pair.
+  fn new_checked(
+    inner: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+    eval: <Hyrax as PCSEngineTrait<T256HyraxEngine>>::CommitmentKey,
+    params: IntEvalParams,
+    max_n: usize,
+  ) -> Result<Self, SpartanError> {
+    validate_key_capacity(&params, max_n)?;
+    Ok(Self {
+      inner,
+      eval,
+      params,
+      max_n,
+    })
+  }
 }
 
 /// Verifier key wraps Hyrax's plus the IntEval parameters.
@@ -937,6 +1027,54 @@ fn pack_bitmap(bits: &[bool]) -> Vec<u8> {
 /// [`BatchDims::new`] and the committed-chunk layout of [`commit`].
 fn chunk_stride(log_bound: usize) -> usize {
   log_bound.div_ceil(CHUNK_BITS).next_power_of_two().max(2)
+}
+
+/// Checked variant of [`chunk_stride`]: the ceiling division uses
+/// `checked_add` and the power-of-two rounding uses
+/// `checked_next_power_of_two`, so a malformed `log_bound` returns
+/// `SpartanError` instead of overflowing.
+fn checked_chunk_stride(log_bound: usize) -> Result<usize, SpartanError> {
+  let ceil = log_bound
+    .checked_add(CHUNK_BITS - 1)
+    .map(|x| x / CHUNK_BITS)
+    .ok_or_else(|| params_overflow("ceil(log_bound / 16)"))?;
+  ceil
+    .checked_next_power_of_two()
+    .map(|x| x.max(2))
+    .ok_or_else(|| params_overflow("chunk_stride next_power_of_two"))
+}
+
+/// The single source of truth for the committed-chunk length of an
+/// `n`-coefficient integer polynomial under `params`:
+/// `n · 2^numlimb_var · chunk_stride(log_t)`, all arithmetic checked.
+/// The limb-index shift is realized as a checked multiply (a bare
+/// `checked_shl` only bounds the shift amount, not the shifted-out bits);
+/// `numlimb_var` is first bounds-checked through `u32::try_from`.
+pub fn f_chunk_len(params: &IntEvalParams, n: usize) -> Result<usize, SpartanError> {
+  let shift =
+    u32::try_from(params.numlimb_var).map_err(|_| params_overflow("numlimb_var as u32"))?;
+  let limb_mult = 1usize
+    .checked_shl(shift)
+    .ok_or_else(|| params_overflow("2^numlimb_var"))?;
+  let stride = checked_chunk_stride(params.log_t)?;
+  n.checked_mul(limb_mult)
+    .and_then(|x| x.checked_mul(stride))
+    .ok_or_else(|| params_overflow("n * 2^numlimb_var * chunk_stride(log_t)"))
+}
+
+/// Shared fallible key-capacity validation for both integer Mod-PCS
+/// commitment keys: rejects a zero capacity, validates the params at
+/// `ceil_log2(max_n)` variables, and validates the inflated chunk length
+/// before any key stores `max_n`.
+fn validate_key_capacity(params: &IntEvalParams, max_n: usize) -> Result<(), SpartanError> {
+  if max_n == 0 {
+    return Err(SpartanError::InvalidInputLength {
+      reason: "integer Mod-PCS commitment key: capacity must be positive".to_string(),
+    });
+  }
+  params.validate(ceil_log2(max_n))?;
+  f_chunk_len(params, max_n)?;
+  Ok(())
 }
 
 /// Build the stacked chunk polynomial of one `(num_polys, n_values,
@@ -1538,21 +1676,12 @@ impl IntegerModPCS {
     ),
     SpartanError,
   > {
-    let num_vars = ceil_log2(n.max(1));
-    params.validate(num_vars)?;
+    validate_key_capacity(&params, n)?;
     // Hyrax CK must be sized for the *committed chunk* polynomial: the
     // input poly has `n` coefficients, each limb-split into
     // `2^numlimb_var` slots and each limb chunk-decomposed into
-    // `chunk_stride(log_t)` base-2^16 slots.
-    let inflated_n = n
-      .checked_shl(params.numlimb_var as u32)
-      .and_then(|x| x.checked_mul(chunk_stride(params.log_t)))
-      .ok_or(SpartanError::InvalidInputLength {
-        reason: format!(
-          "n={n} * 2^numlimb_var={} * chunk_stride overflows usize",
-          params.numlimb_var
-        ),
-      })?;
+    // `chunk_stride(log_t)` base-2^16 slots — exactly `f_chunk_len`.
+    let inflated_n = f_chunk_len(&params, n)?;
     let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
     // Size-1 eval key for the internal `G^{f_y}` eval commitments (kept
     // inside the Mod-PCS key, off the PCS-agnostic trait surface).
@@ -1563,11 +1692,7 @@ impl IntegerModPCS {
     // keys (mirrors the pre-refactor `precompute_ck(&ck_s)`).
     Hyrax::precompute_ck(&eval_ck);
     Ok((
-      IntegerModCommitmentKey {
-        inner: inner_ck,
-        eval: eval_ck.clone(),
-        params: params.clone(),
-      },
+      IntegerModCommitmentKey::new_checked(inner_ck, eval_ck.clone(), params.clone(), n)?,
       IntegerModVerifierKey {
         inner: inner_vk,
         eval: eval_ck,
@@ -1626,20 +1751,18 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
       "default IntEvalParams derivation must satisfy the paper's bounds; \
          override with `setup_with_params` to use tighter parameters",
     );
-    let inflated_n = n
-      .checked_shl(params.numlimb_var as u32)
-      .and_then(|x| x.checked_mul(chunk_stride(params.log_t)))
-      .expect("n * 2^numlimb_var * chunk_stride overflows usize");
+    let inflated_n = f_chunk_len(&params, n)
+      .expect("library-derived default parameters imply a valid f_chunk_len");
     let (inner_ck, inner_vk) = Hyrax::setup(label, inflated_n, width);
     let (eval_ck, _) = Hyrax::setup(b"imod_modpcs_eval", 1, 1);
     // Precompute the eval key once at setup (see `setup_with_params`).
     Hyrax::precompute_ck(&eval_ck);
     (
-      IntegerModCommitmentKey {
-        inner: inner_ck,
-        eval: eval_ck.clone(),
-        params: params.clone(),
-      },
+      // The infallible trait boundary: this constructor call only sees
+      // library-derived, already-validated parameters, so the single
+      // invariant-backed expect is unreachable for a valid trait call.
+      IntegerModCommitmentKey::new_checked(inner_ck, eval_ck.clone(), params.clone(), n)
+        .expect("library-derived default parameters must validate at this capacity"),
       IntegerModVerifierKey {
         inner: inner_vk,
         eval: eval_ck,
@@ -1656,13 +1779,24 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
   }
 
   fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+    // Documented caller contract for the infallible trait boundary: the
+    // key was validated for `max_n`, and `f_chunk_len` is monotone in
+    // `n`, so any `n <= max_n` has a valid inflated length. A caller
+    // violating the capacity contract gets this deliberate assertion,
+    // not an accidental overflow.
+    assert!(
+      n <= ck.max_n,
+      "IntegerModPCS::blind: n = {n} exceeds the commitment-key capacity {}",
+      ck.max_n
+    );
     // `commit` limb-splits an `n`-coefficient polynomial to
     // `2^numlimb_var · n` coefficients and chunk-decomposes each limb
     // into `chunk_stride(log_t)` base-2^16 slots before reaching the
     // inner Hyrax PCS, so the blind must cover that inflated length.
     // (Size-1 eval commits skip splitting in `commit`; an over-long
     // blind is harmless there.)
-    let inflated = (n << ck.params.numlimb_var) * chunk_stride(ck.params.log_t);
+    let inflated =
+      f_chunk_len(&ck.params, n).expect("f_chunk_len validated for commitment-key capacity");
     IntegerModBlind {
       inner: Hyrax::blind(&ck.inner, inflated),
     }
@@ -1688,6 +1822,15 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     // (e.g. the eval-value commitment); the value may be any F element,
     // not bounded by `T_f`, so skip splitting/chunking and the small-
     // scalar path in that case.
+    //
+    // Capacity check independent of `blind`, so bypassing `blind` cannot
+    // bypass the key's validated capacity.
+    if v.len() > ck.max_n {
+      return Err(SpartanError::InvalidVectorSize {
+        actual: v.len(),
+        max: ck.max_n,
+      });
+    }
     let params = &ck.params;
     if v.len() == 1 {
       let v_fq: Vec<t256::Scalar> = v.iter().map(biguint_to_scalar).collect();
@@ -1891,6 +2034,19 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify_batch");
     Ok(())
   }
+
+  /// Explicit traversal of every `DynPrime<2>` the batch argument
+  /// carries: there are none. The IntEval argument stores all p-side data
+  /// as `BigUint`/`BigInt` (`reduction_round_polys`, `int_v_prime`) and
+  /// everything else — chains, range check, combined opening — as q-side
+  /// static scalars, commitments, and group values, which need no
+  /// context check.
+  fn batch_arg_is_in_context(
+    _arg: &Self::BatchEvaluationArgument,
+    _expected: &<<T256DynPrimeEngine as SumcheckEngine>::Scalar as SumcheckField>::Params,
+  ) -> bool {
+    true
+  }
 }
 
 /// The Brakedown-backed integer Mod-PCS: the same IntEval protocol as
@@ -1902,12 +2058,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
 #[derive(Clone, Debug)]
 pub struct IntegerModPCSBd<SE = T256HyraxEngine>(core::marker::PhantomData<SE>);
 
-/// Commitment key for the Brakedown Mod-PCS: only the IntEval
-/// parameters (Brakedown itself needs no key material — its code
-/// matrices derive from a public seed).
+/// Commitment key for the Brakedown Mod-PCS: the IntEval parameters plus
+/// the validated capacity (Brakedown itself needs no key material — its
+/// code matrices derive from a public seed).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BdModCommitmentKey {
   pub(crate) params: IntEvalParams,
+  /// Maximum committable polynomial length the key was validated for.
+  pub(crate) max_n: usize,
 }
 
 /// Verifier key: same content as the commitment key.
@@ -1930,9 +2088,13 @@ impl TranscriptReprTrait for BdModCommitment {
 }
 
 impl BdModCommitmentKey {
-  /// Key from explicit IntEval params (Brakedown needs no key material).
-  pub fn new(params: IntEvalParams) -> Self {
-    Self { params }
+  /// Key from explicit IntEval params and the polynomial capacity it must
+  /// serve. Rejects a zero capacity, validates the params at that
+  /// capacity, and validates the implied `f_chunk_len` (see
+  /// [`validate_key_capacity`]).
+  pub fn new(params: IntEvalParams, max_n: usize) -> Result<Self, SpartanError> {
+    validate_key_capacity(&params, max_n)?;
+    Ok(Self { params, max_n })
   }
 }
 
@@ -1977,16 +2139,26 @@ where
          override with `setup_with_params` to use tighter parameters",
     );
     (
-      BdModCommitmentKey {
-        params: params.clone(),
-      },
+      // Infallible trait boundary: library-derived validated params, so
+      // the single invariant-backed expect is unreachable for a valid
+      // trait call.
+      BdModCommitmentKey::new(params.clone(), n)
+        .expect("library-derived default parameters must validate at this capacity"),
       BdModVerifierKey { params },
     )
   }
 
   fn precompute_ck(_ck: &Self::CommitmentKey) {}
 
-  fn blind(_ck: &Self::CommitmentKey, _n: usize) -> Self::Blind {}
+  fn blind(ck: &Self::CommitmentKey, n: usize) -> Self::Blind {
+    // Same documented caller contract as the Hyrax impl; the blind itself
+    // is a unit for this non-hiding backend.
+    assert!(
+      n <= ck.max_n,
+      "IntegerModPCSBd::blind: n = {n} exceeds the commitment-key capacity {}",
+      ck.max_n
+    );
+  }
 
   fn commit(
     ck: &Self::CommitmentKey,
@@ -1995,6 +2167,15 @@ where
   ) -> Result<Self::Commitment, SpartanError> {
     // Identical chunk layout to the Hyrax Mod-PCS (the protocol's
     // committed-chunk representation), committed with Brakedown.
+    //
+    // Capacity check independent of `blind`, so bypassing `blind` cannot
+    // bypass the key's validated capacity.
+    if v.len() > ck.max_n {
+      return Err(SpartanError::InvalidVectorSize {
+        actual: v.len(),
+        max: ck.max_n,
+      });
+    }
     let params = &ck.params;
     let v_limbs = limb_split_polynomial(v, params.log_t, params.log_t_f);
     let chunk_vals = build_chunk_poly(&[&v_limbs], v_limbs.len(), params.log_t);
@@ -2195,6 +2376,17 @@ where
     )?;
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_bd_verify_batch");
     Ok(())
+  }
+
+  /// Explicit traversal of every `ME::Scalar` (`DynPrime<2>`) the batch
+  /// argument carries: there are none — identical reasoning to the Hyrax
+  /// impl (p-side data is `BigUint`/`BigInt`; chains, range check, and
+  /// combined opening are q-side static scalars and hashes).
+  fn batch_arg_is_in_context(
+    _arg: &Self::BatchEvaluationArgument,
+    _expected: &<<ME as SumcheckEngine>::Scalar as SumcheckField>::Params,
+  ) -> bool {
+    true
   }
 }
 
@@ -5923,5 +6115,99 @@ mod tests {
     let chunk_fq: Vec<t256::Scalar> = chunks.iter().map(|&c| scalar_from_chunk(c)).collect();
     let direct = Hyrax::commit(&ck.inner, &chunk_fq, &blind.inner, true).unwrap();
     assert_eq!(comm.inner, direct);
+  }
+
+  /// `checked_chunk_stride` / `f_chunk_len` boundary behavior: normal
+  /// table values, checked ceiling addition, the `usize -> u32` shift
+  /// conversion, shift overflow, and multiply overflow all return
+  /// `SpartanError` instead of panicking or wrapping.
+  #[test]
+  fn f_chunk_len_boundaries() {
+    // Normal values: chunk_stride(64) = 4; the benchmark memory table
+    // (log_t_f = 256, log_t = 64 → numlimb = 4, numlimb_var = 2).
+    assert_eq!(checked_chunk_stride(64).unwrap(), 4);
+    assert_eq!(checked_chunk_stride(64).unwrap(), chunk_stride(64));
+    let params = IntEvalParams::derive(256, 64, 9, 13).unwrap();
+    assert_eq!(params.numlimb, 4);
+    assert_eq!(params.numlimb_var, 2);
+    assert_eq!(f_chunk_len(&params, 1 << 13).unwrap(), 1 << 17);
+    assert_eq!(f_chunk_len(&params, 1 << 17).unwrap(), 1 << 21);
+    assert_eq!(f_chunk_len(&params, 1 << 21).unwrap(), 1 << 25);
+
+    // Checked stride: the ceiling addition overflows.
+    assert!(checked_chunk_stride(usize::MAX).is_err());
+
+    // Multiply overflow in the final product.
+    assert!(f_chunk_len(&params, usize::MAX).is_err());
+
+    // Shift-amount overflow (2^numlimb_var no longer fits usize) via a
+    // hand-rolled params literal; the u32 conversion path needs a value
+    // above u32::MAX, which usize accommodates on 64-bit targets.
+    let mut absurd = params.clone();
+    absurd.numlimb_var = usize::BITS as usize;
+    assert!(f_chunk_len(&absurd, 4).is_err());
+    absurd.numlimb_var = u32::MAX as usize + 1;
+    assert!(f_chunk_len(&absurd, 4).is_err());
+  }
+
+  /// Malformed public parameters return errors, never panic: `log_t = 0`
+  /// (the asserting `numlimb` path) and `k = 0` (the `div_ceil(k)` path).
+  #[test]
+  fn params_reject_zero_log_t_and_zero_k() {
+    assert!(IntEvalParams::derive(256, 0, 9, 13).is_err());
+    assert!(IntEvalParams::derive(256, 64, 0, 13).is_err());
+    assert!(IntEvalParams::explicit(0, 20, 15, 64, 256, 13).is_err());
+    let mut params = IntEvalParams::derive(256, 64, 9, 13).unwrap();
+    params.k = 0;
+    assert!(params.validate(13).is_err());
+    let mut params = IntEvalParams::derive(256, 64, 9, 13).unwrap();
+    params.log_t = 0;
+    assert!(params.validate(13).is_err());
+  }
+
+  /// Key-capacity contract: zero capacity is rejected at construction for
+  /// both backends; an over-capacity vector is rejected by `commit` with
+  /// `InvalidVectorSize` (independent of `blind`).
+  #[test]
+  fn key_capacity_is_enforced() {
+    let params = IntEvalParams::derive(32, 16, 9, 4).unwrap();
+    // Zero capacity rejected.
+    assert!(IntegerModPCS::setup_with_params(b"cap-test", 0, 4, params.clone()).is_err());
+    assert!(BdModCommitmentKey::new(params.clone(), 0).is_err());
+
+    // Hyrax: commit rejects an over-capacity vector.
+    let n = 16usize;
+    let (ck, _vk) = IntegerModPCS::setup_with_params(b"cap-test", n, 4, params.clone()).unwrap();
+    assert_eq!(ck.max_n, n);
+    let blind = <IntegerModPCS as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let long: Vec<BigUint> = (0..n + 1).map(|i| BigUint::from(i as u32)).collect();
+    match <IntegerModPCS as ModPCSEngineTrait<ME>>::commit(&ck, &long, &blind) {
+      Err(SpartanError::InvalidVectorSize { actual, max }) => {
+        assert_eq!((actual, max), (n + 1, n));
+      }
+      other => panic!("expected InvalidVectorSize, got {other:?}"),
+    }
+
+    // Brakedown: same check through its own commit.
+    let bd_ck = BdModCommitmentKey::new(params, n).unwrap();
+    assert_eq!(bd_ck.max_n, n);
+    type BdMP = IntegerModPCSBd;
+    type BE = crate::provider::T256DynPrimeBdEngine;
+    match <BdMP as ModPCSEngineTrait<BE>>::commit(&bd_ck, &long, &()) {
+      Err(SpartanError::InvalidVectorSize { actual, max }) => {
+        assert_eq!((actual, max), (n + 1, n));
+      }
+      other => panic!("expected InvalidVectorSize, got {other:?}"),
+    }
+  }
+
+  /// `blind` documents `n <= max_n` as a caller contract and enforces it
+  /// with a deliberate assertion, not an accidental overflow.
+  #[test]
+  #[should_panic(expected = "exceeds the commitment-key capacity")]
+  fn blind_asserts_the_capacity_contract() {
+    let params = IntEvalParams::derive(32, 16, 9, 4).unwrap();
+    let (ck, _vk) = IntegerModPCS::setup_with_params(b"cap-test", 16, 4, params).unwrap();
+    let _ = <IntegerModPCS as ModPCSEngineTrait<ME>>::blind(&ck, 17);
   }
 }

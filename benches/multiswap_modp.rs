@@ -750,7 +750,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let t1 = Instant::now();
     let proof = IntModSpartanModpSNARK::<BE>::prove(&pk, &instance, &witness).unwrap();
     let t_prove = t1.elapsed().as_secs_f64() * 1e3;
-    let proof_bytes = proof.eval_arg_size();
+    let proof_bytes = proof.eval_arg_bytes().expect("eval_arg serializes").len();
     let t2 = Instant::now();
     proof.verify(&vk, &instance).unwrap();
     let t_verify = t2.elapsed().as_secs_f64() * 1e3;
@@ -780,7 +780,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
   }
 
   // PSIZE=1: serialized proof size of the Hyrax-backed instantiation on
-  // the standard workload. `eval_arg_size` covers the Mod-PCS batch
+  // the standard workload. `eval_arg_bytes` covers the Mod-PCS batch
   // argument (commitments, GKR, combined opening) — the dominant part;
   // the dynamic-prime side (outer/inner sumcheck round polynomials and
   // claimed evals, ~1.2 KB at 2^13) is not yet `Serialize` and is
@@ -846,7 +846,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let proof = IntModSpartanModpSNARK::<M>::prove(&pk, &instance, &witness).unwrap();
     let total = t0.elapsed().as_secs_f64();
     proof.verify(&vk, &instance).unwrap();
-    let arg_bytes = proof.eval_arg_size();
+    let arg_bytes = proof.eval_arg_bytes().expect("eval_arg serializes").len();
     let (pp, rc, co) = proof.eval_arg_component_sizes();
     println!("  breakdown: per_poly {pp} B, range_check {rc} B, combined_open {co} B");
     // PSDUMP=<path>: write the serialized eval_arg so its compressed

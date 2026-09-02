@@ -50,6 +50,21 @@ type ModCK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::CommitmentKey;
 type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
 type ModBatchEvalArg<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::BatchEvaluationArgument;
 
+/// Canonical proof-component serialization: bincode 1.3 with
+/// `DefaultOptions` pinned to little-endian, fixed-int encoding (the
+/// crate's canonical bincode configuration). Every bincode error maps to
+/// [`SpartanError::SerializationError`] — never to a zero size.
+pub(crate) fn to_canonical_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, SpartanError> {
+  use bincode::Options;
+  bincode::DefaultOptions::new()
+    .with_little_endian()
+    .with_fixint_encoding()
+    .serialize(value)
+    .map_err(|e| SpartanError::SerializationError {
+      reason: format!("canonical bincode serialization failed: {e}"),
+    })
+}
+
 /// Convert a `BigUint` integer into an `M::Scalar` value by reducing
 /// modulo the runtime modulus carried in `params`.
 fn biguint_to_scalar<M: ModEngine>(v: &BigUint, params: &MParams<M>) -> MScalar<M> {
@@ -136,7 +151,7 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeEngine> {
 
   /// Per-component serialized sizes of the batch evaluation argument:
   /// `(per_poly, range_check, combined_open)` bytes. Proof-size
-  /// accounting; see `eval_arg_size` for the total.
+  /// accounting; see `eval_arg_bytes` for the exact total bytes.
   pub fn eval_arg_component_sizes(&self) -> (usize, usize, usize) {
     self.eval_arg.component_sizes()
   }
@@ -194,7 +209,9 @@ impl IntModSpartanModpSNARK<crate::provider::T256DynPrimeBdEngine> {
     let n = shape.num_vars.max(shape.num_cons);
     let num_vars = n.max(1).ilog2() as usize + if n.is_power_of_two() { 0 } else { 1 };
     params.validate(num_vars)?;
-    let ck = crate::provider::pcs::integer_modpcs::BdModCommitmentKey::new(params.clone());
+    // The fallible key constructor revalidates at the key's own capacity
+    // (the original polynomial length `n`).
+    let ck = crate::provider::pcs::integer_modpcs::BdModCommitmentKey::new(params.clone(), n)?;
     let vk = crate::provider::pcs::integer_modpcs::BdModVerifierKey::new(params);
     Ok(Self::assemble_keys(shape, ck, vk))
   }
@@ -222,9 +239,38 @@ impl IntModSpartanModpSNARK<crate::provider::M127DynPrimeBdEngine> {
     let n = shape.num_vars.max(shape.num_cons);
     let num_vars = n.max(1).ilog2() as usize + if n.is_power_of_two() { 0 } else { 1 };
     params.validate(num_vars)?;
-    let ck = crate::provider::pcs::integer_modpcs::BdModCommitmentKey::new(params.clone());
+    // The fallible key constructor revalidates at the key's own capacity
+    // (the original polynomial length `n`).
+    let ck = crate::provider::pcs::integer_modpcs::BdModCommitmentKey::new(params.clone(), n)?;
     let vk = crate::provider::pcs::integer_modpcs::BdModVerifierKey::new(params);
     Ok(Self::assemble_keys(shape, ck, vk))
+  }
+}
+
+impl<M: ModEngine> IntModSpartanModpSNARK<M> {
+  /// Whether every dynamic-field scalar this proof carries belongs to the
+  /// modulus context `expected`: every outer/inner sumcheck round-poly
+  /// coefficient, the five outer claims, `eval_w`, and — delegated to the
+  /// required Mod-PCS hook — the complete evaluation argument. Called by
+  /// `verify` immediately after re-sampling the runtime prime and before
+  /// any proof arithmetic, so a proof from a foreign context is rejected
+  /// cleanly instead of panicking inside `crypto-bigint`.
+  fn is_in_context(&self, expected: &MParams<M>) -> bool {
+    self.sc_outer.is_in_context(expected)
+      && [self.v_a, self.v_b, self.v_c, self.v_m, self.v_q]
+        .iter()
+        .all(|v| v.is_in_context(expected))
+      && self.sc_inner.is_in_context(expected)
+      && self.eval_w.is_in_context(expected)
+      && <ModPCS<M> as ModPCSEngineTrait<M>>::batch_arg_is_in_context(&self.eval_arg, expected)
+  }
+
+  /// Exact canonical bytes of the Mod-PCS batch evaluation argument (the
+  /// dominant proof component), under the crate's pinned bincode
+  /// configuration. Errors propagate as `SerializationError` — unlike the
+  /// removed `eval_arg_size`, a failure is never reported as zero bytes.
+  pub fn eval_arg_bytes(&self) -> Result<Vec<u8>, SpartanError> {
+    to_canonical_bytes(&self.eval_arg)
   }
 }
 
@@ -232,6 +278,25 @@ impl<M> IntModSpartanModpSNARK<M>
 where
   M: ModEngine<TE = Keccak256Transcript<M>>,
 {
+  /// Re-derive the runtime-prime context a verifier would sample for
+  /// `(vk, U)`: replays the pre-`p` transcript absorption of
+  /// `prove`/`verify`. Crate-internal test/bench support for the context
+  /// regression fixtures.
+  #[cfg(test)]
+  pub(crate) fn resample_params(
+    vk: &IntModSpartanModpVerifierKey<M>,
+    U: &IntModR1CSInstanceModp<M>,
+  ) -> MParams<M> {
+    let mut transcript =
+      Keccak256Transcript::<M>::new_with_params(b"IntModSpartanModpSNARK", M::bootstrap_params());
+    transcript.absorb_bytes(b"vk", &vk.digest);
+    transcript.absorb(b"comm_w", &U.comm_w);
+    transcript.absorb(b"comm_q", &U.comm_q);
+    for xi in &U.x {
+      transcript.absorb_bytes(b"x", &xi.to_bytes_le());
+    }
+    M::sample_params(&mut transcript)
+  }
   /// Setup: derive prover and verifier keys from the shape.
   pub fn setup(
     shape: IntModR1CSShapeModp<M>,
@@ -244,17 +309,6 @@ where
   > {
     let (ck, vk_ee) = shape.commitment_key();
     Ok(Self::assemble_keys(shape, ck, vk_ee))
-  }
-
-  /// Serialized size of the Mod-PCS evaluation argument — the dominant
-  /// proof component (the sumcheck round polynomials and claimed
-  /// evaluations add ~KBs of field elements on top; `DynPrime` lacks
-  /// serde, so whole-proof serialization is a separate follow-up).
-  pub fn eval_arg_size(&self) -> usize
-  where
-    ModBatchEvalArg<M>: serde::Serialize,
-  {
-    bincode::serialized_size(&self.eval_arg).map_or(0, |n| n as usize)
   }
 
   /// Shared tail of `setup` / `setup_with_params`: precompute the
@@ -479,6 +533,16 @@ where
     let params = M::sample_params(&mut transcript);
     transcript.set_params(params.clone());
     info!(elapsed_ms = %sp_t.elapsed().as_millis(), "imod_modp_sample_p");
+
+    // Context validation contract: every proof-carried dynamic-field
+    // scalar must belong to the freshly sampled context. Anything that
+    // changes the pre-`p` transcript (public IO, commitments, the vk
+    // digest) can change the sampled prime, and mixing contexts panics
+    // inside `crypto-bigint` — so reject BEFORE constructing `zero`/`one`
+    // or performing any proof arithmetic.
+    if !self.is_in_context(&params) {
+      return Err(SpartanError::InvalidFieldContext);
+    }
 
     let shape = &vk.shape;
     let num_vars = shape.num_vars;
@@ -1190,6 +1254,183 @@ mod tests {
     let (_, vk1) = IntModSpartanModpSNARK::<ME>::setup(shape1).unwrap();
     let (_, vk2) = IntModSpartanModpSNARK::<ME>::setup(shape2).unwrap();
     assert_ne!(vk1.digest(), vk2.digest());
+  }
+
+  /// The toy multi-IO circuit `w₀ · w₁ ≡ x₀ (mod 14)` with three public
+  /// values (x₁ and x₂ are transcript-bound but unconstrained), mirroring
+  /// the combined Poseidon circuit's three-digest statement. Returns
+  /// `(pk, vk, witness, instance, proof)` with `x = [x0, 2, 3]`.
+  fn public_io_fixture(
+    x0: u64,
+  ) -> (
+    IntModSpartanModpProverKey<ME>,
+    IntModSpartanModpVerifierKey<ME>,
+    IntModR1CSWitnessModp<ME>,
+    IntModR1CSInstanceModp<ME>,
+    IntModSpartanModpSNARK<ME>,
+  ) {
+    let one = BigUint::from(1u32);
+    let mat_a = vec![(0, 0, one.clone())];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 5, one)];
+    let mods = vec![BigUint::from(14u32), BigUint::from(0u32)];
+    let shape = IntModR1CSShapeModp::<ME>::new(2, 4, 3, mat_a, mat_b, mat_c, mods).unwrap();
+    // 3 · 5 = 15 ≡ 1 (mod 14): x0 = 1, q0 = 1.
+    let w: Vec<BigUint> = [3u32, 5, 0, 0].iter().map(|v| BigUint::from(*v)).collect();
+    let q: Vec<BigUint> = [1u32, 0].iter().map(|v| BigUint::from(*v)).collect();
+    let x = vec![BigUint::from(x0), BigUint::from(2u32), BigUint::from(3u32)];
+    let (pk, vk) = IntModSpartanModpSNARK::<ME>::setup(shape.clone()).unwrap();
+    let (witness, instance) = IntModR1CSWitnessModp::<ME>::new(&shape, &pk.ck, w, q, x).unwrap();
+    let proof = IntModSpartanModpSNARK::<ME>::prove(&pk, &instance, &witness).unwrap();
+    (pk, vk, witness, instance, proof)
+  }
+
+  /// In-range wrong-digest context regression: changing only ONE public
+  /// digest to another canonical value — holding the other two fixed —
+  /// changes the pre-`p` transcript and (for the searched fixture) the
+  /// sampled runtime prime; verification must return
+  /// `Err(InvalidFieldContext)` — never panic — in BOTH debug and
+  /// release. The search avoids assuming that every changed transcript
+  /// must sample a different prime.
+  #[test]
+  fn imod_modp_rejects_wrong_digest_context() {
+    let (_pk, vk, _witness, instance, proof) = public_io_fixture(1);
+    proof.verify(&vk, &instance).unwrap();
+    let proof_ctx = IntModSpartanModpSNARK::<ME>::resample_params(&vk, &instance);
+
+    let modulus = 14u64;
+    let mut tampered = None;
+    for delta in 1..modulus {
+      let mut candidate = instance.clone();
+      // Only x[0] changes; x[1] and x[2] stay fixed.
+      candidate.x[0] = BigUint::from((1 + delta) % modulus);
+      assert_eq!(candidate.x[1..], instance.x[1..]);
+      let ctx = IntModSpartanModpSNARK::<ME>::resample_params(&vk, &candidate);
+      if ctx.modulus() != proof_ctx.modulus() {
+        tampered = Some(candidate);
+        break;
+      }
+    }
+    let tampered = tampered.expect("some canonical x[0] tweak must resample a different prime");
+    assert_eq!(
+      proof.verify(&vk, &tampered),
+      Err(SpartanError::InvalidFieldContext)
+    );
+  }
+
+  /// Wrong-verifier-key context regression: a valid proof cross-bound to
+  /// a different shape's key re-samples a different prime (asserted
+  /// explicitly) and gets the same clean rejection instead of the old
+  /// `crypto-bigint` panic.
+  #[test]
+  fn imod_modp_rejects_wrong_vk_context() {
+    let (_pk, vk, _witness, instance, proof) = public_io_fixture(1);
+    proof.verify(&vk, &instance).unwrap();
+    let proof_ctx = IntModSpartanModpSNARK::<ME>::resample_params(&vk, &instance);
+
+    // Same dimensions, different A coefficient → different digest.
+    let one = BigUint::from(1u32);
+    let mat_a = vec![(0, 0, BigUint::from(2u32))];
+    let mat_b = vec![(0, 1, one.clone())];
+    let mat_c = vec![(0, 5, one)];
+    let mods = vec![BigUint::from(14u32), BigUint::from(0u32)];
+    let shape2 = IntModR1CSShapeModp::<ME>::new(2, 4, 3, mat_a, mat_b, mat_c, mods).unwrap();
+    let (_pk2, vk2) = IntModSpartanModpSNARK::<ME>::setup(shape2).unwrap();
+    assert_ne!(vk.digest(), vk2.digest());
+    let cross_ctx = IntModSpartanModpSNARK::<ME>::resample_params(&vk2, &instance);
+    assert_ne!(
+      cross_ctx.modulus(),
+      proof_ctx.modulus(),
+      "fixture requires the cross-bound key to re-sample a different prime"
+    );
+    assert_eq!(
+      proof.verify(&vk2, &instance),
+      Err(SpartanError::InvalidFieldContext)
+    );
+  }
+
+  /// Mixed-context traversal coverage: flipping ANY dynamic-field scalar
+  /// of the proof into a foreign modulus context must be caught by
+  /// `is_in_context`, so a future proof field cannot be omitted from the
+  /// traversal silently.
+  #[test]
+  fn imod_modp_context_traversal_covers_every_field() {
+    use crypto_bigint::{Odd, U128, modular::FixedMontyParams};
+    let (_pk, vk, _witness, instance, proof) = public_io_fixture(1);
+    let ctx = IntModSpartanModpSNARK::<ME>::resample_params(&vk, &instance);
+    assert!(proof.is_in_context(&ctx));
+
+    // A foreign context: 2^127 − 1 never equals the sampled 128-bit prime
+    // (whose top bit is forced set).
+    let foreign = FixedMontyParams::new(
+      Odd::new(U128::from_be_hex("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")).unwrap(),
+    );
+    let bad = MScalar::<ME>::one(&foreign);
+    assert!(!bad.is_in_context(&ctx));
+
+    let mutations: Vec<fn(&mut IntModSpartanModpSNARK<ME>, MScalar<ME>)> = vec![
+      |p, v| p.sc_outer.compressed_polys[0].coeffs_except_linear_term[0] = v,
+      |p, v| p.v_a = v,
+      |p, v| p.v_b = v,
+      |p, v| p.v_c = v,
+      |p, v| p.v_m = v,
+      |p, v| p.v_q = v,
+      |p, v| p.sc_inner.compressed_polys[0].coeffs_except_linear_term[0] = v,
+      |p, v| p.eval_w = v,
+    ];
+    for (i, mutate) in mutations.iter().enumerate() {
+      let mut tampered = proof.clone();
+      mutate(&mut tampered, bad);
+      assert!(
+        !tampered.is_in_context(&ctx),
+        "traversal branch {i} missed a foreign-context scalar"
+      );
+    }
+    // The Mod-PCS hook branch: the IntEval batch argument carries no
+    // dynamic-field scalars, so the delegated check accepts it.
+    assert!(<ModPCS<ME> as ModPCSEngineTrait<ME>>::batch_arg_is_in_context(&proof.eval_arg, &ctx));
+  }
+
+  /// The canonical-serialization helper surfaces serializer failures as
+  /// `SerializationError` (never as a zero size): exercised with a
+  /// deliberately failing `Serialize` implementation.
+  #[test]
+  fn imod_modp_canonical_bytes_error_path() {
+    struct FailingSerialize;
+    impl serde::Serialize for FailingSerialize {
+      fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("deliberate test failure"))
+      }
+    }
+    match to_canonical_bytes(&FailingSerialize) {
+      Err(SpartanError::SerializationError { reason }) => {
+        assert!(reason.contains("deliberate test failure"));
+      }
+      other => panic!("expected SerializationError, got {other:?}"),
+    }
+    // And the success path produces the pinned little-endian fixint
+    // encoding for a simple value.
+    assert_eq!(
+      to_canonical_bytes(&1u64).unwrap(),
+      vec![1, 0, 0, 0, 0, 0, 0, 0]
+    );
+  }
+
+  /// The proof-size byte serializers produce nonempty canonical bytes for
+  /// a real proof and instance.
+  #[test]
+  fn imod_modp_proof_size_bytes_roundtrip() {
+    let (_pk, vk, _witness, instance, proof) = public_io_fixture(1);
+    proof.verify(&vk, &instance).unwrap();
+    let arg = proof.eval_arg_bytes().unwrap();
+    assert!(!arg.is_empty());
+    let comms = instance.commitment_bytes().unwrap();
+    assert!(!comms.is_empty());
+    // The tuple encoding is exactly the two commitments' canonical bytes,
+    // consecutively, with no outer tag or length.
+    let cw = to_canonical_bytes(&instance.comm_w).unwrap();
+    let cq = to_canonical_bytes(&instance.comm_q).unwrap();
+    assert_eq!(comms, [cw, cq].concat());
   }
 
   /// Sanity: the transcript-sampled `p` actually differs from the curve
