@@ -891,7 +891,7 @@ fn multiswap_modp_benches(c: &mut Criterion) {
     let t1 = Instant::now();
     proof.verify(&vk, &instance).unwrap();
     let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
-    let arg_bytes = proof.eval_arg_size();
+    let arg_bytes = proof.eval_arg_bytes().expect("serialize eval_arg").len();
     let (pp, rc, co) = proof.eval_arg_component_sizes();
     println!("  breakdown: per_poly {pp} B, range_check {rc} B, combined_open {co} B");
     // PSDUMP=<path>: write the serialized eval_arg so its compressed

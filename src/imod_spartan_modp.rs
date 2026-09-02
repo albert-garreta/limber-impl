@@ -340,7 +340,9 @@ where
     let mut transcript =
       Keccak256Transcript::<M>::new_with_params(b"IntModSpartanModpSNARK", M::bootstrap_params());
     transcript.absorb_bytes(b"vk", &vk.digest);
-    transcript.absorb(b"comm_w", &U.comm_w);
+    for cw in &U.comm_w {
+      transcript.absorb(b"comm_w", cw);
+    }
     transcript.absorb(b"comm_q", &U.comm_q);
     for xi in &U.x {
       transcript.absorb_bytes(b"x", &xi.to_bytes_le());

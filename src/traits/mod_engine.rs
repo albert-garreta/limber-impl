@@ -520,4 +520,18 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
       reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
     })
   }
+
+  /// Whether the batch evaluation argument carries no sampled-prime
+  /// (`E::Scalar`) data outside `expected` — the Mod-PCS counterpart of
+  /// [`SumcheckField::is_in_context`], checked by verify to reject a proof
+  /// built under different params. Defaults to `true`: a Mod-PCS whose
+  /// argument is pure q-side data (static scalars and hashes, independent
+  /// of the sampled prime) is always in context. Backends whose argument
+  /// embeds `E::Scalar` data override this.
+  fn batch_arg_is_in_context(
+    _arg: &Self::BatchEvaluationArgument,
+    _expected: &<E::Scalar as SumcheckField>::Params,
+  ) -> bool {
+    true
+  }
 }
