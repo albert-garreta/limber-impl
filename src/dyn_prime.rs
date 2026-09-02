@@ -120,6 +120,10 @@ impl<const LIMBS: usize> SumcheckField for DynPrime<LIMBS> {
     self.retrieve().to_le_bytes().as_slice().to_vec()
   }
 
+  fn is_in_context(&self, expected: &Self::Params) -> bool {
+    self.params().modulus() == expected.modulus()
+  }
+
   fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self {
     let n = Uint::<LIMBS>::BYTES;
     if bytes.len() <= n {

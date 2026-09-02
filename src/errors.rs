@@ -107,4 +107,14 @@ pub enum SpartanError {
     /// The maximum size that can be handled
     max: usize,
   },
+  /// returned when a proof carries field elements whose runtime-modulus
+  /// context differs from the one the verifier derived from the transcript
+  #[error("InvalidFieldContext")]
+  InvalidFieldContext,
+  /// returned when canonical serialization of a proof component fails
+  #[error("SerializationError: {reason}")]
+  SerializationError {
+    /// The reason for the serialization failure
+    reason: String,
+  },
 }

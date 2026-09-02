@@ -139,38 +139,124 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
 /// earlier through the ModPCS surface. Purely a prover-side
 /// memoization: on a miss the data is recomputed and checked against
 /// the expected root.
+///
+/// Carries fixed audit instrumentation (per-field-type hit / miss /
+/// re-encode / wholesale-clear counters), updated under the cache's own
+/// mutex — no extra atomic or lock — and enabled for every Brakedown
+/// run, so an audited run never measures a different binary from an
+/// unaudited one. Instance-based so unit tests can exercise a private
+/// instance deterministically; production uses one process-global
+/// instance ([`bd_retained_cache`]).
+struct BdRetainedCache {
+  state: Mutex<BdRetainedCacheState>,
+}
+
+#[derive(Default)]
+struct BdRetainedCacheState {
+  map: HashMap<(std::any::TypeId, [u8; 32]), Box<dyn std::any::Any + Send + Sync>>,
+  stats: HashMap<std::any::TypeId, super::BdRetainedCacheStats>,
+}
+
+impl BdRetainedCache {
+  fn new() -> Self {
+    Self {
+      state: Mutex::new(BdRetainedCacheState::default()),
+    }
+  }
+
+  fn put<F: 'static>(&self, root: [u8; 32], data: Box<dyn std::any::Any + Send + Sync>) {
+    let mut guard = self.state.lock().expect("bd data cache poisoned");
+    if guard.map.len() >= 8 {
+      // Wholesale clear, not LRU eviction; attributed to the inserting
+      // field type.
+      guard.map.clear();
+      guard
+        .stats
+        .entry(std::any::TypeId::of::<F>())
+        .or_default()
+        .wholesale_clears += 1;
+    }
+    guard.map.insert((std::any::TypeId::of::<F>(), root), data);
+  }
+
+  fn get<F: 'static, D: Clone + 'static>(&self, root: &[u8; 32]) -> Option<D> {
+    let mut guard = self.state.lock().expect("bd data cache poisoned");
+    let found = guard
+      .map
+      .get(&(std::any::TypeId::of::<F>(), *root))
+      .and_then(|b| b.downcast_ref::<D>().cloned());
+    let stats = guard.stats.entry(std::any::TypeId::of::<F>()).or_default();
+    if found.is_some() {
+      stats.hits += 1;
+    } else {
+      stats.misses += 1;
+    }
+    found
+  }
+
+  /// A cache miss forced a full re-encode on the recommit path.
+  fn note_reencode<F: 'static>(&self) {
+    let mut guard = self.state.lock().expect("bd data cache poisoned");
+    guard
+      .stats
+      .entry(std::any::TypeId::of::<F>())
+      .or_default()
+      .reencodes += 1;
+  }
+
+  /// Clear every retained entry (all field types) and zero `F`'s
+  /// counters, giving a deterministic empty-cache starting state.
+  fn reset<F: 'static>(&self) {
+    let mut guard = self.state.lock().expect("bd data cache poisoned");
+    guard.map.clear();
+    guard.stats.insert(
+      std::any::TypeId::of::<F>(),
+      super::BdRetainedCacheStats::default(),
+    );
+  }
+
+  fn stats<F: 'static>(&self) -> super::BdRetainedCacheStats {
+    self
+      .state
+      .lock()
+      .expect("bd data cache poisoned")
+      .stats
+      .get(&std::any::TypeId::of::<F>())
+      .copied()
+      .unwrap_or_default()
+  }
+}
+
 fn bd_data_cache_put<F: crate::traits::PrimeFieldExt>(
   root: [u8; 32],
   data: BrakedownCommitData<F>,
 ) {
-  let cache = bd_data_cache();
-  let mut guard = cache.lock().expect("bd data cache poisoned");
-  if guard.len() >= 8 {
-    guard.clear();
-  }
-  guard.insert(
-    (std::any::TypeId::of::<F>(), root),
-    Box::new(data) as Box<dyn std::any::Any + Send + Sync>,
-  );
+  bd_retained_cache().put::<F>(root, Box::new(data));
 }
 
 fn bd_data_cache_get<F: crate::traits::PrimeFieldExt>(
   root: &[u8; 32],
 ) -> Option<BrakedownCommitData<F>> {
-  bd_data_cache()
-    .lock()
-    .expect("bd data cache poisoned")
-    .get(&(std::any::TypeId::of::<F>(), *root))
-    .and_then(|b| b.downcast_ref::<BrakedownCommitData<F>>().cloned())
+  bd_retained_cache().get::<F, BrakedownCommitData<F>>(root)
 }
 
-#[allow(clippy::type_complexity)]
-fn bd_data_cache()
--> &'static Mutex<HashMap<(std::any::TypeId, [u8; 32]), Box<dyn std::any::Any + Send + Sync>>> {
-  static CACHE: OnceLock<
-    Mutex<HashMap<(std::any::TypeId, [u8; 32]), Box<dyn std::any::Any + Send + Sync>>>,
-  > = OnceLock::new();
-  CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn bd_retained_cache() -> &'static BdRetainedCache {
+  static CACHE: OnceLock<BdRetainedCache> = OnceLock::new();
+  CACHE.get_or_init(BdRetainedCache::new)
+}
+
+/// Clear the process-global retained cache and zero `F`'s audit
+/// counters. `pub(super)` — Rust privacy is visible-to-self-and-
+/// descendants, so the parent module's public `#[doc(hidden)]` wrappers
+/// delegate here; the cache statics and their storage stay private.
+pub(super) fn bd_retained_cache_reset_for<F: 'static>() {
+  bd_retained_cache().reset::<F>();
+}
+
+/// Snapshot `F`'s retained-cache audit counters (see the reset
+/// counterpart for the visibility rationale).
+pub(super) fn bd_retained_cache_stats_for<F: 'static>() -> super::BdRetainedCacheStats {
+  bd_retained_cache().stats::<F>()
 }
 
 /// One final-opening target after the interleaved claim reduction: the
@@ -330,6 +416,8 @@ where
     if let Some(data) = bd_data_cache_get(comm) {
       return Ok(data);
     }
+    // Miss: this recommit is a full re-encode (audited).
+    bd_retained_cache().note_reencode::<SE::Scalar>();
     let (root, data) = Self::commit(ck, poly, blind, small)?;
     if &root != comm {
       return Err(SpartanError::InternalError {
@@ -450,5 +538,86 @@ where
       brakedown_verify_group(params, &items, a, sub)?;
     }
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Test-private marker types standing in for field types: a local
+  /// `BdRetainedCache` instance plus private `TypeId`s make the pattern
+  /// fully deterministic — no other test in the process can touch them.
+  struct FieldA;
+  struct FieldB;
+
+  fn root(i: u8) -> [u8; 32] {
+    [i; 32]
+  }
+
+  /// Deterministic pattern: put → hit, absent → miss, reset zeroes both
+  /// the map and the counters.
+  #[test]
+  fn retained_cache_hit_miss_and_reset_pattern() {
+    let cache = BdRetainedCache::new();
+    cache.put::<FieldA>(root(1), Box::new(7usize));
+    assert_eq!(cache.get::<FieldA, usize>(&root(1)), Some(7));
+    assert_eq!(cache.get::<FieldA, usize>(&root(2)), None);
+    // A different field type never sees another type's entries.
+    assert_eq!(cache.get::<FieldB, usize>(&root(1)), None);
+    let a = cache.stats::<FieldA>();
+    assert_eq!(
+      (a.hits, a.misses, a.reencodes, a.wholesale_clears),
+      (1, 1, 0, 0)
+    );
+    let b = cache.stats::<FieldB>();
+    assert_eq!((b.hits, b.misses), (0, 1));
+
+    cache.reset::<FieldA>();
+    assert_eq!(cache.get::<FieldA, usize>(&root(1)), None);
+    let a = cache.stats::<FieldA>();
+    // The post-reset miss is the only event on the zeroed counters.
+    assert_eq!(
+      (a.hits, a.misses, a.reencodes, a.wholesale_clears),
+      (0, 1, 0, 0)
+    );
+  }
+
+  /// The 8-entry insertion bound clears the whole map (not LRU) and is
+  /// counted against the inserting type.
+  #[test]
+  fn retained_cache_wholesale_clear_pattern() {
+    let cache = BdRetainedCache::new();
+    for i in 0..8u8 {
+      cache.put::<FieldA>(root(i), Box::new(i as usize));
+    }
+    assert_eq!(cache.stats::<FieldA>().wholesale_clears, 0);
+    // The 9th insertion finds len == 8 and clears everything first.
+    cache.put::<FieldA>(root(8), Box::new(8usize));
+    assert_eq!(cache.stats::<FieldA>().wholesale_clears, 1);
+    assert_eq!(cache.get::<FieldA, usize>(&root(0)), None); // wiped
+    assert_eq!(cache.get::<FieldA, usize>(&root(8)), Some(8)); // fresh
+  }
+
+  /// The recommit path's re-encode counter through the process-global
+  /// cache: a reset (empty cache) makes the next `recommit_data` a
+  /// deterministic miss + re-encode. Interference-immune: only this test
+  /// commits with the F127 engine's scalar under an empty cache, and a
+  /// miss cannot be turned back into a hit by concurrent evictions.
+  #[test]
+  fn retained_cache_reencode_is_audited() {
+    type SE = crate::provider::F127Engine;
+    type F = <SE as crate::traits::mod_engine::SumcheckEngine>::Scalar;
+    let poly: Vec<F> = (0..64u64).map(F::from).collect();
+    let (comm, _data) = BdBackend::<SE>::commit(&(), &poly, &(), true).unwrap();
+
+    bd_retained_cache_reset_for::<F>();
+    let before = bd_retained_cache_stats_for::<F>();
+    assert_eq!(before, super::super::BdRetainedCacheStats::default());
+    let _ = BdBackend::<SE>::recommit_data(&(), &comm, &poly, &(), true).unwrap();
+    let after = bd_retained_cache_stats_for::<F>();
+    assert_eq!(after.misses, 1);
+    assert_eq!(after.reencodes, 1);
+    assert_eq!(after.hits, 0);
   }
 }

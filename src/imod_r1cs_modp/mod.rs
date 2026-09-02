@@ -398,6 +398,20 @@ impl IntModR1CSShapeModp<crate::provider::T256DynPrimeEngine> {
   }
 }
 
+impl<M: ModEngine> IntModR1CSInstanceModp<M> {
+  /// Exact canonical bytes of the per-proof input-commitment pair, as the
+  /// single tuple `(comm_w, comm_q)` under the crate's pinned bincode
+  /// configuration (little-endian, fixed-int). Bincode adds no outer
+  /// tuple tag or length — the elements are consecutive, though their own
+  /// representations may contain length prefixes — so this is one
+  /// canonical encoding, not the sum of two independently chosen ones.
+  /// Proof-size accounting: these commitments are freshly created per
+  /// proof and transmitted with it.
+  pub fn commitment_bytes(&self) -> Result<Vec<u8>, SpartanError> {
+    crate::imod_spartan_modp::to_canonical_bytes(&(&self.comm_w, &self.comm_q))
+  }
+}
+
 impl<M: ModEngine> IntModR1CSWitnessModp<M> {
   /// Commit to integer `(w, q)` and return the witness/instance pair.
   pub fn new(
