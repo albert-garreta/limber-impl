@@ -163,6 +163,13 @@ pub trait SumcheckField:
   /// soundness-grade version needs wide reduction (≥ modulus_bits + 128
   /// input bits).
   fn from_bytes_reduce(params: &Self::Params, bytes: &[u8]) -> Self;
+
+  /// Whether this value belongs to the modulus context `expected`. Static
+  /// fields return `true` (the modulus is baked into the type); dynamic
+  /// fields compare the modulus carried by the value with
+  /// `expected`'s. Verifiers use this to reject proof-carried values from
+  /// a foreign context *before* any mixed-context arithmetic can panic.
+  fn is_in_context(&self, expected: &Self::Params) -> bool;
 }
 
 /// Blanket impl: any static-modulus prime field that already implements
@@ -192,6 +199,9 @@ where
   }
   fn from_bytes_reduce(_: &(), bytes: &[u8]) -> Self {
     <F as PrimeFieldExt>::from_uniform(bytes)
+  }
+  fn is_in_context(&self, _: &()) -> bool {
+    true
   }
 }
 

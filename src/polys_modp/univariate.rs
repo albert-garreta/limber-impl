@@ -156,6 +156,17 @@ impl<F: SumcheckField> CompressedUniPoly<F> {
   pub fn degree(&self) -> usize {
     self.coeffs_except_linear_term.len()
   }
+
+  /// Whether every stored coefficient belongs to the modulus context
+  /// `expected`. `pub(crate)` (not private): the callers live in the
+  /// sibling modules `sumcheck_modp` and `imod_spartan_modp`, where a
+  /// private method would be unreachable.
+  pub(crate) fn is_in_context(&self, expected: &F::Params) -> bool {
+    self
+      .coeffs_except_linear_term
+      .iter()
+      .all(|c| c.is_in_context(expected))
+  }
 }
 
 impl<F: SumcheckField> TranscriptReprTrait for UniPoly<F> {

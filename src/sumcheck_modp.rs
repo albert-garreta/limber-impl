@@ -40,6 +40,16 @@ impl<E: SumcheckEngine> SumcheckProof<E> {
     Self { compressed_polys }
   }
 
+  /// Whether every round polynomial's coefficients belong to the modulus
+  /// context `expected`. `pub(crate)` because the caller
+  /// (`imod_spartan_modp`) lives in a sibling module.
+  pub(crate) fn is_in_context(&self, expected: &<E::Scalar as SumcheckField>::Params) -> bool {
+    self
+      .compressed_polys
+      .iter()
+      .all(|p| p.is_in_context(expected))
+  }
+
   /// Verify the proof. Performs intra-round consistency
   /// (`p_i(0) + p_i(1) == running_claim`) and degree checks; returns
   /// `(final_claim, challenges)`. The caller is responsible for
