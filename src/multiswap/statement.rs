@@ -267,8 +267,12 @@ fn pocklington_rows(
 pub fn build<M: ModEngine>(
   cfg: &Config,
   poseidon: &PoseidonParams,
+  segment: bool,
 ) -> Result<Statement<M>, SpartanError> {
   let mut b = Builder::new();
+  if segment {
+    b = b.with_width_segments();
+  }
   let mut sections = Sections::default();
   let one = Lc::constant(BigUint::one());
   match cfg {
@@ -492,10 +496,151 @@ mod tests {
 
   /// The full statement is satisfied (`is_sat`), and a tampered witness
   /// — the prover's `Q` bumped by one — is not.
+  /// Width histogram of the full-statement witness (--ignored). Decides
+  /// how many width segments the commitment should group into and the
+  /// achievable savings: chunks scale with sum(numlimb over values).
+  #[test]
+  #[ignore = "measurement"]
+  fn full_witness_width_histogram() {
+    let poseidon = PoseidonParams::bls12_381_owwb20();
+    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon, false).unwrap();
+    let w = &st.built.w;
+    let block = st.built.block_len;
+    // bucket by bit-width class
+    let mut buckets = std::collections::BTreeMap::<usize, usize>::new();
+    let mut nonzero = 0usize;
+    for (i, v) in w.iter().enumerate() {
+      let _ = v;
+      let b = st.built.bounds[i].bits().saturating_sub(1) as usize; // bound 2^k -> k bits
+      let cls = if b == 0 {
+        0
+      } else if b <= 16 {
+        16
+      } else if b <= 254 {
+        254
+      } else if b <= 322 {
+        322
+      } else if b <= 512 {
+        512
+      } else if b <= 1024 {
+        1024
+      } else {
+        2048
+      };
+      *buckets.entry(cls).or_default() += 1;
+      if b > 0 {
+        nonzero += 1;
+      }
+    }
+    println!(
+      "full witness: {} w-values ({} nonzero), small block_len={}",
+      w.len(),
+      nonzero,
+      block
+    );
+    for (cls, cnt) in &buckets {
+      println!(
+        "  <= {cls:>4} bits: {cnt:>6}  ({:.1}%)",
+        100.0 * *cnt as f64 / w.len() as f64
+      );
+    }
+    // chunks at uniform 2048 vs grouped-by-class (numlimb = ceil(width/64))
+    let nl = |bits: usize| -> usize { bits.div_ceil(64).max(1) };
+    let uniform: usize = w.len() * nl(2048);
+    let grouped: usize = buckets
+      .iter()
+      .map(|(cls, cnt)| cnt * nl((*cls).max(1)))
+      .sum();
+    println!(
+      "chunks (numlimb sum): uniform@2048 = {uniform}, grouped = {grouped}  => {:.2}x fewer",
+      uniform as f64 / grouped as f64
+    );
+  }
+
+  #[test]
+  fn segmented_full_prove_verify() {
+    let poseidon = PoseidonParams::bls12_381_owwb20();
+    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon, true).unwrap();
+    let (pk, vk) = IntModSpartanModpSNARK::<T256DynPrimeEngine>::setup_with_params(
+      st.built.shape.clone(),
+      params_for(&st.built.shape),
+    )
+    .unwrap();
+    let (witness, instance) = IntModR1CSWitnessModp::<T256DynPrimeEngine>::new(
+      &st.built.shape,
+      pk.ck(),
+      st.built.w.clone(),
+      st.built.q.clone(),
+      st.built.io.clone(),
+    )
+    .unwrap();
+    assert!(
+      instance.comm_w.len() > 1,
+      "expected multiple segment commitments"
+    );
+    let proof =
+      IntModSpartanModpSNARK::<T256DynPrimeEngine>::prove(&pk, &instance, &witness).unwrap();
+    proof.verify(&vk, &instance).unwrap();
+  }
+
+  #[test]
+  fn segmented_full_is_sat_and_tiles() {
+    let poseidon = PoseidonParams::bls12_381_owwb20();
+    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon, true).unwrap();
+    let shape = &st.built.shape;
+    let segs = shape.width_segments();
+    assert!(!segs.is_empty(), "segmentation should produce segments");
+
+    // Tile check: sorted, contiguous, aligned, cover [0, num_vars).
+    let mut cursor = 0usize;
+    let nl = |ltf: usize| ltf.div_ceil(64).max(1);
+    let mut seg_chunks = 0usize;
+    for s in segs {
+      assert_eq!(s.start, cursor, "segment not contiguous");
+      assert_eq!(s.start % s.size(), 0, "segment not aligned");
+      seg_chunks += s.size() * nl(s.log_t_f);
+      cursor += s.size();
+    }
+    assert_eq!(cursor, shape.num_vars(), "segments must cover all columns");
+    let uniform_chunks = shape.num_vars() * nl(2048);
+    println!(
+      "segmented full: num_vars={}, {} segments, chunks {} vs uniform {} => {:.2}x fewer",
+      shape.num_vars(),
+      segs.len(),
+      seg_chunks,
+      uniform_chunks,
+      uniform_chunks as f64 / seg_chunks as f64
+    );
+    for s in segs {
+      println!(
+        "  seg start={:>6} size={:>6} log_t_f={:>4}",
+        s.start,
+        s.size(),
+        s.log_t_f
+      );
+    }
+
+    // is_sat still holds under the reordered layout.
+    let (pk, _vk) = IntModSpartanModpSNARK::<T256DynPrimeEngine>::setup_with_params(
+      shape.clone(),
+      params_for(shape),
+    )
+    .unwrap();
+    let (witness, instance) = IntModR1CSWitnessModp::<T256DynPrimeEngine>::new(
+      shape,
+      pk.ck(),
+      st.built.w.clone(),
+      st.built.q.clone(),
+      st.built.io.clone(),
+    )
+    .unwrap();
+    shape.is_sat(pk.ck(), &instance, &witness).unwrap();
+  }
+
   #[test]
   fn full_statement_is_sat_and_rejects_tamper() {
     let poseidon = PoseidonParams::bls12_381_owwb20();
-    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon).unwrap();
+    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon, false).unwrap();
     let (pk, _vk) = IntModSpartanModpSNARK::<T256DynPrimeEngine>::setup_with_params(
       st.built.shape.clone(),
       params_for(&st.built.shape),
@@ -532,7 +677,7 @@ mod tests {
   #[ignore]
   fn full_statement_proves_hash_mode() {
     let poseidon = PoseidonParams::bls12_381_owwb20();
-    let st = build::<T256DynPrimeBdEngine>(&Config::Full { swaps: 1 }, &poseidon).unwrap();
+    let st = build::<T256DynPrimeBdEngine>(&Config::Full { swaps: 1 }, &poseidon, false).unwrap();
     let (pk, vk) = IntModSpartanModpSNARK::<T256DynPrimeBdEngine>::setup_with_params(
       st.built.shape.clone(),
       params_for(&st.built.shape),
@@ -563,7 +708,7 @@ mod tests {
   #[test]
   fn rsa_statement_builds_in_2_13_and_is_sat() {
     let poseidon = PoseidonParams::bls12_381_owwb20();
-    let st = build::<T256DynPrimeEngine>(&Config::Rsa, &poseidon).unwrap();
+    let st = build::<T256DynPrimeEngine>(&Config::Rsa, &poseidon, false).unwrap();
     eprintln!(
       "rsa: rows {} cols {} nnz {}",
       st.built.real_rows, st.built.real_cols, st.nnz
@@ -591,7 +736,7 @@ mod tests {
   #[test]
   fn full_statement_builds_in_2_14() {
     let poseidon = PoseidonParams::bls12_381_owwb20();
-    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon).unwrap();
+    let st = build::<T256DynPrimeEngine>(&Config::Full { swaps: 1 }, &poseidon, false).unwrap();
     for (name, rows) in &st.sections.0 {
       eprintln!("{name:>24}: {rows}");
     }

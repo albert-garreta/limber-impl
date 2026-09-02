@@ -442,6 +442,33 @@ impl IntEvalParams {
       })
     })
   }
+
+  /// These params committing values of width `log_t_f` bits (a *segment*
+  /// of a width-grouped witness) instead of `self.log_t_f`, keeping the
+  /// shared `(log_t, log_p, log_q, s, k)` bounds so every segment reduces
+  /// against the SAME range check and combined opening. Only `numlimb`
+  /// and `numlimb_var` change. `log_t_f` must be a positive multiple of
+  /// `log_t` no larger than `self.log_t_f`; the norm and soundness bounds
+  /// then hold a fortiori — narrower values with the same `(log_t, k)`
+  /// and at least as many CRT primes (derived for the wider `num_vars`).
+  pub fn narrowed(&self, log_t_f: usize) -> Result<Self, SpartanError> {
+    if log_t_f == 0 || log_t_f % self.log_t != 0 || log_t_f > self.log_t_f {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "IntEvalParams::narrowed: log_t_f={log_t_f} must be a positive multiple of \
+           log_t={} and <= self.log_t_f={}",
+          self.log_t, self.log_t_f
+        ),
+      });
+    }
+    let nl = numlimb(log_t_f, self.log_t);
+    Ok(IntEvalParams {
+      log_t_f,
+      numlimb: nl,
+      numlimb_var: numlimb_var(nl),
+      ..self.clone()
+    })
+  }
 }
 
 /// Ceiling `log_2`. `ceil_log2(0)` returns 0 (callers guard with `.max(1)`).
@@ -1712,6 +1739,14 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     Hyrax::check_commitment(&comm.inner, n, width)
   }
 
+  fn commitment_log_t_f(ck: &Self::CommitmentKey) -> usize {
+    ck.params.log_t_f
+  }
+
+  fn verifier_log_t_f(vk: &Self::VerifierKey) -> usize {
+    vk.params.log_t_f
+  }
+
   fn prove(
     ck: &Self::CommitmentKey,
     transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
@@ -1934,6 +1969,256 @@ impl ModPCSEngineTrait<T256DynPrimeEngine> for IntegerModPCS {
     info!(elapsed_ms = %verify_t.elapsed().as_millis(), "integer_modpcs_verify_batch");
     Ok(())
   }
+
+  fn commit_at(
+    ck: &Self::CommitmentKey,
+    v: &[BigUint],
+    r: &Self::Blind,
+    log_t_f: usize,
+  ) -> Result<Self::Commitment, SpartanError> {
+    let params = ck.params.narrowed(log_t_f)?;
+    Self::commit_seg(ck, v, r, &params)
+  }
+
+  fn prove_batch_with_params(
+    ck: &Self::CommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    polys: &[&[BigUint]],
+    blinds: &[&Self::Blind],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    log_t_fs: &[usize],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    if log_t_fs.len() != polys.len() {
+      return Err(SpartanError::InternalError {
+        reason: "prove_batch_with_params: log_t_fs length mismatch".to_string(),
+      });
+    }
+    let params_per: Vec<IntEvalParams> = log_t_fs
+      .iter()
+      .map(|&l| ck.params.narrowed(l))
+      .collect::<Result<_, _>>()?;
+    Self::prove_batch_seg(
+      ck,
+      transcript,
+      comms,
+      polys,
+      blinds,
+      points,
+      evals,
+      blocks,
+      &params_per,
+    )
+  }
+
+  fn verify_batch_with_params(
+    vk: &Self::VerifierKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&Self::Commitment],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &Self::BatchEvaluationArgument,
+    blocks: &[&[SmallValueBlock]],
+    log_t_fs: &[usize],
+  ) -> Result<(), SpartanError> {
+    let params_per: Vec<IntEvalParams> = log_t_fs
+      .iter()
+      .map(|&l| vk.params.narrowed(l))
+      .collect::<Result<_, _>>()?;
+    Self::verify_batch_seg(
+      vk,
+      transcript,
+      comms,
+      points,
+      evals,
+      arg,
+      blocks,
+      &params_per,
+    )
+  }
+}
+
+/// Width-grouped commitment primitives: commit and batch-open with a
+/// *per-polynomial* `IntEvalParams`, so a witness split into segments by
+/// value width commits each segment at a matched bound. A narrow segment
+/// (small `log_t_f` → few limbs) yields a shorter chunk vector and a
+/// genuinely cheaper MSM / range check, while the shared range check and
+/// combined opening still run once over the whole batch. `ck.params`
+/// must be the *widest* segment's params (it sizes the generators and
+/// carries the uniform `(log_t, log_p, log_q)` bounds every segment
+/// agrees on). See `docs/imod_followups.md` for the measured basis.
+#[allow(dead_code)] // exercised by tests; wired into the driver next
+impl IntegerModPCS {
+  pub(crate) fn commit_seg(
+    ck: &IntegerModCommitmentKey,
+    v: &[BigUint],
+    r: &IntegerModBlind,
+    params: &IntEvalParams,
+  ) -> Result<IntegerModCommitment, SpartanError> {
+    if v.len() == 1 {
+      let v_fq: Vec<t256::Scalar> = v.iter().map(biguint_to_scalar).collect();
+      let inner = Hyrax::commit(&ck.inner, &v_fq, &r.inner, false)?;
+      return Ok(IntegerModCommitment { inner });
+    }
+    let v_limbs = limb_split_polynomial(v, params.log_t, params.log_t_f);
+    let chunk_vals = build_chunk_poly(&[&v_limbs], v_limbs.len(), params.log_t);
+    let chunk_fq: Vec<t256::Scalar> = chunk_vals
+      .par_iter()
+      .map(|&c| scalar_from_chunk(c))
+      .collect();
+    let inner = Hyrax::commit(&ck.inner, &chunk_fq, &r.inner, true)?;
+    Ok(IntegerModCommitment { inner })
+  }
+
+  /// [`ModPCSEngineTrait::prove_batch_with_blocks`] with a per-polynomial
+  /// `IntEvalParams`: poly `i`'s reduction + chains run at `params_per[i]`,
+  /// while the shared range check + combined open run once at `ck.params`.
+  /// Every polynomial that carries a non-empty `blocks` entry MUST have
+  /// `params_per[i].numlimb_var == ck.params.numlimb_var` (the small-value
+  /// gadget indexes the chunk oracle at the batch numlimb_var); segments
+  /// narrower than the batch commit at `log_t_f = log_t` (numlimb 1) and
+  /// range-check by commit width, so they carry no blocks.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn prove_batch_seg(
+    ck: &IntegerModCommitmentKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&IntegerModCommitment],
+    polys: &[&[BigUint]],
+    blinds: &[&IntegerModBlind],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    blocks: &[&[SmallValueBlock]],
+    params_per: &[IntEvalParams],
+  ) -> Result<IntEvalBatchArgument<HyBackend>, SpartanError> {
+    let n = polys.len();
+    if n == 0
+      || comms.len() != n
+      || blinds.len() != n
+      || points.len() != n
+      || evals.len() != n
+      || blocks.len() != n
+      || params_per.len() != n
+    {
+      return Err(SpartanError::InternalError {
+        reason: "prove_batch_with_params: empty or mismatched inputs".to_string(),
+      });
+    }
+    let mut ph1s: Vec<ChainPhase1<HyBackend>> = Vec::with_capacity(n);
+    for i in 0..n {
+      ph1s.push(prove_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
+        &params_per[i],
+        ck,
+        transcript,
+        polys[i],
+        points[i],
+        evals[i],
+      )?);
+    }
+    let mut states: Vec<PerPolyProver<HyBackend>> = Vec::with_capacity(n);
+    for (i, ph1) in ph1s.into_iter().enumerate() {
+      states.push(prove_one_poly_phase2::<HyBackend, T256DynPrimeEngine>(
+        &params_per[i],
+        transcript,
+        ph1,
+      )?);
+    }
+    let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
+    let blind_inners: Vec<_> = blinds.iter().map(|b| &b.inner).collect();
+    let (range_check, combined_open, small_block_evals) =
+      finish_batch_open::<HyBackend, T256DynPrimeEngine>(
+        &ck.params,
+        ck,
+        transcript,
+        &mut states,
+        &comm_inners,
+        &blind_inners,
+        blocks,
+      )?;
+    let per_poly = states
+      .into_iter()
+      .map(|st| IntEvalPerPolyArgument {
+        reduction_round_polys: st.reduction_round_polys,
+        int_v_prime: st.int_v_prime,
+        chains: st.chains,
+        ab_comms: st.ab_comms,
+      })
+      .collect();
+    Ok(IntEvalBatchArgument {
+      per_poly,
+      range_check,
+      combined_open,
+      small_block_evals,
+    })
+  }
+
+  /// Verifier mirror of [`IntegerModPCS::prove_batch_seg`].
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn verify_batch_seg(
+    vk: &IntegerModVerifierKey,
+    transcript: &mut <T256DynPrimeEngine as SumcheckEngine>::TE,
+    comms: &[&IntegerModCommitment],
+    points: &[&[<T256DynPrimeEngine as SumcheckEngine>::Scalar]],
+    evals: &[&BigUint],
+    arg: &IntEvalBatchArgument<HyBackend>,
+    blocks: &[&[SmallValueBlock]],
+    params_per: &[IntEvalParams],
+  ) -> Result<(), SpartanError> {
+    let n = arg.per_poly.len();
+    if comms.len() != n
+      || points.len() != n
+      || evals.len() != n
+      || blocks.len() != n
+      || params_per.len() != n
+    {
+      return Err(SpartanError::InvalidSumcheckProof);
+    }
+    let mut vph1s: Vec<VerifyPhase1> = Vec::with_capacity(n);
+    for i in 0..n {
+      let pp = &arg.per_poly[i];
+      vph1s.push(verify_one_poly_phase1::<HyBackend, T256DynPrimeEngine>(
+        &params_per[i],
+        transcript,
+        points[i],
+        evals[i],
+        &pp.reduction_round_polys,
+        &pp.int_v_prime,
+        &pp.chains,
+        &pp.ab_comms,
+      )?);
+    }
+    let mut vs: Vec<PerPolyVerifier> = Vec::with_capacity(n);
+    for (i, ph1) in vph1s.into_iter().enumerate() {
+      let pp = &arg.per_poly[i];
+      vs.push(verify_one_poly_phase2::<HyBackend, T256DynPrimeEngine>(
+        &params_per[i],
+        transcript,
+        &pp.chains,
+        &pp.int_v_prime,
+        ph1,
+      )?);
+    }
+    let comm_inners: Vec<_> = comms.iter().map(|c| &c.inner).collect();
+    let ab_comms_per_poly: Vec<_> = arg
+      .per_poly
+      .iter()
+      .map(|pp| pp.ab_comms.as_slice())
+      .collect();
+    finish_batch_verify::<HyBackend, T256DynPrimeEngine>(
+      &vk.params,
+      vk,
+      transcript,
+      &comm_inners,
+      &mut vs,
+      &ab_comms_per_poly,
+      &arg.range_check,
+      &arg.combined_open,
+      blocks,
+      &arg.small_block_evals,
+    )?;
+    Ok(())
+  }
 }
 
 /// The Brakedown-backed integer Mod-PCS: the same IntEval protocol as
@@ -2055,6 +2340,14 @@ where
     _width: usize,
   ) -> Result<(), SpartanError> {
     Ok(())
+  }
+
+  fn commitment_log_t_f(ck: &Self::CommitmentKey) -> usize {
+    ck.params.log_t_f
+  }
+
+  fn verifier_log_t_f(vk: &Self::VerifierKey) -> usize {
+    vk.params.log_t_f
   }
 
   fn prove(
@@ -2284,6 +2577,10 @@ where
 /// opening borrow from. Built by [`prove_one_poly`], consumed by
 /// [`finish_batch_open`].
 struct PerPolyProver<B: CommitBackend> {
+  /// This poly's own `numlimb_var` (limb-axis variable count); segments of
+  /// different widths differ here, so block claims must use it, not the
+  /// shared batch params.
+  numlimb_var: usize,
   reduction_round_polys: Vec<Vec<BigUint>>,
   int_v_prime: BigInt,
   chains: Vec<ChainData<B::Scalar>>,
@@ -2801,6 +3098,7 @@ fn prove_one_poly_phase2<
   info!(elapsed_ms = %open_t.elapsed().as_millis(), "imod_pcs_chain_claims");
 
   Ok(PerPolyProver {
+    numlimb_var: params.numlimb_var,
     reduction_round_polys,
     int_v_prime,
     chains,
@@ -3032,14 +3330,14 @@ where
     }
     // Small-value block claims (zero-subcube gadget), transcript-ordered
     // after the range check, per poly, in declaration order.
-    let poly_n = (st.f_limb.len().trailing_zeros() as usize) - params.numlimb_var;
+    let poly_n = (st.f_limb.len().trailing_zeros() as usize) - st.numlimb_var;
     let blk_list: &[SmallValueBlock] = blocks.get(p).copied().unwrap_or(&[]);
     let mut blk_evals = Vec::with_capacity(blk_list.len());
     for blk in blk_list {
       let (bcl, e2) = small_block_claims::<B, _>(
         transcript,
         poly_n,
-        params.numlimb_var,
+        st.numlimb_var,
         d.log_stride,
         blk,
         Some(rc_art.chunk_data[f_batch_idx[p]].0.as_slice()),
@@ -3128,6 +3426,8 @@ where
 /// public dimensions [`finish_batch_verify`] needs to pin batch shapes
 /// and combined-open point lengths.
 struct PerPolyVerifier<F = t256::Scalar> {
+  /// This poly's own `numlimb_var` (see [`PerPolyProver::numlimb_var`]).
+  numlimb_var: usize,
   f_claims: OpenClaims<F>,
   ab_claims: Vec<OpenClaims<F>>,
   num_vars: usize,
@@ -3420,6 +3720,7 @@ fn verify_one_poly_phase2<
   info!(elapsed_ms = %vchain_t.elapsed().as_millis(), "imod_pcs_verify_chains");
 
   Ok(PerPolyVerifier {
+    numlimb_var: params.numlimb_var,
     f_claims,
     ab_claims,
     num_vars,
@@ -3458,10 +3759,6 @@ fn verify_one_poly<
   verify_one_poly_phase2::<B, ME>(params, transcript, chains, int_v_prime, ph1)
 }
 
-/// Verifier mirror of [`finish_batch_open`]: ONE shared range check over
-/// every polynomial's batches, then ONE combined-open verification over
-/// every commitment, in the same canonical order the prover used.
-#[allow(clippy::too_many_arguments)]
 fn finish_batch_verify<
   B: CommitBackend,
   ME: crate::traits::mod_engine::ModEngine<
@@ -3545,7 +3842,7 @@ where
     }
     // Small-value block claims: mirror of the prover's assembly, with
     // `e2` read from the proof.
-    let poly_n = v.num_vars - params.numlimb_var;
+    let poly_n = v.num_vars - v.numlimb_var;
     let blk_list: &[SmallValueBlock] = blocks.get(p).copied().unwrap_or(&[]);
     for (bi, blk) in blk_list.iter().enumerate() {
       let e2 = small_block_evals
@@ -3556,7 +3853,7 @@ where
       let (bcl, _) = small_block_claims::<B, _>(
         transcript,
         poly_n,
-        params.numlimb_var,
+        v.numlimb_var,
         d.log_stride,
         blk,
         None,
@@ -5361,6 +5658,651 @@ mod tests {
         "verify_batch must reject a tampered eval for poly {i}"
       );
     }
+  }
+
+  /// Width-grouped commitment: a heterogeneous batch where one poly is
+  /// committed and opened at a WIDE `IntEvalParams` (many limbs) and the
+  /// other at a NARROW one (few limbs) round-trips through
+  /// `prove_batch_with_params` / `verify_batch_with_params`, and a
+  /// tampered narrow-segment eval still rejects. This is the enabling
+  /// primitive for segmenting a mixed-width witness so its narrow part
+  /// commits cheaply — the shared range check + combined open run once at
+  /// the wide `ck.params` while each poly reduces at its own bound.
+  /// The width-grouped `W(point)` decomposition: for an aligned dyadic
+  /// tiling, `W(point) = sum_seg selector_seg(point_hi) · Seg(point_lo)`,
+  /// where a segment `[start, start+2^L)` uses the LAST `L` coords for its
+  /// local evaluation and the leading coords as an eq-selector on
+  /// `start >> L` (MSB-first, matching `integer_mle_evaluate`). Checked
+  /// over the integers so no modulus hides an ordering bug.
+  /// Real-layout end-to-end payoff (--ignored, release): commit + open the
+  /// actual full-statement witness uniformly (@2048, one poly) vs width-
+  /// grouped over its real segments (each at its own bound), through one
+  /// shared range check + combined open. Large field (M127) so the
+  /// reduction's limb division never hits its toy-field zero.
+  #[test]
+  #[ignore = "measurement; run with --release --ignored --nocapture"]
+  fn segmented_open_real_layout_measurement() {
+    use crate::multiswap::poseidon::PoseidonParams;
+    use crate::multiswap::statement::{Config, build};
+    use std::time::Instant;
+
+    let dp = crypto_bigint::modular::FixedMontyParams::<2>::new(
+      crypto_bigint::Odd::new(crypto_bigint::U128::MAX >> 1).unwrap(),
+    );
+    let pmod: BigUint = (BigUint::from(1u32) << 127u32) - BigUint::from(1u32);
+
+    let poseidon = PoseidonParams::bls12_381_owwb20();
+    let st = build::<ME>(&Config::Full { swaps: 1 }, &poseidon, true).unwrap();
+    let w = &st.built.w;
+    let segs = st.built.shape.width_segments().to_vec();
+    let num_vars = w.len().trailing_zeros() as usize;
+    let wide = IntEvalParams::derive(2048, 64, DEFAULT_K, num_vars).unwrap();
+    let (ck, vk) =
+      IntegerModPCS::setup_with_params(b"seg-real", w.len(), 256, wide.clone()).unwrap();
+
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dp, ((i as u64) * 7 + 3) % 101))
+      .collect();
+    let eval_bu = |poly: &[BigUint], pt: &[DP]| -> BigUint {
+      let ip: Vec<BigUint> = pt.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &ip)
+        .mod_floor(&BigInt::from(pmod.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+
+    // Uniform: whole w @2048, one poly.
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, w.len());
+    let t = Instant::now();
+    let comm = IntegerModPCS::commit_seg(&ck, w, &blind, &wide).unwrap();
+    let u_commit = t.elapsed().as_secs_f64() * 1e3;
+    let eval = eval_bu(w, &point);
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"u", dp);
+    let t = Instant::now();
+    let arg = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut pt,
+      &[&comm],
+      &[w.as_slice()],
+      &[&blind],
+      &[point.as_slice()],
+      &[&eval],
+      &[&[]],
+      &[wide.clone()],
+    )
+    .unwrap();
+    let u_open = t.elapsed().as_secs_f64() * 1e3;
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"u", dp);
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut vt,
+      &[&comm],
+      &[point.as_slice()],
+      &[&eval],
+      &arg,
+      &[&[]],
+      &[wide.clone()],
+    )
+    .unwrap();
+
+    // Segmented: one poly per width segment.
+    let mut params_per = Vec::new();
+    let mut slices: Vec<Vec<BigUint>> = Vec::new();
+    let mut locals: Vec<Vec<DP>> = Vec::new();
+    let mut evals: Vec<BigUint> = Vec::new();
+    for s in &segs {
+      let sl = w[s.start..s.start + s.size()].to_vec();
+      let hi = num_vars - s.log_len;
+      let local: Vec<DP> = point[hi..].to_vec();
+      evals.push(eval_bu(&sl, &local));
+      params_per.push(wide.narrowed(s.log_t_f).unwrap());
+      slices.push(sl);
+      locals.push(local);
+    }
+    let blinds_s: Vec<_> = segs
+      .iter()
+      .map(|s| <MP as ModPCSEngineTrait<ME>>::blind(&ck, s.size()))
+      .collect();
+    let t = Instant::now();
+    let comms_s: Vec<_> = (0..segs.len())
+      .map(|i| IntegerModPCS::commit_seg(&ck, &slices[i], &blinds_s[i], &params_per[i]).unwrap())
+      .collect();
+    let s_commit = t.elapsed().as_secs_f64() * 1e3;
+    let cr: Vec<_> = comms_s.iter().collect();
+    let pr: Vec<&[BigUint]> = slices.iter().map(|v| v.as_slice()).collect();
+    let br: Vec<_> = blinds_s.iter().collect();
+    let ptr: Vec<&[DP]> = locals.iter().map(|v| v.as_slice()).collect();
+    let er: Vec<&BigUint> = evals.iter().collect();
+    let nb: Vec<&[SmallValueBlock]> = vec![&[]; segs.len()];
+    let mut pt2 = <ME as SumcheckEngine>::TE::new_with_params(b"s", dp);
+    let t = Instant::now();
+    let arg2 =
+      IntegerModPCS::prove_batch_seg(&ck, &mut pt2, &cr, &pr, &br, &ptr, &er, &nb, &params_per)
+        .unwrap();
+    let s_open = t.elapsed().as_secs_f64() * 1e3;
+    let mut vt2 = <ME as SumcheckEngine>::TE::new_with_params(b"s", dp);
+    IntegerModPCS::verify_batch_seg(&vk, &mut vt2, &cr, &ptr, &er, &arg2, &nb, &params_per)
+      .unwrap();
+
+    println!("REAL layout: num_vars={num_vars}, {} segments", segs.len());
+    println!(
+      "UNIFORM  @2048: commit {u_commit:.1} ms  open {u_open:.1} ms  total {:.1} ms",
+      u_commit + u_open
+    );
+    println!(
+      "SEGMENTED     : commit {s_commit:.1} ms  open {s_open:.1} ms  total {:.1} ms",
+      s_commit + s_open
+    );
+    println!(
+      "speedup vs uniform: SEG total {:.2}x",
+      (u_commit + u_open) / (s_commit + s_open)
+    );
+  }
+
+  #[test]
+  fn width_segment_selector_sum_reconstructs_mle() {
+    let num_vars = 5usize;
+    let n = 1usize << num_vars;
+    let w: Vec<BigUint> = (0..n).map(|i| BigUint::from((i as u64) * 7 + 1)).collect();
+    // point coords (arbitrary small integers, MSB-first)
+    let point: Vec<BigUint> = (0..num_vars)
+      .map(|i| BigUint::from((i as u64) * 3 + 2))
+      .collect();
+    let full = integer_mle_evaluate(&w, &point);
+
+    // An aligned dyadic tiling of [0, 32): 16 | 8 | 4 | 4.
+    let segs: [(usize, usize); 4] = [(0, 4), (16, 3), (24, 2), (28, 2)];
+    let mut acc = BigInt::from(0u32);
+    for (start, log_len) in segs {
+      let hi_vars = num_vars - log_len;
+      // selector = eq(start >> log_len, point[0..hi_vars]) as an integer product.
+      let h = start >> log_len;
+      let mut sel = BigInt::from(1u32);
+      for i in 0..hi_vars {
+        // point[i] corresponds to bit (hi_vars-1-i) of h.
+        let bit = (h >> (hi_vars - 1 - i)) & 1;
+        let pi = BigInt::from(point[i].clone());
+        sel *= if bit == 1 {
+          pi
+        } else {
+          BigInt::from(1u32) - pi
+        };
+      }
+      let seg = &w[start..start + (1 << log_len)];
+      let local = &point[hi_vars..];
+      acc += sel * integer_mle_evaluate(seg, local);
+    }
+    assert_eq!(acc, full, "selector-sum must reconstruct the full MLE");
+  }
+
+  /// Batch of two polys differing in BOTH size and params (the width-
+  /// grouped case): poly0 has 2^7 values at the wide bound, poly1 has 2^5
+  /// at a narrow bound. Isolates heterogeneous-size + heterogeneous-param
+  /// batching.
+  /// Four polys of DIFFERENT sizes at the SAME params in one batch — the
+  /// width-grouped shape. Uses a LARGE field on purpose: the reduction
+  /// verifier recovers `f_eval = red_final_claim / limb(r_k)`, and
+  /// `limb(r_k)` (the limb-recombination weight at the reduction
+  /// challenge) is zero at one field point. Over the toy field 37 that
+  /// hits with prob ~1/37, so a heterogeneous batch whose transcript lands
+  /// on it fails verification; over a ~124-bit prime (as the real prover
+  /// samples) it is ~2^-124. Guards that segmentation opens are sound at
+  /// production field sizes.
+  #[test]
+  fn four_diff_size_same_param_batch() {
+    // Large field (M127 = 2^127-1) so limb(r_k)=0 is ~2^-127, not ~1/37.
+    let dp = crypto_bigint::modular::FixedMontyParams::<2>::new(
+      crypto_bigint::Odd::new(crypto_bigint::U128::MAX >> 1).unwrap(),
+    );
+    let p: BigUint = (BigUint::from(1u32) << 127u32) - BigUint::from(1u32);
+    let wide = IntEvalParams::derive_optimized(256, 7).unwrap();
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"four", 128, 256, wide.clone()).unwrap();
+    let sizes = [7usize, 6, 6, 5];
+    let ev = |poly: &[BigUint], pt: &[DP]| -> BigUint {
+      let ip: Vec<BigUint> = pt.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &ip)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+    let mut polys = Vec::new();
+    let mut pts = Vec::new();
+    let mut blinds = Vec::new();
+    let mut evals = Vec::new();
+    for (k, &lv) in sizes.iter().enumerate() {
+      let n = 1usize << lv;
+      let poly: Vec<BigUint> = (0..n)
+        .map(|i| BigUint::from((i as u32 + 1) * (k as u32 + 1)) << 100)
+        .collect();
+      let pt: Vec<DP> = (0..lv)
+        .map(|i| DP::from_u64(&dp, ((i as u64) * 7 + 3 + k as u64) % 37))
+        .collect();
+      evals.push(ev(&poly, &pt));
+      blinds.push(<MP as ModPCSEngineTrait<ME>>::blind(&ck, n));
+      polys.push(poly);
+      pts.push(pt);
+    }
+    let comms: Vec<_> = (0..4)
+      .map(|k| IntegerModPCS::commit_seg(&ck, &polys[k], &blinds[k], &wide).unwrap())
+      .collect();
+    let cr: Vec<_> = comms.iter().collect();
+    let pr: Vec<&[BigUint]> = polys.iter().map(|v| v.as_slice()).collect();
+    let br: Vec<_> = blinds.iter().collect();
+    let ptr: Vec<&[DP]> = pts.iter().map(|v| v.as_slice()).collect();
+    let er: Vec<&BigUint> = evals.iter().collect();
+    let nb: Vec<&[SmallValueBlock]> = vec![&[]; 4];
+    let pp = vec![wide.clone(); 4];
+    let mut tp = <ME as SumcheckEngine>::TE::new_with_params(b"four", dp);
+    let a =
+      IntegerModPCS::prove_batch_seg(&ck, &mut tp, &cr, &pr, &br, &ptr, &er, &nb, &pp).unwrap();
+    let mut tv = <ME as SumcheckEngine>::TE::new_with_params(b"four", dp);
+    IntegerModPCS::verify_batch_seg(&vk, &mut tv, &cr, &ptr, &er, &a, &nb, &pp).unwrap();
+  }
+
+  #[test]
+  fn diff_size_and_param_batch_round_trips() {
+    let dyn_params = small_dyn_params();
+    let p: BigUint = BigUint::from(37u32);
+    let wide = IntEvalParams::derive_optimized(256, 7).unwrap();
+    let narrow = wide.narrowed(wide.log_t / 1 * 1).unwrap(); // = log_t (numlimb 1)
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"ds", 128, 256, wide.clone()).unwrap();
+
+    let n0 = 1usize << 7;
+    let n1 = 1usize << 5;
+    let poly0: Vec<BigUint> = (0..n0)
+      .map(|i| BigUint::from(i as u32 + 1) << 100)
+      .collect();
+    let poly1: Vec<BigUint> = (0..n1).map(|i| BigUint::from(i as u32 * 3 + 2)).collect();
+    let pt0: Vec<DP> = (0..7)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+    let pt1: Vec<DP> = (0..5)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 5 + 1) % 37))
+      .collect();
+    let ev = |poly: &[BigUint], pt: &[DP]| -> BigUint {
+      let ip: Vec<BigUint> = pt.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &ip)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+    let e0 = ev(&poly0, &pt0);
+    let e1 = ev(&poly1, &pt1);
+    let b0 = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n0);
+    let b1 = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n1);
+    let c0 = IntegerModPCS::commit_seg(&ck, &poly0, &b0, &wide).unwrap();
+    let c1 = IntegerModPCS::commit_seg(&ck, &poly1, &b1, &narrow).unwrap();
+    let nb: [&[SmallValueBlock]; 2] = [&[], &[]];
+    let pp = [wide.clone(), narrow.clone()];
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"ds", dyn_params);
+    let arg = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut pt,
+      &[&c0, &c1],
+      &[&poly0, &poly1],
+      &[&b0, &b1],
+      &[&pt0, &pt1],
+      &[&e0, &e1],
+      &nb,
+      &pp,
+    )
+    .unwrap();
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"ds", dyn_params);
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut vt,
+      &[&c0, &c1],
+      &[&pt0, &pt1],
+      &[&e0, &e1],
+      &arg,
+      &nb,
+      &pp,
+    )
+    .unwrap();
+  }
+
+  /// The small-value block, on a NARROW segment (numlimb_var=0), actually
+  /// enforces `< 2^16`: an honest all-16-bit poly verifies, and tampering
+  /// one value to 2^20 (still a valid narrow commitment, chunks < 2^16, so
+  /// the plain range check passes) is rejected by the block claim. Guards
+  /// the per-segment numlimb_var wiring that makes the block sound in
+  /// width-grouped mode. Large field so the reduction division is safe.
+  #[test]
+  fn narrow_segment_block_rejects_out_of_range() {
+    let dp = crypto_bigint::modular::FixedMontyParams::<2>::new(
+      crypto_bigint::Odd::new(crypto_bigint::U128::MAX >> 1).unwrap(),
+    );
+    let p: BigUint = (BigUint::from(1u32) << 127u32) - BigUint::from(1u32);
+    let num_vars = 6usize;
+    let n = 1usize << num_vars;
+    let wide = IntEvalParams::derive_optimized(256, num_vars).unwrap();
+    let narrow = wide.narrowed(wide.log_t).unwrap(); // numlimb 1 -> numlimb_var 0
+    assert_eq!(narrow.numlimb_var, 0);
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"nb", n, 256, wide.clone()).unwrap();
+
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dp, ((i as u64) * 7 + 3) % 101))
+      .collect();
+    let ev = |poly: &[BigUint], pt: &[DP]| -> BigUint {
+      let ip: Vec<BigUint> = pt.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &ip)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+    let block = SmallValueBlock {
+      start: 0,
+      log_len: num_vars,
+    }; // covers all n
+    let blks: [&[SmallValueBlock]; 1] = [std::slice::from_ref(&block)];
+
+    // Honest: all values < 2^16.
+    let poly: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 * 3 + 1)).collect();
+    let bl = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm = IntegerModPCS::commit_seg(&ck, &poly, &bl, &narrow).unwrap();
+    let e = ev(&poly, &point);
+    let mut tp = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
+    let arg = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut tp,
+      &[&comm],
+      &[&poly],
+      &[&bl],
+      &[&point],
+      &[&e],
+      &blks,
+      &[narrow.clone()],
+    )
+    .unwrap();
+    let mut tv = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut tv,
+      &[&comm],
+      &[&point],
+      &[&e],
+      &arg,
+      &blks,
+      &[narrow.clone()],
+    )
+    .unwrap();
+
+    // Tamper: value 2^20 (>= 2^16). Chunks still < 2^16, so the plain range
+    // check is fine; the block must reject.
+    let mut bad = poly.clone();
+    bad[3] = BigUint::from(1u32) << 20u32;
+    let comm2 = IntegerModPCS::commit_seg(&ck, &bad, &bl, &narrow).unwrap();
+    let e2 = ev(&bad, &point);
+    let mut tp2 = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
+    let arg2 = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut tp2,
+      &[&comm2],
+      &[&bad],
+      &[&bl],
+      &[&point],
+      &[&e2],
+      &blks,
+      &[narrow.clone()],
+    )
+    .unwrap();
+    let mut tv2 = <ME as SumcheckEngine>::TE::new_with_params(b"nb", dp);
+    assert!(
+      IntegerModPCS::verify_batch_seg(
+        &vk,
+        &mut tv2,
+        &[&comm2],
+        &[&point],
+        &[&e2],
+        &arg2,
+        &blks,
+        &[narrow.clone()],
+      )
+      .is_err(),
+      "block must reject a value >= 2^16 on a narrow segment"
+    );
+  }
+
+  #[test]
+  fn mixed_width_batch_round_trips() {
+    let num_vars = 6usize;
+    let n = 1usize << num_vars;
+    let dyn_params = small_dyn_params();
+    let p: BigUint = BigUint::from(37u32);
+
+    let wide_params = IntEvalParams::derive_optimized(256, num_vars).unwrap();
+    let narrow_params = wide_params.narrowed(128).unwrap();
+    // Distinct limb counts are the whole point of the exercise.
+    assert!(narrow_params.numlimb < wide_params.numlimb);
+
+    let (ck, vk) =
+      IntegerModPCS::setup_with_params(b"seg-batch", n, 256, wide_params.clone()).unwrap();
+
+    // poly0 wide (~2^180 values), poly1 narrow (~2^38 values).
+    let poly0: Vec<BigUint> = (0..n).map(|i| BigUint::from(i as u32 + 1) << 180).collect();
+    let poly1: Vec<BigUint> = (0..n)
+      .map(|i| BigUint::from((i as u32) * 3 + 5) << 30)
+      .collect();
+
+    let point0: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+    let point1: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 5 + 1) % 37))
+      .collect();
+
+    let eval_of = |poly: &[BigUint], point: &[DP]| -> BigUint {
+      let int_point: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &int_point)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+    let eval0 = eval_of(&poly0, &point0);
+    let eval1 = eval_of(&poly1, &point1);
+
+    let blind0 = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let blind1 = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let comm0 = IntegerModPCS::commit_seg(&ck, &poly0, &blind0, &wide_params).unwrap();
+    let comm1 = IntegerModPCS::commit_seg(&ck, &poly1, &blind1, &narrow_params).unwrap();
+
+    let comms = [&comm0, &comm1];
+    let polys: [&[BigUint]; 2] = [&poly0, &poly1];
+    let blinds = [&blind0, &blind1];
+    let points: [&[DP]; 2] = [&point0, &point1];
+    let evals = [&eval0, &eval1];
+    let no_blocks: [&[SmallValueBlock]; 2] = [&[], &[]];
+    let params_per = [wide_params.clone(), narrow_params.clone()];
+
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"seg-batch", dyn_params);
+    let arg = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut pt,
+      &comms,
+      &polys,
+      &blinds,
+      &points,
+      &evals,
+      &no_blocks,
+      &params_per,
+    )
+    .unwrap();
+
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"seg-batch", dyn_params);
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut vt,
+      &comms,
+      &points,
+      &evals,
+      &arg,
+      &no_blocks,
+      &params_per,
+    )
+    .unwrap();
+
+    // Negative control: tamper the narrow segment's claimed eval.
+    let bad1 = (&eval1 + BigUint::from(1u32)) % &p;
+    let evals_bad = [&eval0, &bad1];
+    let mut vtb = <ME as SumcheckEngine>::TE::new_with_params(b"seg-batch", dyn_params);
+    assert!(
+      IntegerModPCS::verify_batch_seg(
+        &vk,
+        &mut vtb,
+        &comms,
+        &points,
+        &evals_bad,
+        &arg,
+        &no_blocks,
+        &params_per,
+      )
+      .is_err(),
+      "verify must reject a tampered narrow-segment eval"
+    );
+  }
+
+  /// End-to-end payoff of width grouping on a realistic *mixed*-width
+  /// witness (`--ignored`, single-thread). Baseline: commit the whole
+  /// witness at the wide 2048-bit bound and open it as one poly. Grouped:
+  /// commit the wide half at 2048 and the narrow half at 256 (an 8x-fewer-
+  /// limb segment via `narrowed`), open both through one shared range
+  /// check + combined open. Prints commit + open wall time for each — the
+  /// commit+open is ~99% of the real Spartan prove (measured), so this is
+  /// the mechanism's achievable prover speedup on this width mix.
+  #[test]
+  #[ignore = "measurement; run explicitly with --ignored --nocapture"]
+  fn width_grouping_endtoend_measurement() {
+    use std::time::Instant;
+    let num_vars = 13usize; // 8192 values, multiswap-scale
+    let n = 1usize << num_vars;
+    let half = n / 2;
+    let dyn_params = small_dyn_params();
+    let p: BigUint = BigUint::from(37u32);
+
+    let wide = IntEvalParams::derive_optimized(2048, num_vars).unwrap();
+    let narrow = wide.narrowed(256).unwrap();
+    println!(
+      "wide: log_t={} numlimb={}  narrow: numlimb={} ({}x fewer limbs)",
+      wide.log_t,
+      wide.numlimb,
+      narrow.numlimb,
+      wide.numlimb / narrow.numlimb
+    );
+
+    // Wide half: full 2048-bit values. Narrow half: ~254-bit values.
+    let wide_val = (BigUint::from(1u32) << 2000usize) + BigUint::from(12345u32);
+    let narrow_val = (BigUint::from(1u32) << 250usize) + BigUint::from(678u32);
+    let whole: Vec<BigUint> = (0..n)
+      .map(|i| {
+        if i < half {
+          wide_val.clone()
+        } else {
+          narrow_val.clone()
+        }
+      })
+      .collect();
+    let seg_wide: Vec<BigUint> = whole[..half].to_vec();
+    let seg_narrow: Vec<BigUint> = whole[half..].to_vec();
+
+    let (ck, vk) = IntegerModPCS::setup_with_params(b"wg-e2e", n, 256, wide.clone()).unwrap();
+
+    let point: Vec<DP> = (0..num_vars)
+      .map(|i| DP::from_u64(&dyn_params, ((i as u64) * 7 + 3) % 37))
+      .collect();
+    let pt_lo: Vec<DP> = point[1..].to_vec(); // segment point (top bit selects half)
+    let eval_of = |poly: &[BigUint], point: &[DP]| -> BigUint {
+      let ip: Vec<BigUint> = point.iter().map(dyn_to_biguint).collect();
+      integer_mle_evaluate(poly, &ip)
+        .mod_floor(&BigInt::from(p.clone()))
+        .to_biguint()
+        .unwrap()
+    };
+
+    // ---- Baseline: whole witness at the wide bound, one poly ----
+    let blind = <MP as ModPCSEngineTrait<ME>>::blind(&ck, n);
+    let t = Instant::now();
+    let comm = IntegerModPCS::commit_seg(&ck, &whole, &blind, &wide).unwrap();
+    let base_commit = t.elapsed().as_secs_f64() * 1e3;
+    let eval = eval_of(&whole, &point);
+    let mut pt = <ME as SumcheckEngine>::TE::new_with_params(b"wg", dyn_params);
+    let t = Instant::now();
+    let arg = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut pt,
+      &[&comm],
+      &[&whole],
+      &[&blind],
+      &[&point],
+      &[&eval],
+      &[&[]],
+      &[wide.clone()],
+    )
+    .unwrap();
+    let base_open = t.elapsed().as_secs_f64() * 1e3;
+    let mut vt = <ME as SumcheckEngine>::TE::new_with_params(b"wg", dyn_params);
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut vt,
+      &[&comm],
+      &[&point],
+      &[&eval],
+      &arg,
+      &[&[]],
+      &[wide.clone()],
+    )
+    .unwrap();
+
+    // ---- Grouped: wide half @2048 + narrow half @256, one batch ----
+    let bw = <MP as ModPCSEngineTrait<ME>>::blind(&ck, half);
+    let bn = <MP as ModPCSEngineTrait<ME>>::blind(&ck, half);
+    let t = Instant::now();
+    let cw = IntegerModPCS::commit_seg(&ck, &seg_wide, &bw, &wide).unwrap();
+    let cn = IntegerModPCS::commit_seg(&ck, &seg_narrow, &bn, &narrow).unwrap();
+    let grp_commit = t.elapsed().as_secs_f64() * 1e3;
+    let ew = eval_of(&seg_wide, &pt_lo);
+    let en = eval_of(&seg_narrow, &pt_lo);
+    let mut pt2 = <ME as SumcheckEngine>::TE::new_with_params(b"wg", dyn_params);
+    let t = Instant::now();
+    let arg2 = IntegerModPCS::prove_batch_seg(
+      &ck,
+      &mut pt2,
+      &[&cw, &cn],
+      &[&seg_wide, &seg_narrow],
+      &[&bw, &bn],
+      &[&pt_lo, &pt_lo],
+      &[&ew, &en],
+      &[&[], &[]],
+      &[wide.clone(), narrow.clone()],
+    )
+    .unwrap();
+    let grp_open = t.elapsed().as_secs_f64() * 1e3;
+    let mut vt2 = <ME as SumcheckEngine>::TE::new_with_params(b"wg", dyn_params);
+    IntegerModPCS::verify_batch_seg(
+      &vk,
+      &mut vt2,
+      &[&cw, &cn],
+      &[&pt_lo, &pt_lo],
+      &[&ew, &en],
+      &arg2,
+      &[&[], &[]],
+      &[wide.clone(), narrow.clone()],
+    )
+    .unwrap();
+
+    println!(
+      "BASELINE (whole @2048):  commit {base_commit:.1} ms  open {base_open:.1} ms  total {:.1} ms",
+      base_commit + base_open
+    );
+    println!(
+      "GROUPED  (2048 | 256):   commit {grp_commit:.1} ms  open {grp_open:.1} ms  total {:.1} ms",
+      grp_commit + grp_open
+    );
+    println!(
+      "speedup: commit {:.2}x  open {:.2}x  total {:.2}x",
+      base_commit / grp_commit,
+      base_open / grp_open,
+      (base_commit + base_open) / (grp_commit + grp_open)
+    );
   }
 
   /// `validate` catches a hand-rolled `IntEvalParams` literal where

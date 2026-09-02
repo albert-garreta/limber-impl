@@ -470,8 +470,12 @@ fn ws<MM: limber::traits::mod_engine::ModEngine>(d: Dims) -> Workload<MM> {
       } else {
         Config::Rsa
       };
-      let st = statement::build::<MM>(&config, &PoseidonParams::bls12_381_owwb20())
-        .expect("statement builds");
+      let st = statement::build::<MM>(
+        &config,
+        &PoseidonParams::bls12_381_owwb20(),
+        std::env::var_os("MSSEG").is_some(),
+      )
+      .expect("statement builds");
       (st.built.shape, st.built.w, st.built.q, st.built.io)
     }
     _ => {

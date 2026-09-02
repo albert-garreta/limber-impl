@@ -26,6 +26,28 @@ use num_traits::Zero;
 use rayon::prelude::*;
 use tracing::info;
 
+/// An aligned witness segment committed at its own value-width bound
+/// (`log_t_f`), for width-grouped commitment. `[start, start+2^log_len)`
+/// must be aligned (`start % 2^log_len == 0`); the segments tile
+/// `[0, num_vars)`. A narrow segment (small `log_t_f`) commits at fewer
+/// limbs, so its Mod-PCS commit + range check + opening are cheaper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidthSegment {
+  /// Aligned start column.
+  pub start: usize,
+  /// log2 of the segment length.
+  pub log_len: usize,
+  /// Commitment norm bound (bits) for this segment's values.
+  pub log_t_f: usize,
+}
+
+impl WidthSegment {
+  /// Segment length `2^log_len`.
+  pub fn size(&self) -> usize {
+    1usize << self.log_len
+  }
+}
+
 type ModPCS<M> = <M as ModEngine>::ModPCS;
 type ModCK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::CommitmentKey;
 type ModVK<M> = <ModPCS<M> as ModPCSEngineTrait<M>>::VerifierKey;
@@ -56,6 +78,9 @@ pub struct IntModR1CSShapeModp<M: ModEngine> {
   pub(crate) mods: Vec<BigUint>,
   /// Aligned witness blocks asserted `< 2^16` by the Mod-PCS (no rows).
   pub(crate) small_blocks: Vec<SmallValueBlock>,
+  /// Width-grouped commitment segments tiling `[0, num_vars)`; empty means
+  /// a single uniform segment (the default).
+  pub(crate) width_segments: Vec<WidthSegment>,
   pub(crate) _phantom: core::marker::PhantomData<M>,
 }
 
@@ -65,14 +90,14 @@ pub struct IntModR1CSShapeModp<M: ModEngine> {
 pub struct IntModR1CSWitnessModp<M: ModEngine> {
   pub(crate) w: Vec<BigUint>,
   pub(crate) q: Vec<BigUint>,
-  pub(crate) r_w: ModBlind<M>,
+  pub(crate) r_w: Vec<ModBlind<M>>,
   pub(crate) r_q: ModBlind<M>,
 }
 
 /// Public instance: integer-valued IO and the integer-valued commitments.
 #[derive(Clone, Debug)]
 pub struct IntModR1CSInstanceModp<M: ModEngine> {
-  pub(crate) comm_w: ModComm<M>,
+  pub(crate) comm_w: Vec<ModComm<M>>,
   pub(crate) comm_q: ModComm<M>,
   pub(crate) x: Vec<BigUint>,
 }
@@ -129,6 +154,7 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       C,
       mods,
       small_blocks: Vec::new(),
+      width_segments: Vec::new(),
       _phantom: core::marker::PhantomData,
     })
   }
@@ -151,6 +177,43 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
   /// The declared small-value blocks.
   pub fn small_value_blocks(&self) -> &[SmallValueBlock] {
     &self.small_blocks
+  }
+
+  /// Declare width-grouped commitment segments. They must tile
+  /// `[0, num_vars)` with aligned starts (each `start % size == 0`), be
+  /// sorted and contiguous, and every column must be covered exactly
+  /// once. Segments enter the shape digest.
+  pub fn with_width_segments(mut self, segments: Vec<WidthSegment>) -> Result<Self, SpartanError> {
+    let mut cursor = 0usize;
+    for s in &segments {
+      if s.start != cursor
+        || s.start % s.size() != 0
+        || s.log_len > self.num_vars.trailing_zeros() as usize
+      {
+        return Err(SpartanError::InvalidInputLength {
+          reason: format!(
+            "WidthSegment {{start:{}, log_len:{}}} not aligned/contiguous at cursor {cursor}",
+            s.start, s.log_len
+          ),
+        });
+      }
+      cursor += s.size();
+    }
+    if !segments.is_empty() && cursor != self.num_vars {
+      return Err(SpartanError::InvalidInputLength {
+        reason: format!(
+          "width segments cover {cursor} columns, expected num_vars={}",
+          self.num_vars
+        ),
+      });
+    }
+    self.width_segments = segments;
+    Ok(self)
+  }
+
+  /// The declared width segments (empty = single uniform segment).
+  pub fn width_segments(&self) -> &[WidthSegment] {
+    &self.width_segments
   }
 
   /// Number of witness columns (`|w|`), a power of two.
@@ -221,8 +284,26 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
 
     let (comm_w_ok, comm_q_ok) = rayon::join(
       || -> Result<bool, SpartanError> {
-        let cw = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.w, &W.r_w)?;
-        Ok(cw == U.comm_w)
+        // Re-commit the witness the same way `new` did: per width segment,
+        // or as one commitment when the shape declares none.
+        let segs = self.width_segments();
+        if segs.is_empty() {
+          let cw = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.w, &W.r_w[0])?;
+          Ok(U.comm_w.len() == 1 && cw == U.comm_w[0])
+        } else {
+          if U.comm_w.len() != segs.len() || W.r_w.len() != segs.len() {
+            return Ok(false);
+          }
+          for (i, seg) in segs.iter().enumerate() {
+            let slice = &W.w[seg.start..seg.start + seg.size()];
+            let cw =
+              <ModPCS<M> as ModPCSEngineTrait<M>>::commit_at(ck, slice, &W.r_w[i], seg.log_t_f)?;
+            if cw != U.comm_w[i] {
+              return Ok(false);
+            }
+          }
+          Ok(true)
+        }
       },
       || -> Result<bool, SpartanError> {
         let cq = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &W.q, &W.r_q)?;
@@ -282,6 +363,12 @@ impl<M: ModEngine> IntModR1CSShapeModp<M> {
       h.update((b.start as u64).to_le_bytes());
       h.update((b.log_len as u64).to_le_bytes());
     }
+    h.update((self.width_segments.len() as u64).to_le_bytes());
+    for s in &self.width_segments {
+      h.update((s.start as u64).to_le_bytes());
+      h.update((s.log_len as u64).to_le_bytes());
+      h.update((s.log_t_f as u64).to_le_bytes());
+    }
     h.finalize().into()
   }
 }
@@ -323,15 +410,29 @@ impl<M: ModEngine> IntModR1CSWitnessModp<M> {
     if w.len() != shape.num_vars || q.len() != shape.num_cons || x.len() != shape.num_io {
       return Err(SpartanError::InvalidWitnessLength);
     }
-    let r_w = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_vars);
     let r_q = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_cons);
     let (_wq_span, wq_t) = start_span!("imod_modp_wq_commit");
-    let (comm_w, comm_q) = rayon::join(
-      || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &w, &r_w),
-      || <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &q, &r_q),
-    );
-    let comm_w = comm_w?;
-    let comm_q = comm_q?;
+    // Witness commitment: one commitment per width-grouped segment (each at
+    // its own value-width bound), or a single commitment over the whole
+    // witness when the shape declares no segments.
+    let segs = shape.width_segments();
+    let (r_w, comm_w): (Vec<ModBlind<M>>, Vec<ModComm<M>>) = if segs.is_empty() {
+      let r = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, shape.num_vars);
+      let c = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &w, &r)?;
+      (vec![r], vec![c])
+    } else {
+      let mut rs = Vec::with_capacity(segs.len());
+      let mut cs = Vec::with_capacity(segs.len());
+      for seg in segs {
+        let slice = &w[seg.start..seg.start + seg.size()];
+        let r = <ModPCS<M> as ModPCSEngineTrait<M>>::blind(ck, seg.size());
+        let c = <ModPCS<M> as ModPCSEngineTrait<M>>::commit_at(ck, slice, &r, seg.log_t_f)?;
+        rs.push(r);
+        cs.push(c);
+      }
+      (rs, cs)
+    };
+    let comm_q = <ModPCS<M> as ModPCSEngineTrait<M>>::commit(ck, &q, &r_q)?;
     info!(elapsed_ms = %wq_t.elapsed().as_millis(), "imod_modp_wq_commit");
     Ok((
       Self { w, q, r_w, r_q },

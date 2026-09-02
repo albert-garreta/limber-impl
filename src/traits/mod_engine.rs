@@ -344,6 +344,14 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
   /// Length / shape sanity check on a commitment.
   fn check_commitment(comm: &Self::Commitment, n: usize, width: usize) -> Result<(), SpartanError>;
 
+  /// The commitment key's native value-width bound in bits (the width a
+  /// plain [`commit`](Self::commit) uses). Width-grouped segments commit at
+  /// `<= ` this via [`commit_at`](Self::commit_at).
+  fn commitment_log_t_f(ck: &Self::CommitmentKey) -> usize;
+
+  /// Verifier-key mirror of [`commitment_log_t_f`](Self::commitment_log_t_f).
+  fn verifier_log_t_f(vk: &Self::VerifierKey) -> usize;
+
   /// Prove that the integer-valued polynomial `poly` evaluates at the
   /// `Z_p` point `point` to `eval` (the canonical integer in `[0, p)`
   /// representing the `Z_p` evaluation).
@@ -446,5 +454,60 @@ pub trait ModPCSEngineTrait<E: ModEngine>: Clone + Send + Sync {
       });
     }
     Self::verify_batch(vk, transcript, comms, points, evals, arg)
+  }
+
+  /// Commit `v` as an integer polynomial whose values are bounded by
+  /// `2^log_t_f` bits — a width-grouped commitment *segment*. A narrower
+  /// bound lets the impl commit at fewer internal limbs (cheaper MSM /
+  /// range check). The default only supports the key's native width.
+  fn commit_at(
+    _ck: &Self::CommitmentKey,
+    _v: &[BigUint],
+    _r: &Self::Blind,
+    _log_t_f: usize,
+  ) -> Result<Self::Commitment, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
+    })
+  }
+
+  /// [`prove_batch_with_blocks`](Self::prove_batch_with_blocks) where
+  /// polynomial `i` was committed at width `log_t_fs[i]` bits (its
+  /// width-grouped segment bound). Every poly shares one range check and
+  /// combined opening; the per-poly width only changes its own limb count.
+  /// The default is unsupported.
+  #[allow(clippy::too_many_arguments)]
+  fn prove_batch_with_params(
+    _ck: &Self::CommitmentKey,
+    _transcript: &mut E::TE,
+    _comms: &[&Self::Commitment],
+    _polys: &[&[BigUint]],
+    _blinds: &[&Self::Blind],
+    _points: &[&[E::Scalar]],
+    _evals: &[&BigUint],
+    _blocks: &[&[SmallValueBlock]],
+    _log_t_fs: &[usize],
+  ) -> Result<Self::BatchEvaluationArgument, SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
+    })
+  }
+
+  /// Verify a [`prove_batch_with_params`](Self::prove_batch_with_params)
+  /// argument; `log_t_fs` mirrors the prover's per-poly segment widths.
+  #[allow(clippy::too_many_arguments)]
+  fn verify_batch_with_params(
+    _vk: &Self::VerifierKey,
+    _transcript: &mut E::TE,
+    _comms: &[&Self::Commitment],
+    _points: &[&[E::Scalar]],
+    _evals: &[&BigUint],
+    _arg: &Self::BatchEvaluationArgument,
+    _blocks: &[&[SmallValueBlock]],
+    _log_t_fs: &[usize],
+  ) -> Result<(), SpartanError> {
+    Err(SpartanError::InternalError {
+      reason: "this Mod-PCS does not support width-grouped commitment".to_string(),
+    })
   }
 }
