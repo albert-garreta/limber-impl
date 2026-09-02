@@ -37,10 +37,20 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Security level for Brakedown layouts (column-open count derivation).
-/// Aligned with the accepted system floor (~114-117 bits: the 2^-114
-/// fingerprint term and LAMBDA_BOUND2 = 117) rather than over-securing
-/// this one term to 128 - the same argument as the challenge bound.
-const BD_LAMBDA: usize = 117;
+/// Aligned with the honest system floor: the 2^-114 fingerprint
+/// prime-sampling term is the weakest link, so provisioning the column
+/// count above 114 over-secures this one term (cf. LAMBDA_BOUND2 = 117
+/// for the challenge bound). Swept: each ~10 bits is ~0.5 MB of proof.
+const BD_LAMBDA_DEFAULT: usize = 114;
+/// Column-open security parameter, `BDLAMBDA` overrides (benching knob).
+/// Default 114; the honest system floor is ~114 (the 2^-114 fingerprint
+/// term), so values in [114,117] are free, below 114 lowers real security.
+fn bd_lambda() -> usize {
+  std::env::var("BDLAMBDA")
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    .unwrap_or(BD_LAMBDA_DEFAULT)
+}
 /// Public seed for the deterministic expander-code matrices; both prover
 /// and verifier derive identical layouts from (length, spec, seed).
 const BD_SEED: &[u8] = b"imod-modpcs-brakedown-v1";
@@ -114,7 +124,11 @@ pub(crate) fn bd_params<F: crate::traits::PrimeFieldExt>(n: usize) -> &'static B
     .unwrap_or(1 << 15)
     .min(n);
   let params: &'static BrakedownParams<F> = Box::leak(Box::new(BrakedownParams::new_with_row_len(
-    n, spec, BD_LAMBDA, BD_SEED, row_len,
+    n,
+    spec,
+    bd_lambda(),
+    BD_SEED,
+    row_len,
   )));
   guard.insert(key, params as &'static (dyn Any + Send + Sync));
   params

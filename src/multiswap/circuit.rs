@@ -581,8 +581,14 @@ impl Builder {
     // power-of-two boundary does not spawn a chain of 1-column segments;
     // a granule takes the MAX class of its members (a little over-wide at
     // class boundaries, far fewer segments). Positions never move.
-    const G_LOG: usize = 10; // 1024-column granule
-    let g = 1usize << G_LOG;
+    // 4096-column granule by default (the swept optimum: recovers the
+    // verify/proof penalty while keeping the prover win); SEGGLOG
+    // overrides (benching knob).
+    let g_log: usize = std::env::var("SEGGLOG")
+      .ok()
+      .and_then(|v| v.parse::<usize>().ok())
+      .unwrap_or(12);
+    let g = 1usize << g_log;
     let granule_class = |gk: usize| -> usize {
       let lo = gk * g;
       let hi = (lo + g).min(num_vars);
