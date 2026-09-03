@@ -1,5 +1,35 @@
 # Limber: Low Overhead SNARKs for Integers
 
+> **Fork notice.** This is a fork of [lucasxia01/limber-impl](https://github.com/lucasxia01/limber-impl),
+> the reference implementation of [Limber](https://eprint.iacr.org/2026/1635) by Chen, Xia, Nguyen and Bünz.
+> Upstream is the source of truth; this fork is used for benchmarking and comparison work
+> and tracks upstream `main`.
+
+## Main benchmark command
+
+The headline number is the MultiSwap benchmark (Table 1 of the paper).
+All paper numbers are single-threaded with native CPU codegen:
+
+```bash
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" cargo bench --bench multiswap_modp
+```
+
+Prepend `BDPCS=1` to run the Brakedown (hash-based) instantiation instead of Hyrax.
+The other benches and knobs are documented in [Reproducing the paper's numbers](#reproducing-the-papers-numbers) below.
+
+Upstream `main` currently requires Rust 1.97 or newer (`rustup update stable`); older toolchains fail to build the
+library with an E0658 error on `isolate_lowest_one`.
+
+This fork also adds `examples/spartan_part_timing.rs`, a per-phase timing harness that splits the prover
+into its Spartan-style $\mathbb{Z}_p$ sumcheck part and its mod-PCS part on the msshape configs:
+
+```bash
+RAYON_NUM_THREADS=1 RUSTFLAGS="-C target-cpu=native" RUST_LOG=info \
+  cargo run --release --example spartan_part_timing
+```
+
+---
+
 In this repo, we build SNARKs for Integers over Mod R1CS, where constraints support arbitrary modular arithmetic.
 It implements the protocol from the accompanying paper [*Limber: Low Overhead SNARKs for Integers from Any PCS*](https://eprint.iacr.org/2026/1635).
 
