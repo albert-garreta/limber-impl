@@ -279,17 +279,19 @@ macro_rules! roundtrip_h1 {
 #[test]
 fn roundtrip_h1_combined_hyrax() {
   let instance = roundtrip_h1!(Hy, HYRAX_K);
-  // H = 1 combined input-commitment pair: n = 2^11, f_chunk = 2^15,
-  // 16 rows per commitment → 2 × (8-byte Vec length + 16 × 33 bytes)
-  // = 1,072 canonical bytes.
-  assert_eq!(instance.commitment_bytes().unwrap().len(), 1072);
+  // H = 1: n = 2^11, f_chunk = 2^15, 16 rows per commitment. `comm_w`
+  // is now a per-segment Vec (one width segment here), so its 8-byte
+  // outer length prefix is added on top of the two commitments:
+  // 8 (outer Vec) + 2 × (8-byte Vec length + 16 × 33 bytes) = 1,080.
+  assert_eq!(instance.commitment_bytes().unwrap().len(), 1080);
 }
 
 #[test]
 fn roundtrip_h1_combined_brakedown() {
   let instance = roundtrip_h1!(Bd, BD_K);
-  // Brakedown: two 32-byte Merkle roots, no length prefixes.
-  assert_eq!(instance.commitment_bytes().unwrap().len(), 64);
+  // Brakedown: two 32-byte Merkle roots + the 8-byte outer length
+  // prefix of the per-segment `comm_w` Vec = 72.
+  assert_eq!(instance.commitment_bytes().unwrap().len(), 72);
 }
 
 /// Cheap, non-proving `H = 10`-per-field headline structure: the 30-hash

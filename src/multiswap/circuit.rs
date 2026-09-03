@@ -616,7 +616,7 @@ impl Builder {
       let by_align = if off == 0 {
         num_vars
       } else {
-        off & off.wrapping_neg()
+        off.isolate_lowest_one()
       };
       let avail = run_end - off;
       let by_size = 1usize << (usize::BITS - 1 - avail.leading_zeros());
